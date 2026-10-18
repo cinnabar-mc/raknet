@@ -118,14 +118,16 @@ impl RakSession {
         result
     }
 
-    /// Tracks receive progress while a reliable or ordered gap remains.
+    /// Retains a deferred reliable obligation until delivery advances, including across control traffic.
     fn refresh_stall(&mut self, now: Instant) {
-        let waiting = !self.inbound_rel_ahead.is_empty() || self.inbound_ord_bytes > 0;
+        let waiting = self.inbound_deferred
+            || !self.inbound_rel_ahead.is_empty()
+            || self.inbound_ord_bytes > 0;
         self.inbound_stall = match (waiting, self.inbound_stall) {
-            (false, _) => None,
-            (true, Some((since, progress))) if progress == self.inbound_progress => {
+            (_, Some((since, progress))) if progress == self.inbound_progress => {
                 Some((since, progress))
             }
+            (false, _) => None,
             (true, _) => Some((now, self.inbound_progress)),
         };
     }

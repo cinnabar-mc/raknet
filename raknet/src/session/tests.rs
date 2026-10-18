@@ -1919,3 +1919,71 @@ fn deferred_reliable_before_admission_times_out_despite_live_control_traffic() {
         "retransmission and live control traffic must not erase an undelivered reliable obligation"
     );
 }
+
+#[test]
+fn deferred_reliable_deadline_survives_snapshot_without_retained_fragments() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = 1024;
+    let start = domain_time();
+    let mut frame = fragment(1, 2, 0, &[0xfe; 1200]);
+    frame.reliability = RakReliability::Reliable;
+    receiver.handle(datagram_at(0, vec![frame], start)).unwrap();
+    let capture = start + SESSION_TIMEOUT / 2;
+    receiver
+        .handle(datagram_at(1, unreliable(0), capture))
+        .unwrap();
+    drain_outputs(&mut receiver);
+    let json = facet_json::to_string(&receiver.snapshot(capture)).unwrap();
+    let destination = crate::clock::test_now() + Duration::from_secs(3600);
+    let mut resumed = RakSession::restore(
+        facet_json::from_str(&json).unwrap(),
+        destination,
+        SESSION_TIMEOUT / 2,
+    )
+    .unwrap();
+    resumed
+        .handle(datagram_at(2, unreliable(0), destination))
+        .unwrap();
+    resumed
+        .handle(RakSessionInput::Update(destination))
+        .unwrap();
+    assert_eq!(
+        disconnect_reason(&resumed),
+        Some(RakDisconnectReason::Timeout)
+    );
+}
+
+#[test]
+fn admitted_retransmission_clears_a_transient_reliable_deferral() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = 1024;
+    let start = domain_time();
+    let mut first = fragment(1, 2, 0, &[0xfe; 1200]);
+    first.reliability = RakReliability::Reliable;
+    receiver
+        .handle(datagram_at(0, vec![first.clone()], start))
+        .unwrap();
+    let progress = start + SESSION_TIMEOUT / 3;
+    receiver.config.max_queued_bytes = 4096;
+    receiver
+        .handle(datagram_at(0, vec![first], progress))
+        .unwrap();
+    let mut final_frame = fragment(1, 2, 1, &[1]);
+    final_frame.reliability = RakReliability::Reliable;
+    final_frame.reliable_index = 1;
+    receiver
+        .handle(datagram_at(1, vec![final_frame], progress))
+        .unwrap();
+    let delivered = packets(&mut receiver);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].len(), 1201);
+    assert_eq!(delivered[0][1200], 1);
+    let now = start + SESSION_TIMEOUT;
+    receiver.handle(datagram_at(2, unreliable(0), now)).unwrap();
+    receiver.handle(RakSessionInput::Update(now)).unwrap();
+    assert_eq!(
+        receiver.state,
+        RakSessionState::Connected,
+        "a delivered deferred message must not retain a spurious stall obligation"
+    );
+}

@@ -82,7 +82,7 @@ impl MtuProbes {
         }
         let pending = self.pending.take().expect("the completion token matched");
         let urgent = if too_large {
-            self.count = ATTEMPTS_PER_SIZE * (pending.rung + 1);
+            self.count = self.count.max(ATTEMPTS_PER_SIZE * (pending.rung + 1));
             true
         } else if elapsed.as_millis() > 100 {
             let final_start = ATTEMPTS_PER_SIZE * (self.sizes.len() - 1);
