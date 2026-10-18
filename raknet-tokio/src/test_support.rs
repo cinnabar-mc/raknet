@@ -125,3 +125,34 @@ pub(crate) fn negotiated_pair(
     }
     panic!("public negotiation did not complete within the controlled work bound");
 }
+
+/// Captures genuine manual-flush phases; the retained loopback socket owns any old-adapter output.
+pub(crate) fn manual_flush_snapshots()
+-> (std::net::UdpSocket, RakSessionSnapshot, RakSessionSnapshot) {
+    let output = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let remote = output.local_addr().unwrap();
+    let local = "127.0.0.1:54321".parse().unwrap();
+    let now = Instant::now();
+    let config = RakSessionConfig {
+        autoflush: false,
+        ..Default::default()
+    };
+    let (established, _) = negotiated_pair(local, remote, now, now, config.clone());
+    let (mut closing, _) = negotiated_pair(local, remote, now, now, config);
+    closing
+        .send(
+            Box::from(&b"\xfepending original output"[..]),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+            now,
+        )
+        .unwrap();
+    let mut closing = closing.close(now).unwrap();
+    while closing.poll().is_some() {}
+    assert_eq!(closing.state(), RakSessionState::Closing);
+    (
+        output,
+        established.snapshot(now).unwrap(),
+        closing.snapshot(now).unwrap(),
+    )
+}

@@ -1,5 +1,33 @@
 use super::*;
 
+/// Exercises the public adapter against the original genuinely negotiated snapshot policy.
+async fn reject_manual_flush_snapshot(snapshot: RakSessionSnapshot) {
+    let mut server = RakServer::new("127.0.0.1:0".parse().unwrap(), |_| {})
+        .start()
+        .await
+        .unwrap();
+    let result = server.adopt(snapshot, Duration::ZERO).await;
+    let rejected = result.is_err();
+    drop(result);
+    server.stop().await;
+    assert!(
+        rejected,
+        "automatic server adopted manual flushing without a tick capability"
+    );
+}
+
+#[tokio::test]
+async fn automatic_server_rejects_established_manual_flush_snapshot() {
+    let (_output, established, _) = crate::test_support::manual_flush_snapshots();
+    reject_manual_flush_snapshot(established).await;
+}
+
+#[tokio::test]
+async fn automatic_server_rejects_closing_manual_flush_snapshot() {
+    let (_output, _, closing) = crate::test_support::manual_flush_snapshots();
+    reject_manual_flush_snapshot(closing).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn rak_server() {

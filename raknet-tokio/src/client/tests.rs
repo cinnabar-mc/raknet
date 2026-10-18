@@ -1,5 +1,30 @@
 use super::*;
 
+/// Exercises the public adapter against the original genuinely negotiated snapshot policy.
+async fn reject_manual_flush_snapshot(snapshot: RakSessionSnapshot) {
+    let client = RakClient::new(|_| {}).start().await.unwrap();
+    let result = client.adopt(snapshot, Duration::ZERO).await;
+    let rejected = result.is_err();
+    drop(result);
+    client.stop().await;
+    assert!(
+        rejected,
+        "automatic client adopted manual flushing without a tick capability"
+    );
+}
+
+#[tokio::test]
+async fn automatic_client_rejects_established_manual_flush_snapshot() {
+    let (_output, established, _) = crate::test_support::manual_flush_snapshots();
+    reject_manual_flush_snapshot(established).await;
+}
+
+#[tokio::test]
+async fn automatic_client_rejects_closing_manual_flush_snapshot() {
+    let (_output, _, closing) = crate::test_support::manual_flush_snapshots();
+    reject_manual_flush_snapshot(closing).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
     let now = Instant::now().into_std();
