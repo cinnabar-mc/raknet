@@ -25,6 +25,29 @@ async fn automatic_client_rejects_closing_manual_flush_snapshot() {
     reject_manual_flush_snapshot(closing).await;
 }
 
+#[tokio::test]
+async fn rejected_snapshot_retains_original_policy_before_time_restoration() {
+    let (_output, established, closing) = crate::test_support::manual_flush_snapshots();
+    let client = RakClient::new(|_| {}).start().await.unwrap();
+    for original in [established, closing] {
+        let uptime = original.captured_uptime_ms();
+        let Err(ClientAdoptError::UnsupportedConfiguration { snapshot, cause }) =
+            client.adopt(original, Duration::MAX).await
+        else {
+            panic!("manual policy must return its capture before invalid time restoration")
+        };
+        assert_eq!(cause.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!snapshot.config().autoflush);
+        assert_eq!(snapshot.captured_uptime_ms(), uptime);
+        assert!(
+            snapshot
+                .restore(Instant::now().into_std(), Duration::ZERO)
+                .is_ok()
+        );
+    }
+    client.stop().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
     let now = Instant::now().into_std();
@@ -63,7 +86,7 @@ async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
     let _ = reply.send(Err(RakClientError::Closed));
     assert!(matches!(
         adopting.await.unwrap(),
-        Err(RakClientError::Closed)
+        Err(ClientAdoptError::Session(RakClientError::Closed))
     ));
 }
 

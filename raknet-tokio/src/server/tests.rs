@@ -29,6 +29,32 @@ async fn automatic_server_rejects_closing_manual_flush_snapshot() {
 }
 
 #[tokio::test]
+async fn rejected_snapshot_retains_original_policy_before_time_restoration() {
+    let (_output, established, closing) = crate::test_support::manual_flush_snapshots();
+    let mut server = RakServer::new("127.0.0.1:0".parse().unwrap(), |_| {})
+        .start()
+        .await
+        .unwrap();
+    for original in [established, closing] {
+        let uptime = original.captured_uptime_ms();
+        let Err(ServerAdoptError::UnsupportedConfiguration { snapshot, cause }) =
+            server.adopt(original, Duration::MAX).await
+        else {
+            panic!("manual policy must return its capture before invalid time restoration")
+        };
+        assert_eq!(cause.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!snapshot.config().autoflush);
+        assert_eq!(snapshot.captured_uptime_ms(), uptime);
+        assert!(
+            snapshot
+                .restore(Instant::now().into_std(), Duration::ZERO)
+                .is_ok()
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 #[ignore]
 async fn rak_server() {
     let _ = tracing_subscriber::fmt()

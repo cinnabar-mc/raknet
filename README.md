@@ -23,6 +23,11 @@ The adapters are separate crates, rather than features of `raknet`. Their
 `RakClient`, `RakServer` and `RakSession` names refer to different integration
 types. Import from the chosen crate's `prelude`.
 
+Tokio and Bevy require `config.session.autoflush = true`, the default. They
+reject manual flushing before opening a socket because their handles expose no
+caller `tick`. Tokio also rejects manual-flush snapshots before restoration or
+actor dispatch, returning the original capture in its adoption error.
+
 ## Add a dependency
 
 Use the Cinnabar Git repository to select this implementation:
@@ -135,7 +140,9 @@ message queues must be drained by application systems.
 
 Add `RakClientPlugin` or `RakServerPlugin`, and insert the corresponding
 `RakClient::new(...)` or `RakServer::new(address, ...)` resource. These
-constructors bind nonblocking sockets and return `std::io::Result`.
+constructors bind nonblocking sockets and return `ClientStartError` or
+`ServerStartError` on failure. Their `into_parts()` methods recover the original
+configuration, bind address for servers, and I/O cause for an explicit retry.
 
 The plugins update their resources in `PreUpdate` and emit `RakClientEvent` or
 `RakServerEvent` messages. Order same-schedule consumers after `RakClientSet` or

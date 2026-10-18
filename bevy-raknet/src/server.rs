@@ -64,19 +64,32 @@ pub struct RakServer {
 }
 
 impl RakServer {
-    pub fn new<T>(addr: SocketAddr, conf: T) -> std::io::Result<Self>
+    /// Binds an automatic server, retaining its original address/configuration on startup failure.
+    /// Manual session flushing is unsupported because this resource exposes no caller tick.
+    pub fn new<T>(addr: SocketAddr, conf: T) -> Result<Self, ServerStartError>
     where
         T: FnOnce(&mut RakServerConfig),
     {
         let mut config = RakServerConfig::default();
         conf(&mut config);
 
-        config
-            .session
-            .validate()
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
-        let socket = UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
+        if let Err(error) = config.session.validate() {
+            return Err(ServerStartError::new(
+                addr,
+                config,
+                std::io::Error::new(ErrorKind::InvalidInput, error),
+            ));
+        }
+        if let Err(cause) = crate::configuration::require_automatic_flush(&config.session) {
+            return Err(ServerStartError::new(addr, config, cause));
+        }
+        let socket = match UdpSocket::bind(addr) {
+            Ok(socket) => socket,
+            Err(cause) => return Err(ServerStartError::new(addr, config, cause)),
+        };
+        if let Err(cause) = socket.set_nonblocking(true) {
+            return Err(ServerStartError::new(addr, config, cause));
+        }
 
         Ok(Self {
             socket,
@@ -85,7 +98,7 @@ impl RakServer {
             received: VecDeque::new(),
             events: VecDeque::new(),
             intl: RakServerIntl::new(config, addr, RakClock::new(Instant::now()), Instant::now())
-                .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?,
+                .expect("the same pure session configuration was validated before binding"),
         })
     }
 
@@ -258,6 +271,50 @@ impl RakServer {
         }
 
         self.remove_sessions(disconnected, now);
+    }
+}
+
+/// A failed startup retains the original bind address, server configuration and cause.
+pub struct ServerStartError {
+    addr: SocketAddr,
+    config: Box<RakServerConfig>,
+    cause: std::io::Error,
+}
+
+impl ServerStartError {
+    /// Keeps the configured value intact through validation and socket setup failures.
+    fn new(addr: SocketAddr, config: RakServerConfig, cause: std::io::Error) -> Self {
+        Self {
+            addr,
+            config: Box::new(config),
+            cause,
+        }
+    }
+
+    /// Recovers the original address/configuration and failure for an explicit retry or retirement.
+    pub fn into_parts(self) -> (SocketAddr, RakServerConfig, std::io::Error) {
+        (self.addr, *self.config, self.cause)
+    }
+}
+
+impl std::fmt::Debug for ServerStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerStartError")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ServerStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "server startup failed: {}", self.cause)
+    }
+}
+
+impl std::error::Error for ServerStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 

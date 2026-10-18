@@ -156,13 +156,22 @@ impl RakClient<ConfiguredClient> {
         }
     }
 
-    /// Opens the socket owner and consumes the configuration capability.
+    /// Opens the automatic socket owner, retaining configuration on validation or bind failure.
+    /// Manual session flushing is unsupported because this handle exposes no caller tick.
     pub async fn start(self) -> Result<RakClient<RunningClient>, ClientStartError> {
         if let Err(error) = self.state.config.validate() {
             let cause = std::io::Error::new(std::io::ErrorKind::InvalidInput, error).into();
             return Err(ClientStartError {
                 client: Box::new(self),
                 cause,
+            });
+        }
+        if let Err(cause) =
+            crate::configuration::require_automatic_flush(&self.state.config.session)
+        {
+            return Err(ClientStartError {
+                client: Box::new(self),
+                cause: cause.into(),
             });
         }
         let sockets = match ClientSockets::bind(self.state.config.local_port).await {
@@ -418,24 +427,33 @@ impl RakClient<RunningClient> {
 
     /// Resumes a session captured with [`RakSession::snapshot`] on another client.
     ///
-    /// Fails with [`RakClientError::AlreadyConnected`] if this client already has a
-    /// session or is connecting. The peer is not contacted, so the caller is responsible
-    /// for pointing it at this client's socket. `elapsed` is the time since capture.
+    /// Manual-flush captures are returned unchanged in [`ClientAdoptError::UnsupportedConfiguration`]
+    /// before restoration or dispatch. Other errors consume the capture, including
+    /// [`RakClientError::AlreadyConnected`] if this endpoint is already in use.
+    /// The caller arranges peer routing; `elapsed` is the time since capture.
     pub async fn adopt(
         &self,
         snapshot: RakSessionSnapshot,
         elapsed: Duration,
-    ) -> Result<RestoredSession, RakClientError> {
+    ) -> Result<RestoredSession, ClientAdoptError> {
+        if let Err(cause) = crate::configuration::require_automatic_flush(snapshot.config()) {
+            return Err(ClientAdoptError::UnsupportedConfiguration {
+                snapshot: Box::new(snapshot),
+                cause,
+            });
+        }
         let msg_tx = &self.state.msg_tx;
 
-        let session = snapshot.restore(Instant::now().into_std(), elapsed)?;
+        let session = snapshot
+            .restore(Instant::now().into_std(), elapsed)
+            .map_err(RakClientError::from)?;
         let (tx, rx) = oneshot::channel();
 
         msg_tx
             .send(RakClientMsg::Adopt(session, tx))
             .map_err(|_| RakClientError::Closed)?;
 
-        rx.await.map_err(|_| RakClientError::Closed)?
+        Ok(rx.await.map_err(|_| RakClientError::Closed)??)
     }
 
     pub async fn connect(
@@ -449,6 +467,23 @@ impl RakClient<RunningClient> {
         let _ = msg_tx.send(RakClientMsg::Connect(addr, tx));
         rx.await.map_err(|_| RakClientError::Closed)?
     }
+}
+
+/// An adapter-policy rejection retains the original capture before any restore or actor dispatch.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientAdoptError {
+    /// This automatic endpoint cannot drive the saved manual-flush policy.
+    #[error("client snapshot configuration is unsupported: {cause}")]
+    UnsupportedConfiguration {
+        /// The exact unconsumed application capture, without a rebased clock.
+        snapshot: Box<RakSessionSnapshot>,
+        /// Adapter-owned local validation failure.
+        #[source]
+        cause: std::io::Error,
+    },
+    /// Restoration or actor admission consumed the capture and failed.
+    #[error(transparent)]
+    Session(#[from] RakClientError),
 }
 
 /// A failed socket start retains the original configured client.

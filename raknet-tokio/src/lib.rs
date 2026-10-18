@@ -1,11 +1,15 @@
 mod client;
+mod configuration;
 mod server;
 mod session;
 
 pub mod prelude {
-    pub use super::client::{ClientStartError, ConfiguredClient, RakClient, RunningClient};
+    pub use super::client::{
+        ClientAdoptError, ClientStartError, ConfiguredClient, RakClient, RunningClient,
+    };
     pub use super::server::{
-        ConfiguredServer, RakServer, RunningServer, ServerStartError, error::RakServerError,
+        ConfiguredServer, RakServer, RunningServer, ServerAdoptError, ServerStartError,
+        error::RakServerError,
     };
     pub use super::session::{RakSession, RestoredSession, SessionCloseError, SnapshotError};
     pub use raknet::prelude::{

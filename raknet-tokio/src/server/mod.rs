@@ -55,12 +55,21 @@ impl RakServer<ConfiguredServer> {
         self.state.config.max_connections = value;
     }
 
-    /// Binds the socket and consumes configuration into a running owner.
+    /// Binds an automatic socket owner, retaining configuration on validation or bind failure.
+    /// Manual session flushing is unsupported because this handle exposes no caller tick.
     pub async fn start(self) -> Result<RakServer<RunningServer>, ServerStartError> {
         if let Err(error) = self.state.config.session.validate() {
             return Err(ServerStartError {
                 server: Box::new(self),
                 cause: raknet::prelude::RakServerError::from(error).into(),
+            });
+        }
+        if let Err(cause) =
+            crate::configuration::require_automatic_flush(&self.state.config.session)
+        {
+            return Err(ServerStartError {
+                server: Box::new(self),
+                cause: cause.into(),
             });
         }
         let socket = match UdpSocket::bind(self.state.addr).await {
@@ -290,21 +299,31 @@ impl RakServer<RunningServer> {
 
     /// Resumes a session captured with [`crate::session::RakSession::snapshot`] on
     /// another server, returning its handle here. `elapsed` is the time since capture.
+    /// Manual-flush captures are returned unchanged before restoration or dispatch;
+    /// other restore/actor errors consume the capture.
     pub async fn adopt(
         &mut self,
         snapshot: RakSessionSnapshot,
         elapsed: Duration,
-    ) -> Result<RestoredSession, RakServerError> {
+    ) -> Result<RestoredSession, ServerAdoptError> {
+        if let Err(cause) = crate::configuration::require_automatic_flush(snapshot.config()) {
+            return Err(ServerAdoptError::UnsupportedConfiguration {
+                snapshot: Box::new(snapshot),
+                cause,
+            });
+        }
         let msg_tx = &self.state.msg_tx;
 
-        let session = snapshot.restore(Instant::now().into_std(), elapsed)?;
+        let session = snapshot
+            .restore(Instant::now().into_std(), elapsed)
+            .map_err(RakServerError::from)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         msg_tx
             .send(RakServerMsg::Adopt(session, tx))
             .map_err(|_| RakServerError::Closed)?;
 
-        rx.await.map_err(|_| RakServerError::Closed)?
+        Ok(rx.await.map_err(|_| RakServerError::Closed)??)
     }
 
     pub async fn accept(&mut self) -> Result<RakSession<Established>, RakServerError> {
@@ -314,6 +333,23 @@ impl RakServer<RunningServer> {
             .await
             .ok_or(RakServerError::Closed)
     }
+}
+
+/// An adapter-policy rejection retains the original capture before any restore or actor dispatch.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerAdoptError {
+    /// This automatic endpoint cannot drive the saved manual-flush policy.
+    #[error("server snapshot configuration is unsupported: {cause}")]
+    UnsupportedConfiguration {
+        /// The exact unconsumed application capture, without a rebased clock.
+        snapshot: Box<RakSessionSnapshot>,
+        /// Adapter-owned local validation failure.
+        #[source]
+        cause: std::io::Error,
+    },
+    /// Restoration or actor admission consumed the capture and failed.
+    #[error(transparent)]
+    Session(#[from] RakServerError),
 }
 
 /// A failed bind retains the original server configuration.

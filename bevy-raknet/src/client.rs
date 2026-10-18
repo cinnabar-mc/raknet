@@ -60,18 +60,31 @@ pub struct RakClient {
 }
 
 impl RakClient {
-    pub fn new<T>(conf: T) -> std::io::Result<Self>
+    /// Binds an automatic client, retaining the original configuration on any startup failure.
+    /// Manual session flushing is unsupported because this resource exposes no caller tick.
+    pub fn new<T>(conf: T) -> Result<Self, ClientStartError>
     where
         T: FnOnce(&mut RakClientConfig),
     {
         let mut config = RakClientConfig::default();
         conf(&mut config);
 
-        config
-            .validate()
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.local_port))?;
-        socket.set_nonblocking(true)?;
+        if let Err(error) = config.validate() {
+            return Err(ClientStartError::new(
+                config,
+                std::io::Error::new(ErrorKind::InvalidInput, error),
+            ));
+        }
+        if let Err(cause) = crate::configuration::require_automatic_flush(&config.session) {
+            return Err(ClientStartError::new(config, cause));
+        }
+        let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.local_port)) {
+            Ok(socket) => socket,
+            Err(cause) => return Err(ClientStartError::new(config, cause)),
+        };
+        if let Err(cause) = socket.set_nonblocking(true) {
+            return Err(ClientStartError::new(config, cause));
+        }
 
         Ok(Self {
             buffer: vec![0; config.max_mtu_size as usize].into_boxed_slice(),
@@ -81,7 +94,7 @@ impl RakClient {
             pongs: VecDeque::new(),
             events: VecDeque::new(),
             intl: Driver::new(config, RakClock::new(Instant::now()))
-                .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?,
+                .expect("the same pure client configuration was validated before binding"),
         })
     }
 
@@ -273,6 +286,48 @@ impl RakClient {
                     .push_back(RakClientEvent::Disconnected { reason });
             }
         }
+    }
+}
+
+/// A failed startup retains the unstarted client configuration and original cause.
+pub struct ClientStartError {
+    config: Box<RakClientConfig>,
+    cause: std::io::Error,
+}
+
+impl ClientStartError {
+    /// Keeps the configured value intact through validation and socket setup failures.
+    fn new(config: RakClientConfig, cause: std::io::Error) -> Self {
+        Self {
+            config: Box::new(config),
+            cause,
+        }
+    }
+
+    /// Recovers the original configuration and failure for an explicit retry or retirement.
+    pub fn into_parts(self) -> (RakClientConfig, std::io::Error) {
+        (*self.config, self.cause)
+    }
+}
+
+impl std::fmt::Debug for ClientStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientStartError")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ClientStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "client startup failed: {}", self.cause)
+    }
+}
+
+impl std::error::Error for ClientStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 

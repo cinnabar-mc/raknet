@@ -121,7 +121,7 @@ that a peer remains reachable between calls.
 | Common `RakSessionInput` | Meaning |
 | --- | --- |
 | `Datagram(bytes, now)` | One complete datagram already routed to this peer. |
-| `Update(now)` | Advance ACKs, retransmission, liveness and close processing. |
+| `Update(now)` | Advance configured automatic flushing, liveness and close processing. |
 
 | Owned method | Capability and result |
 | --- | --- |
@@ -130,6 +130,11 @@ that a peer remains reachable between calls.
 | `session.abort(now)` | Consumes either live phase and returns Closing with immediate-retirement output. |
 | `session.tick(now)` | Explicitly flushes existing work when the caller owns the flush cadence. |
 | `session.finish()` | Consumes a terminal, fully drained owner into opaque terminal metadata; otherwise returns the owner unchanged. |
+
+For a manual-flush core session, call `tick(now)` explicitly to advance ACKs,
+retransmission and queued delivery. This capability is on the handed-off session;
+client/server endpoints do not expose a separate manual tick during online
+negotiation.
 
 A close error returns the Closing owner and cause through `into_parts()`. It
 never drops pending packet/terminal output or restores send permission. Continue
@@ -181,6 +186,29 @@ terminal metadata with `finish()`. A close request is not completion of the wire
 shutdown. Keep the running client/server owner alive; `stop().await` consumes it
 and awaits its stop. Bevy users close an exclusive established capability
 and keep updating until the disconnected event arrives.
+
+### Automatic adapter configuration
+
+Tokio and Bevy require `session.autoflush = true`. Keep the caller-selected
+positive `autoflush_interval_ms` and byte capacities; the adapters reject an
+unsupported manual policy instead of changing it. Validation precedes socket
+binding and task creation. Tokio startup errors retain the original Configured
+owner through `into_parts()`.
+
+Bevy `ClientStartError::into_parts()` returns `(RakClientConfig, io::Error)`;
+`ServerStartError::into_parts()` returns `(SocketAddr, RakServerConfig, io::Error)`.
+This also preserves configuration after a bind or nonblocking setup failure.
+For an explicit retry, pass the recovered value to the same constructor callback:
+
+```rust
+use bevy_raknet::prelude::{ClientStartError, RakClient};
+
+fn retry(failure: ClientStartError) -> Result<RakClient, ClientStartError> {
+    let (mut config, _cause) = failure.into_parts();
+    config.session.autoflush = true;
+    RakClient::new(|next| *next = config)
+}
+```
 
 ## Many sessions on shared sockets
 
@@ -241,3 +269,12 @@ handle or terminal metadata. Server adoption assigns a fresh local ID. Adoption
 neither re-handshakes the peer nor moves its network route. Stop the old owner and
 arrange socket/peer routing so only the new owner advances the session; capture
 alone leaves the old owner running.
+
+`snapshot.config()` borrows its original saved policy without restoring it.
+Tokio rejects every manual-flush capture, including a terminal capture, before
+restoration or actor dispatch. `ClientAdoptError::UnsupportedConfiguration` and
+`ServerAdoptError::UnsupportedConfiguration` retain the original boxed snapshot
+and an `InvalidInput` I/O cause; match that variant to recover it for a caller-driven
+core integration. Their `Session` variants preserve existing restore or actor
+failures after the capture has been consumed. No application tick is exposed by
+an automatic session handle.

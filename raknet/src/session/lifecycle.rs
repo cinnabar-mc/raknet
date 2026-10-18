@@ -305,6 +305,10 @@ pub enum RestoredSession {
 }
 
 impl RakSessionSnapshot {
+    /// Borrows the saved local policy without restoring or changing this capture.
+    pub fn config(&self) -> &super::config::RakSessionConfig {
+        &self.inner.config
+    }
     /// Returns the captured endpoint uptime without exposing mutable saved state.
     pub fn captured_uptime_ms(&self) -> u64 {
         self.inner.captured_uptime_ms
