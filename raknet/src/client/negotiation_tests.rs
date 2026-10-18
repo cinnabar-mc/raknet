@@ -601,3 +601,38 @@ fn identity_stays_with_each_attempt_through_challenges_retries_session_and_recon
         ping_guid.as_u64()
     );
 }
+
+#[test]
+fn final_mtu_size_errors_exhaust_the_original_probe_budget() {
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let mut now = crate::clock::test_now() + Duration::from_secs(1000);
+    client
+        .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
+            remote: PEER,
+            local: SocketAddr::new(PEER.ip(), 54321),
+            now,
+        })
+        .unwrap();
+    for expected in [1464, 1172, 548, 548] {
+        let (id, len) = pending_probe(&mut client).unwrap();
+        assert_eq!(len, expected);
+        client
+            .handle(RakClientInput::MtuProbeResult {
+                id,
+                now,
+                elapsed: Duration::ZERO,
+                too_large: true,
+            })
+            .unwrap();
+        now += Duration::from_millis(10);
+        client.handle(RakClientInput::Update(now)).unwrap();
+    }
+    assert!(
+        pending_probe(&mut client).is_none(),
+        "a final too-large completion must exhaust the same finite ladder as a successful write"
+    );
+}

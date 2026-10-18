@@ -1872,3 +1872,50 @@ fn acknowledged_sends_release_outbound_bytes() {
 
     assert_eq!(a.outbound_bytes(), 0);
 }
+
+#[test]
+fn deferred_reliable_before_admission_times_out_despite_live_control_traffic() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = 1024;
+    let start = domain_time();
+    let mut frame = fragment(1, 2, 0, &[0xfe; 1200]);
+    frame.reliability = RakReliability::Reliable;
+    receiver
+        .handle(datagram_at(0, vec![frame.clone()], start))
+        .unwrap();
+    assert!(receiver.inbound_spl_queue.is_empty());
+    assert!(receiver.inbound_rel_ahead.is_empty());
+    assert_eq!(receiver.state, RakSessionState::Connected);
+    for (sequence, after) in [
+        (1, SESSION_TIMEOUT / 3),
+        (2, SESSION_TIMEOUT * 2 / 3),
+        (3, SESSION_TIMEOUT - Duration::from_millis(1)),
+    ] {
+        let now = start + after;
+        receiver
+            .handle(datagram_at(0, vec![frame.clone()], now))
+            .unwrap();
+        let ping = ConnectedPing {
+            timestamp: sequence as i64,
+        }
+        .serialized()
+        .unwrap();
+        receiver
+            .handle(datagram_at(
+                sequence,
+                vec![Frame::new(RakReliability::Unreliable, ping)],
+                now,
+            ))
+            .unwrap();
+        receiver.handle(RakSessionInput::Update(now)).unwrap();
+        assert_eq!(receiver.state, RakSessionState::Connected);
+    }
+    receiver
+        .handle(RakSessionInput::Update(start + SESSION_TIMEOUT))
+        .unwrap();
+    assert_eq!(
+        disconnect_reason(&receiver),
+        Some(RakDisconnectReason::Timeout),
+        "retransmission and live control traffic must not erase an undelivered reliable obligation"
+    );
+}
