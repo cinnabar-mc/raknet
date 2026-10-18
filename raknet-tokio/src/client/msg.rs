@@ -1,7 +1,6 @@
 use crate::session::RakSession;
-use raknet::prelude::{RakClientError, RakSessionSnapshot};
+use raknet::prelude::{RakClientError, RakSession as RakSessionIntl};
 use std::net::SocketAddr;
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub enum RakClientMsg {
@@ -11,8 +10,7 @@ pub enum RakClientMsg {
     ),
     Ping(SocketAddr, oneshot::Sender<super::PingResult>),
     Adopt(
-        Box<RakSessionSnapshot>,
-        Duration,
+        Box<RakSessionIntl>,
         oneshot::Sender<Result<RakSession, RakClientError>>,
     ),
     Stop,

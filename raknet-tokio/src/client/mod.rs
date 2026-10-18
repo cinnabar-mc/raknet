@@ -220,16 +220,11 @@ impl RakClient {
                                         }
                                     }
                                 }
-                                RakClientMsg::Adopt(snapshot, elapsed, reply) => {
-                                    match RakSessionIntl::restore(*snapshot, now, elapsed) {
-                                        Ok(session) => match client.adopt(session) {
-                                            Ok(()) => connect = Some(reply),
-                                            Err(e) => {
-                                                let _ = reply.send(Err(e));
-                                            }
-                                        },
+                                RakClientMsg::Adopt(session, reply) => {
+                                    match client.adopt(*session) {
+                                        Ok(()) => connect = Some(reply),
                                         Err(e) => {
-                                            let _ = reply.send(Err(e.into()));
+                                            let _ = reply.send(Err(e));
                                         }
                                     }
                                 }
@@ -394,10 +389,11 @@ impl RakClient {
             return Err(RakClientError::Closed);
         };
 
+        let session = RakSessionIntl::restore(snapshot, Instant::now().into_std(), elapsed)?;
         let (tx, rx) = oneshot::channel();
 
         msg_tx
-            .send(RakClientMsg::Adopt(Box::new(snapshot), elapsed, tx))
+            .send(RakClientMsg::Adopt(Box::new(session), tx))
             .map_err(|_| RakClientError::Closed)?;
 
         rx.await.map_err(|_| RakClientError::Closed)?
@@ -418,6 +414,46 @@ impl RakClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
+        let now = Instant::now().into_std();
+        let original = RakSessionIntl::new(
+            RakSessionId(1),
+            "127.0.0.1:19132".parse().unwrap(),
+            7,
+            1492,
+            now,
+            RakClock::new(now - Duration::from_secs(5)),
+            Default::default(),
+        );
+        let snapshot = original.snapshot(now);
+        let (msg_tx, mut msg_rx) = unbounded_channel();
+        let client = RakClient {
+            state: RakClientState::Running {
+                handle: tokio::spawn(async {}),
+                msg_tx,
+            },
+        };
+        let adopting =
+            tokio::spawn(async move { client.adopt(snapshot, Duration::from_millis(100)).await });
+        let message = msg_rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let RakClientMsg::Adopt(session, reply) = message else {
+            panic!("adoption must deliver a session to the actor");
+        };
+        assert_eq!(
+            session
+                .snapshot(Instant::now().into_std())
+                .captured_uptime_ms,
+            8100
+        );
+        let _ = reply.send(Err(RakClientError::Closed));
+        assert!(matches!(
+            adopting.await.unwrap(),
+            Err(RakClientError::Closed)
+        ));
+    }
 
     #[tokio::test]
     async fn failed_ping_identity_reaches_the_reply_without_blocking_the_next_ping() {
