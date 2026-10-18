@@ -587,12 +587,27 @@ impl RakSession {
         }
     }
 
+    /// Schedules application traffic while keeping Immediate sends inside flow limits.
     fn send_frame(
         &mut self,
         frame: Frame,
         priority: RakPriority,
         now: Instant,
     ) -> Result<(), RakSessionError> {
+        let frames = self.prepare_frames(frame);
+        if priority == RakPriority::Immediate {
+            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
+            self.outbound_queue[priority as usize].extend(frames);
+            self.send_queue(now)?;
+            self.flush();
+        } else {
+            self.queue_frames(frames, priority, now)?;
+        }
+        Ok(())
+    }
+
+    /// Assigns wire counters and fragments one payload independently from scheduling.
+    fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
         let max_size = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
 
         let order_channel = frame.order_channel;
@@ -645,7 +660,7 @@ impl RakSession {
         }
 
         let split_size = payloads.len();
-        let frames: Vec<Frame> = payloads
+        payloads
             .into_iter()
             .enumerate()
             .map(|(i, payload)| Frame {
@@ -666,17 +681,13 @@ impl RakSession {
                 split_id,
                 split_index: i as u32,
             })
-            .collect();
+            .collect()
+    }
 
-        if priority == RakPriority::Immediate {
-            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
-            self.outbound_queue[priority as usize].extend(frames);
-            self.send_queue(now)?;
-            self.flush();
-        } else {
-            self.queue_frames(frames, priority, now)?;
-        }
-        Ok(())
+    /// Emits protocol control independently from application congestion and queue admission.
+    fn send_control(&mut self, frame: Frame, now: Instant) -> Result<(), RakSessionError> {
+        let frames = self.prepare_frames(frame);
+        self.queue_frames(frames, RakPriority::Immediate, now)
     }
 
     fn queue_frames(
@@ -774,12 +785,7 @@ impl RakSession {
         let ping = ConnectedPing {
             timestamp: self.clock.timestamp(now),
         };
-        self.handle(RakSessionInput::Send(
-            ping.serialized()?,
-            reliability,
-            RakPriority::Immediate,
-            now,
-        ))
+        self.send_control(Frame::new(reliability, ping.serialized()?), now)
     }
 
     /// Restores the completed handshake prefix before an optional terminal notification.
@@ -809,14 +815,12 @@ impl RakSession {
             timestamp: self.clock.timestamp(now),
         };
 
-        let reliability = RakReliability::Unreliable;
-        let priority = RakPriority::Immediate;
-        _ = self.handle(RakSessionInput::Send(
-            pong.serialized()?,
-            reliability,
-            priority,
-            now,
-        ));
+        if self.state != RakSessionState::Closing {
+            self.send_control(
+                Frame::new(RakReliability::Unreliable, pong.serialized()?),
+                now,
+            )?;
+        }
         Ok(())
     }
 
@@ -861,7 +865,8 @@ impl RakSession {
 
             let frame = Frame::new(RakReliability::ReliableOrdered, disconnect.serialized()?);
 
-            self.send_frame(frame, RakPriority::Immediate, now)?;
+            // Terminal control must leave before the adapter receives Disconnected.
+            self.send_control(frame, now)?;
         }
 
         self.state = RakSessionState::Disconnected;

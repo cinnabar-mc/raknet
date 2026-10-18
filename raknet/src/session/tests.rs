@@ -864,6 +864,65 @@ fn immediate_reliable_sends_obey_the_outstanding_window() {
 }
 
 #[test]
+fn terminal_notification_precedes_stopping_an_exhausted_sender() {
+    for immediate in [false, true] {
+        let mut sender = session(0, 1);
+        let now = domain_time();
+        for _ in 0..MAX_UNACKED_RELIABLE + 20 {
+            sender
+                .handle(RakSessionInput::Send(
+                    Box::new([0xfe]),
+                    RakReliability::ReliableOrdered,
+                    RakPriority::Immediate,
+                    now,
+                ))
+                .unwrap();
+        }
+        assert!(!sender.outbound_queue[RakPriority::Immediate as usize].is_empty());
+        drain_outputs(&mut sender);
+        let ping = ConnectedPing { timestamp: 42 }.serialized().unwrap();
+        sender
+            .handle(datagram_at(
+                0,
+                vec![Frame::new(RakReliability::Unreliable, ping)],
+                now,
+            ))
+            .unwrap();
+        let replies = payloads_of(&drain_outputs(&mut sender));
+        assert!(
+            replies
+                .iter()
+                .any(|payload| payload.first() == Some(&packet_id::CONNECTED_PONG)),
+            "protocol replies must progress while application sends are blocked"
+        );
+        if immediate {
+            sender.handle(RakSessionInput::DisconnectNow(now)).unwrap();
+        } else {
+            sender.handle(RakSessionInput::Disconnect(now)).unwrap();
+            sender
+                .handle(RakSessionInput::Update(
+                    now + sender.config.close_timeout + Duration::from_millis(1),
+                ))
+                .unwrap();
+        }
+        let outputs = drain_outputs(&mut sender);
+        assert!(
+            payloads_of(&outputs)
+                .iter()
+                .any(|payload| payload.as_ref() == [packet_id::DISCONNECT]),
+            "termination must emit its notification even when application sends are blocked"
+        );
+        assert!(matches!(
+            outputs.last(),
+            Some(RakSessionOutput::Disconnected(
+                _,
+                RakDisconnectReason::Requested
+            ))
+        ));
+    }
+}
+
+#[test]
 fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
     for split in [false, true] {
         let mut receiver = session(0, 1);
