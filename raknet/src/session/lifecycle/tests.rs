@@ -1,6 +1,6 @@
 use super::*;
 use crate::clock::RakClock;
-use crate::protocol::codec::RakCodec;
+use crate::protocol::codec::RakCodecHelper;
 use crate::protocol::packets::disconnect::Disconnect;
 
 /// Constructs private engine fixtures without exposing a public handoff bypass.

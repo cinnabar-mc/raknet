@@ -94,6 +94,7 @@ pub(crate) fn negotiated_pair(
             }
         }
         if let Some(session) = &mut local_session {
+            session.tick(now).unwrap();
             while let Some(output) = session.poll() {
                 if let RakSessionOutput::Datagram(bytes, _) = output {
                     server
@@ -104,6 +105,7 @@ pub(crate) fn negotiated_pair(
             }
         }
         if let Some(session) = &mut remote_session {
+            session.tick(now).unwrap();
             while let Some(output) = session.poll() {
                 if let RakSessionOutput::Datagram(bytes, _) = output {
                     client
@@ -114,7 +116,11 @@ pub(crate) fn negotiated_pair(
             }
         }
         if !moved && local_session.is_some() && remote_session.is_some() {
-            return (local_session.unwrap(), remote_session.unwrap());
+            let local_session = local_session.unwrap();
+            let remote_session = remote_session.unwrap();
+            assert_eq!(local_session.outbound_bytes(), 0);
+            assert_eq!(remote_session.outbound_bytes(), 0);
+            return (local_session, remote_session);
         }
     }
     panic!("public negotiation did not complete within the controlled work bound");
