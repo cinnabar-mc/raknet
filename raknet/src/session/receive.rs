@@ -12,12 +12,12 @@ use crate::protocol::packets::frame_set::FrameSet;
 use crate::protocol::types::frame::Frame;
 use crate::util::u24;
 use std::io::Cursor;
-use std::time::SystemTime;
+use std::time::Instant;
 use tracing::debug;
 
 impl RakSession {
     /// Releases fragment payloads whose reassemblies have stopped making progress.
-    pub(super) fn evict_stale_splits(&mut self, now: SystemTime) {
+    pub(super) fn evict_stale_splits(&mut self, now: Instant) {
         let last = &self.inbound_spl_last;
         let mut freed = 0;
         self.inbound_spl_queue.retain(|split_id, fragments| {
@@ -46,7 +46,7 @@ impl RakSession {
     pub(super) fn handle_frame_set(
         &mut self,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         let set = FrameSet::deserialize(buf)?;
 
@@ -96,7 +96,7 @@ impl RakSession {
     pub(super) fn handle_frame(
         &mut self,
         frame: Frame,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         if frame.reliability.is_reliable() && !self.track_reliable(frame.reliable_index) {
             debug!(
@@ -145,7 +145,7 @@ impl RakSession {
     pub(super) fn handle_full_frame(
         &mut self,
         frame: Frame,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         let channel = frame.order_channel as usize;
 
@@ -239,7 +239,7 @@ impl RakSession {
     pub(super) fn handle_split_frame(
         &mut self,
         frame: Frame,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         if frame.split_index >= frame.split_size {
             debug!(

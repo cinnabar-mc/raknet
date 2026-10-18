@@ -1,9 +1,66 @@
 use super::*;
 use crate::util::flags;
 
+#[test]
+fn ping_counters_and_latency_use_the_endpoint_origin() {
+    let origin = crate::clock::test_now();
+    let clock = RakClock::new(origin);
+    let mut client = RakClient::new(RakClientConfig::default(), clock);
+    let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, 19132));
+    let sent = origin + Duration::from_millis(1234);
+    client
+        .handle(RakClientInput::Ping {
+            remote,
+            guid: crate::client::TEST_CLIENT_GUID,
+            now: sent,
+        })
+        .unwrap();
+    let Some(RakClientOutput::SocketDatagram(bytes, _)) = client.poll() else {
+        panic!("ping must emit an offline datagram");
+    };
+    let ping = UnconnectedPing::deserialize(&mut Cursor::new(bytes.as_ref())).unwrap();
+    assert_eq!(ping.timestamp, 1234);
+
+    let received = sent + Duration::from_micros(2500);
+    for echoed in [ping.timestamp, u64::MAX] {
+        let pong = UnconnectedPong {
+            timestamp: echoed,
+            guid: 1,
+            message: Box::from(*b"peer"),
+        };
+        client
+            .handle(RakClientInput::Datagram(
+                pong.serialized().unwrap(),
+                remote,
+                received,
+            ))
+            .unwrap();
+        let Some(RakClientOutput::Pong {
+            echoed_timestamp,
+            latency,
+            ..
+        }) = client.poll()
+        else {
+            panic!("pong must return its raw counter and monotonic latency");
+        };
+        assert_eq!(echoed_timestamp, echoed);
+        assert_eq!(
+            latency,
+            if echoed == ping.timestamp {
+                Duration::from_micros(2500)
+            } else {
+                Duration::ZERO
+            }
+        );
+    }
+}
+
 /// Returns the first probe's payload length for a fresh synthetic connection.
 fn request_1_len(addr: SocketAddr) -> u16 {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     client
         .handle(RakClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
@@ -19,8 +76,8 @@ fn request_1_len(addr: SocketAddr) -> u16 {
 }
 
 /// Supplies a reproducible domain timestamp without reading the clock.
-fn domain_time() -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(1000)
+fn domain_time() -> Instant {
+    crate::clock::test_now() + Duration::from_secs(1000)
 }
 
 #[test]
@@ -34,12 +91,15 @@ fn request_1_leaves_room_for_the_ip_and_udp_headers() {
 
 #[test]
 fn overall_connect_timeout_fails_regardless_of_attempts() {
-    let mut client = RakClient::new(RakClientConfig {
-        conn_attempt_timeout: Duration::from_millis(100),
-        conn_attempt_interval: Duration::from_millis(1000),
-        conn_attempt_max: 100,
-        ..RakClientConfig::default()
-    });
+    let mut client = RakClient::new(
+        RakClientConfig {
+            conn_attempt_timeout: Duration::from_millis(100),
+            conn_attempt_interval: Duration::from_millis(1000),
+            conn_attempt_max: 100,
+            ..RakClientConfig::default()
+        },
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
 
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
@@ -70,7 +130,10 @@ fn last_wait(client: &mut RakClient) -> Option<Duration> {
 
 #[test]
 fn connected_client_schedules_a_wait_instead_of_spinning() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
@@ -102,7 +165,10 @@ fn connected_client_schedules_a_wait_instead_of_spinning() {
 
 #[test]
 fn failed_connect_schedules_a_wait_instead_of_spinning() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
@@ -129,7 +195,10 @@ fn failed_connect_schedules_a_wait_instead_of_spinning() {
 
 #[test]
 fn disconnect_input_allows_reconnect() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
 
     client.state = RakClientState::Connected(addr);
@@ -175,7 +244,10 @@ fn reply_2(addr: SocketAddr, mtu: u16) -> Box<[u8]> {
 
 #[test]
 fn reply_2_above_the_maximum_mtu_is_clamped() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
     client
@@ -208,7 +280,10 @@ fn reply_2_above_the_maximum_mtu_is_clamped() {
 
 #[test]
 fn handshake_session_resends_connection_request() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let t0 = domain_time();
 
@@ -244,10 +319,13 @@ fn handshake_session_resends_connection_request() {
 
 #[test]
 fn failed_connect_resets_and_schedules_a_wait() {
-    let mut client = RakClient::new(RakClientConfig {
-        conn_attempt_timeout: Duration::from_millis(100),
-        ..RakClientConfig::default()
-    });
+    let mut client = RakClient::new(
+        RakClientConfig {
+            conn_attempt_timeout: Duration::from_millis(100),
+            ..RakClientConfig::default()
+        },
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
@@ -273,7 +351,10 @@ fn failed_connect_resets_and_schedules_a_wait() {
 
 #[test]
 fn incompatible_protocol_resets_state() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
 
@@ -300,7 +381,10 @@ fn incompatible_protocol_resets_state() {
 
 #[test]
 fn connect_while_connecting_is_rejected() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
 

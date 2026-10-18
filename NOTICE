@@ -21,3 +21,7 @@ ordered transfer of pending packets and terminal notifications.
 Default client GUID generation uses fresh OS entropy for each ping/connection,
 with the reference's little-endian payload mapping and client type bits. Identity
 is supplied explicitly to the Rust engine and retained in attempt metadata.
+
+Wire timestamps use endpoint-relative monotonic uptime, following the same
+reference's timestamp and remote SystemUptime behavior. Portable Rust snapshots
+rebase their timer offsets using caller-supplied transfer elapsed time.

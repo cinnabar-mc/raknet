@@ -4,6 +4,7 @@ pub mod error;
 pub mod input;
 pub mod output;
 
+use crate::clock::RakClock;
 use crate::protocol::codec::{RakCodec, RakCodecHelper};
 use crate::protocol::packets::already_connected::AlreadyConnected;
 use crate::protocol::packets::connection_request::ConnectionRequest;
@@ -21,6 +22,7 @@ use crate::protocol::packets::unconnected_pong::UnconnectedPong;
 use crate::sans::Sans;
 use crate::server::error::RakServerError;
 use crate::server::input::RakServerInput;
+use crate::session::config::RakSessionConfig;
 use crate::session::input::RakSessionInput;
 use crate::session::output::RakSessionOutput;
 use crate::session::state::RakSessionState;
@@ -37,7 +39,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, RandomState};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 const RECENTLY_CONNECTED_COOLDOWN: Duration = Duration::from_millis(5000);
@@ -48,25 +50,26 @@ const COOKIE_ROTATION_INTERVAL: Duration = Duration::from_secs(2);
 pub struct RakServer {
     addr: SocketAddr,
     config: RakServerConfig,
+    clock: RakClock,
 
     session_id: RakSessionId,
     session_map: HashMap<SocketAddr, RakSessionId>,
     session_addr: HashMap<RakSessionId, SocketAddr>,
-    session_pending: HashMap<SocketAddr, (SystemTime, RakSession)>,
+    session_pending: HashMap<SocketAddr, (Instant, RakSession)>,
 
-    recently_disconnected: HashMap<SocketAddr, SystemTime>,
+    recently_disconnected: HashMap<SocketAddr, Instant>,
 
-    offline_window: SystemTime,
+    offline_window: Instant,
     offline_total: i32,
     offline_per_ip: HashMap<IpAddr, i32>,
 
-    online_window: SystemTime,
+    online_window: Instant,
     online_per_ip: HashMap<IpAddr, i32>,
-    blocked: HashMap<IpAddr, SystemTime>,
+    blocked: HashMap<IpAddr, Instant>,
 
     cookie_key: RandomState,
     cookie_salts: [u64; 2],
-    cookie_rotated: SystemTime,
+    cookie_rotated: Instant,
 
     output: VecDeque<RakServerOutput>,
 }
@@ -113,8 +116,7 @@ impl Sans for RakServer {
 
                 self.recently_disconnected
                     .retain(|_, &mut disconnected_at| {
-                        now.duration_since(disconnected_at).unwrap_or_default()
-                            < RECENTLY_CONNECTED_COOLDOWN
+                        now.saturating_duration_since(disconnected_at) < RECENTLY_CONNECTED_COOLDOWN
                     });
             }
             RakServerInput::Update(now) => {
@@ -133,10 +135,12 @@ impl Sans for RakServer {
 }
 
 impl RakServer {
-    pub fn new(config: RakServerConfig, addr: SocketAddr) -> Self {
+    /// Creates an endpoint with explicit wire-counter origin and initial timer time.
+    pub fn new(config: RakServerConfig, addr: SocketAddr, clock: RakClock, now: Instant) -> Self {
         Self {
             config,
             addr,
+            clock,
 
             session_id: RakSessionId(0),
             session_map: HashMap::new(),
@@ -144,16 +148,16 @@ impl RakServer {
             session_pending: HashMap::new(),
             recently_disconnected: HashMap::new(),
 
-            offline_window: SystemTime::UNIX_EPOCH,
+            offline_window: now,
             offline_total: 0,
             offline_per_ip: HashMap::new(),
-            online_window: SystemTime::UNIX_EPOCH,
+            online_window: now,
             online_per_ip: HashMap::new(),
             blocked: HashMap::new(),
 
             cookie_key: RandomState::new(),
             cookie_salts: [random(), random()],
-            cookie_rotated: SystemTime::UNIX_EPOCH,
+            cookie_rotated: now,
 
             output: VecDeque::new(),
         }
@@ -178,8 +182,8 @@ impl RakServer {
             .push_back(RakServerOutput::SessionConnected(Box::new(session)));
     }
 
-    fn rotate_cookie_salt(&mut self, now: SystemTime) {
-        let elapsed = now.duration_since(self.cookie_rotated).unwrap_or_default();
+    fn rotate_cookie_salt(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.cookie_rotated);
 
         if elapsed >= COOKIE_ROTATION_INTERVAL * 2 {
             self.cookie_salts = [random(), random()];
@@ -219,9 +223,8 @@ impl RakServer {
         }
     }
 
-    fn rate_limited(&mut self, addr: SocketAddr, now: SystemTime) -> bool {
-        if now.duration_since(self.offline_window).unwrap_or_default() >= OFFLINE_RATE_LIMIT_WINDOW
-        {
+    fn rate_limited(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        if now.saturating_duration_since(self.offline_window) >= OFFLINE_RATE_LIMIT_WINDOW {
             self.offline_window = now;
             self.offline_total = 0;
             self.offline_per_ip.clear();
@@ -241,9 +244,8 @@ impl RakServer {
         *count > self.config.packet_limit
     }
 
-    fn online_rate_limited(&mut self, ip: IpAddr, now: SystemTime) -> bool {
-        if now.duration_since(self.online_window).unwrap_or_default()
-            >= constants::ONLINE_RATE_LIMIT_WINDOW
+    fn online_rate_limited(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if now.saturating_duration_since(self.online_window) >= constants::ONLINE_RATE_LIMIT_WINDOW
         {
             self.online_window = now;
             self.online_per_ip.clear();
@@ -254,7 +256,7 @@ impl RakServer {
         *count > self.config.online_packet_limit
     }
 
-    fn blocked(&mut self, ip: IpAddr, now: SystemTime) -> bool {
+    fn blocked(&mut self, ip: IpAddr, now: Instant) -> bool {
         let ip = ip.to_canonical();
         match self.blocked.get(&ip) {
             Some(&until) if now < until => true,
@@ -266,7 +268,7 @@ impl RakServer {
         }
     }
 
-    fn tick_temp_sessions(&mut self, now: SystemTime) -> Result<(), RakServerError> {
+    fn tick_temp_sessions(&mut self, now: Instant) -> Result<(), RakServerError> {
         let mut closed = Vec::new();
 
         for (&addr, (_, session)) in self.session_pending.iter_mut() {
@@ -289,12 +291,12 @@ impl RakServer {
         Ok(())
     }
 
-    fn evict_stale_temp_sessions(&mut self, now: SystemTime) {
+    fn evict_stale_temp_sessions(&mut self, now: Instant) {
         let stale: Vec<SocketAddr> = self
             .session_pending
             .iter()
             .filter(|(_, (created, _))| {
-                now.duration_since(*created).unwrap_or_default() >= PENDING_CONNECTION_TIMEOUT
+                now.saturating_duration_since(*created) >= PENDING_CONNECTION_TIMEOUT
             })
             .map(|(&addr, _)| addr)
             .collect();
@@ -310,7 +312,7 @@ impl RakServer {
         &mut self,
         buf: &[u8],
         addr: SocketAddr,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakServerError> {
         if self.rate_limited(addr, now) {
             return Ok(());
@@ -339,7 +341,7 @@ impl RakServer {
         &mut self,
         buf: Box<[u8]>,
         addr: SocketAddr,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakServerError> {
         if self.online_rate_limited(addr.ip(), now) {
             debug!(
@@ -445,7 +447,7 @@ impl RakServer {
         &mut self,
         cursor: &mut Cursor<&[u8]>,
         addr: SocketAddr,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakServerError> {
         let request = OpenConnectionRequest1::deserialize(cursor)?;
 
@@ -472,7 +474,7 @@ impl RakServer {
         }
 
         if let Some(&disconnected_at) = self.recently_disconnected.get(&addr)
-            && now.duration_since(disconnected_at).unwrap_or_default() < RECENTLY_CONNECTED_COOLDOWN
+            && now.saturating_duration_since(disconnected_at) < RECENTLY_CONNECTED_COOLDOWN
         {
             debug!("refusing connection from {} due to recent disconnect", addr);
 
@@ -510,7 +512,7 @@ impl RakServer {
         &mut self,
         cursor: &mut Cursor<&[u8]>,
         addr: SocketAddr,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakServerError> {
         let request = OpenConnectionRequest2::deserialize(cursor)?;
 
@@ -592,9 +594,18 @@ impl RakServer {
         self.session_map.insert(addr, id);
         self.session_addr.insert(id, addr);
 
-        let session = RakSession::new(id, addr, request.client, request.mtu, now, |conf| {
-            conf.ordering_channels = self.config.max_ordering_channels;
-        });
+        let session = RakSession::new(
+            id,
+            addr,
+            request.client,
+            request.mtu,
+            now,
+            self.clock,
+            RakSessionConfig {
+                ordering_channels: self.config.max_ordering_channels,
+                ..Default::default()
+            },
+        );
 
         self.session_pending.insert(addr, (now, session));
 
@@ -605,7 +616,7 @@ impl RakServer {
         session: &mut RakSession,
         addr: SocketAddr,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakServerError> {
         let request = ConnectionRequest::deserialize(buf)?;
 
@@ -616,7 +627,7 @@ impl RakServer {
             system_index: 0,
             system_addresses: vec![SocketAddr::new(unspecified_ip_like(addr), 0); 10],
             request_timestamp: request.client_timestamp,
-            timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
+            timestamp: session.clock.timestamp(now),
         };
 
         session.handle(RakSessionInput::Send(

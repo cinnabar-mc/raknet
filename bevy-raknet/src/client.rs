@@ -5,7 +5,7 @@ use raknet::prelude::{RakClient as RakClientIntl, RakSession as RakSessionIntl, 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
@@ -51,7 +51,7 @@ pub struct RakClient {
     socket: UdpSocket,
     session: Option<RakSessionIntl>,
     received: VecDeque<Box<[u8]>>,
-    pongs: VecDeque<(SocketAddr, Box<[u8]>, SystemTime)>,
+    pongs: VecDeque<(SocketAddr, Box<[u8]>, Duration)>,
     events: VecDeque<RakClientEvent>,
     buffer: Box<[u8]>,
 }
@@ -77,7 +77,7 @@ impl RakClient {
             received: VecDeque::new(),
             pongs: VecDeque::new(),
             events: VecDeque::new(),
-            intl: RakClientIntl::new(config),
+            intl: RakClientIntl::new(config, RakClock::new(Instant::now())),
         })
     }
 
@@ -100,7 +100,7 @@ impl RakClient {
             remote: addr,
             local,
             guid,
-            now: SystemTime::now(),
+            now: Instant::now(),
         }) {
             debug!("client failed to start connection: {error}");
         }
@@ -117,7 +117,7 @@ impl RakClient {
         let _ = self.intl.handle(RakClientInput::Ping {
             remote: addr,
             guid,
-            now: SystemTime::now(),
+            now: Instant::now(),
         });
     }
 
@@ -146,7 +146,7 @@ impl RakClient {
             buf.into(),
             reliability,
             priority,
-            SystemTime::now(),
+            Instant::now(),
         ))?;
 
         if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
@@ -163,7 +163,7 @@ impl RakClient {
         self.received.pop_front()
     }
 
-    pub fn recv_pong(&mut self) -> Option<(SocketAddr, Box<[u8]>, SystemTime)> {
+    pub fn recv_pong(&mut self) -> Option<(SocketAddr, Box<[u8]>, Duration)> {
         self.pongs.pop_front()
     }
 
@@ -174,7 +174,7 @@ impl RakClient {
             return;
         };
 
-        let _ = session.handle(RakSessionInput::Disconnect(SystemTime::now()));
+        let _ = session.handle(RakSessionInput::Disconnect(Instant::now()));
 
         if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
             self.session = None;
@@ -189,7 +189,7 @@ impl RakClient {
     }
 
     pub fn update(&mut self) {
-        let now = SystemTime::now();
+        let now = Instant::now();
 
         for _ in 0..MAX_DATAGRAMS_PER_TICK {
             match self.socket.recv_from(&mut self.buffer) {
@@ -219,7 +219,7 @@ impl RakClient {
                     let elapsed = started.elapsed();
                     let input = RakClientInput::MtuProbeResult {
                         id,
-                        now: SystemTime::now(),
+                        now: Instant::now(),
                         elapsed,
                         too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
                     };
@@ -242,7 +242,12 @@ impl RakClient {
                     self.events.push_back(RakClientEvent::Connected);
                 }
                 RakClientOutput::Wait(_) => {}
-                RakClientOutput::Pong(addr, msg, time) => self.pongs.push_back((addr, msg, time)),
+                RakClientOutput::Pong {
+                    addr,
+                    message,
+                    latency,
+                    ..
+                } => self.pongs.push_back((addr, message, latency)),
             }
         }
 
@@ -265,7 +270,7 @@ impl Drop for RakClient {
             return;
         };
 
-        let _ = session.handle(RakSessionInput::DisconnectNow(SystemTime::now()));
+        let _ = session.handle(RakSessionInput::DisconnectNow(Instant::now()));
 
         while let Some(output) = session.poll() {
             if let RakSessionOutput::Datagram(buf, addr) = output {

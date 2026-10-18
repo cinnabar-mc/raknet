@@ -75,8 +75,17 @@ A RakNet transport library written in Rust.
 
 ### Sans-I/O connection drivers
 
-The core receives caller-supplied `SystemTime` values. Pass the same clock to
-`RakSession::new` and `RakSession::restore` that drives subsequent session inputs.
+The core receives caller-supplied `std::time::Instant` values. Create a `RakClock`
+from the endpoint start time and reuse it across connection attempts; wire
+counters are milliseconds of monotonic uptime. Session construction takes an
+owned `RakSessionConfig`. Authentication UTC is independent of transport time.
+
+`snapshot(now)` captures portable millisecond offsets without serializing an
+`Instant`. To move a session between processes, call `restore(snapshot, now,
+elapsed)` with the destination clock and time since capture. SDK `adopt` takes
+the same elapsed duration. Invalid address or clock ranges return a typed error.
+Drain pending output before capture; a restored closing session receives a fresh
+close timeout.
 
 A `RakClientOutput::MtuProbe` transfers one probe write to the I/O adapter. Measure
 only the socket write, then submit its opaque ID, completion time, elapsed write

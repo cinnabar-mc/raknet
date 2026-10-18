@@ -2,7 +2,7 @@
 
 use super::{RakClientConfig, RakClientError};
 use crate::util::constants;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use constants::MTU_PROBE_ATTEMPTS_PER_SIZE as ATTEMPTS_PER_SIZE;
 const URGENT_DELAY: Duration = Duration::from_millis(10);
@@ -14,7 +14,7 @@ pub struct MtuProbeId(pub(super) u64);
 #[derive(Clone, Debug)]
 struct PendingProbe {
     id: MtuProbeId,
-    started: SystemTime,
+    started: Instant,
     rung: usize,
 }
 
@@ -24,13 +24,13 @@ pub(super) struct MtuProbes {
     count: usize,
     limit: usize,
     interval: Duration,
-    next: Option<SystemTime>,
+    next: Option<Instant>,
     pending: Option<PendingProbe>,
 }
 
 impl MtuProbes {
     /// Derives distinct descending probe sizes within the validated caller's bounds.
-    pub(super) fn new(config: &RakClientConfig, now: SystemTime) -> Self {
+    pub(super) fn new(config: &RakClientConfig, now: Instant) -> Self {
         let floor = config.min_mtu_size.max(constants::MIN_PROBE_MTU_SIZE);
         let mut sizes = vec![config.max_mtu_size];
         for size in constants::MTU_SIZES
@@ -54,7 +54,7 @@ impl MtuProbes {
     }
 
     /// Takes one due probe; its completion must arrive before another is emitted.
-    pub(super) fn take(&mut self, now: SystemTime, id: MtuProbeId) -> Option<u16> {
+    pub(super) fn take(&mut self, now: Instant, id: MtuProbeId) -> Option<u16> {
         if self.pending.is_some() || self.count >= self.limit || self.next? > now {
             return None;
         }
@@ -73,7 +73,7 @@ impl MtuProbes {
     pub(super) fn completed(
         &mut self,
         id: MtuProbeId,
-        now: SystemTime,
+        now: Instant,
         elapsed: Duration,
         too_large: bool,
     ) -> Result<bool, RakClientError> {
@@ -107,13 +107,13 @@ impl MtuProbes {
     }
 
     /// Returns the next retry deadline, excluding a write already owned by the adapter.
-    pub(super) fn next(&self) -> Option<SystemTime> {
+    pub(super) fn next(&self) -> Option<Instant> {
         self.next
     }
 }
 
 /// Rejects unrepresentable domain deadlines instead of panicking on caller input.
-pub(super) fn deadline(now: SystemTime, after: Duration) -> Result<SystemTime, RakClientError> {
+pub(super) fn deadline(now: Instant, after: Duration) -> Result<Instant, RakClientError> {
     now.checked_add(after).ok_or(RakClientError::InvalidConfig(
         "connection deadline is too large",
     ))

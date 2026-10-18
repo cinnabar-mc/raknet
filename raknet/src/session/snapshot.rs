@@ -4,20 +4,21 @@ use super::config::RakSessionConfig;
 use super::congestion_controller::{RakCongestionController, RakCongestionSnapshot};
 use super::state::RakSessionState;
 use super::{RakSession, RakSessionId};
+use crate::clock::RakClock;
 use crate::protocol::codec::RakCodec;
 use crate::protocol::packets::frame_set::FrameSet;
 use crate::protocol::types::frame::Frame;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::AddrParseError;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// [`RakSession`] in a serializable form, so a session can be moved to another process
 /// and resumed there.
 ///
-/// Times are milliseconds from [`RakSessionSnapshot::epoch_ms`], and the queues are
-/// `Vec`s, since `SystemTime`, `VecDeque` and `BinaryHeap` have no `Facet` impl. Pending
-/// output is not carried - drain it with `poll()` before taking a snapshot.
+/// Times are millisecond offsets from the endpoint's wire-counter origin. Restore
+/// rebases them onto the destination's monotonic clock using explicit transfer
+/// elapsed time. Pending output is not carried; drain `poll()` before capture.
 #[derive(Clone, Debug, facet::Facet)]
 pub struct RakSessionSnapshot {
     pub id: u64,
@@ -28,8 +29,8 @@ pub struct RakSessionSnapshot {
     pub mtu: u16,
     pub config: RakSessionConfig,
 
-    /// Wall clock the offsets below are measured from.
-    pub epoch_ms: u64,
+    /// Endpoint uptime when this snapshot was captured.
+    pub captured_uptime_ms: u64,
     pub last_tick_ms: u64,
     pub last_ping_ms: u64,
     pub last_recv_ms: u64,
@@ -60,10 +61,19 @@ pub struct RakSessionSnapshot {
     pub inbound_seq_idx: [u32; 32],
 }
 
+/// A snapshot cannot be reconstructed in the destination clock or address space.
+#[derive(Debug, thiserror::Error)]
+pub enum RakSessionRestoreError {
+    #[error("invalid snapshot address: {0}")]
+    InvalidAddress(#[from] AddrParseError),
+    #[error("snapshot time is outside the monotonic clock range")]
+    TimeOutOfRange,
+}
+
 impl RakSession {
     /// Captures this session's protocol state.
-    pub fn snapshot(&self) -> RakSessionSnapshot {
-        let epoch = UNIX_EPOCH;
+    pub fn snapshot(&self, now: Instant) -> RakSessionSnapshot {
+        let clock = self.clock;
         RakSessionSnapshot {
             id: self.id.0,
             addr: self.addr.to_string(),
@@ -72,13 +82,13 @@ impl RakSession {
             mtu: self.mtu,
             config: self.config.clone(),
 
-            epoch_ms: 0,
-            last_tick_ms: millis_since(epoch, self.last_tick),
-            last_ping_ms: millis_since(epoch, self.last_ping),
-            last_recv_ms: millis_since(epoch, self.last_recv),
-            last_pong_ms: millis_since(epoch, self.last_pong),
+            captured_uptime_ms: clock.timestamp(now),
+            last_tick_ms: clock.timestamp(self.last_tick),
+            last_ping_ms: clock.timestamp(self.last_ping),
+            last_recv_ms: clock.timestamp(self.last_recv),
+            last_pong_ms: clock.timestamp(self.last_pong),
 
-            congestion_controller: self.congestion_controller.snapshot(epoch),
+            congestion_controller: self.congestion_controller.snapshot(clock),
 
             queue: self
                 .queue
@@ -101,7 +111,7 @@ impl RakSession {
             outbound_resend: self
                 .outbound_resend
                 .iter()
-                .map(|(at, seq)| (millis_since(epoch, at.0), *seq))
+                .map(|(at, seq)| (clock.timestamp(at.0), *seq))
                 .collect(),
             outbound_ord_idx: self.outbound_ord_idx,
             outbound_seq_idx: self.outbound_seq_idx,
@@ -116,10 +126,26 @@ impl RakSession {
         }
     }
 
-    /// Rebuilds a session from [`RakSession::snapshot`], using caller time for a closing session.
-    pub fn restore(snapshot: RakSessionSnapshot, now: SystemTime) -> Result<Self, AddrParseError> {
-        let epoch = UNIX_EPOCH + Duration::from_millis(snapshot.epoch_ms);
-        let at = |offset: u64| epoch + Duration::from_millis(offset);
+    /// Resumes saved timers and wire uptime in the destination's monotonic clock.
+    ///
+    /// `elapsed` is the time since capture, supplied by the transfer owner. Closing
+    /// sessions retain the existing policy of a fresh close timeout at `now`.
+    ///
+    /// # Errors
+    /// Returns an error for invalid addresses or unrepresentable saved times.
+    pub fn restore(
+        snapshot: RakSessionSnapshot,
+        now: Instant,
+        elapsed: Duration,
+    ) -> Result<Self, RakSessionRestoreError> {
+        let clock = RakClock::restore(snapshot.captured_uptime_ms, now, elapsed)
+            .ok_or(RakSessionRestoreError::TimeOutOfRange)?;
+        let at = |offset| {
+            clock
+                .at(offset)
+                .ok_or(RakSessionRestoreError::TimeOutOfRange)
+        };
+        let last_recv = at(snapshot.last_recv_ms)?;
 
         let mut outbound_queue: [VecDeque<Frame>; 4] = Default::default();
         for (channel, frames) in snapshot.outbound_queue.into_iter().enumerate().take(4) {
@@ -138,7 +164,7 @@ impl RakSession {
         let inbound_spl_bytes = payload_bytes(&inbound_spl_queue);
         let inbound_spl_last = inbound_spl_queue
             .keys()
-            .map(|&split_id| (split_id, at(snapshot.last_recv_ms)))
+            .map(|&split_id| (split_id, last_recv))
             .collect();
         let inbound_ord_queue = rebuild_nested(snapshot.inbound_ord_queue);
         let inbound_ord_bytes = payload_bytes(&inbound_ord_queue);
@@ -156,17 +182,18 @@ impl RakSession {
             guid: snapshot.guid,
             mtu: snapshot.mtu,
             config: snapshot.config,
+            clock,
 
-            last_tick: at(snapshot.last_tick_ms),
-            last_ping: at(snapshot.last_ping_ms),
-            last_recv: at(snapshot.last_recv_ms),
-            last_pong: at(snapshot.last_pong_ms),
+            last_tick: at(snapshot.last_tick_ms)?,
+            last_ping: at(snapshot.last_ping_ms)?,
+            last_recv: at(snapshot.last_recv_ms)?,
+            last_pong: at(snapshot.last_pong_ms)?,
             closing_since: (snapshot.state == RakSessionState::Closing).then_some(now),
 
             congestion_controller: RakCongestionController::restore(
                 snapshot.congestion_controller,
-                epoch,
-            ),
+                clock,
+            )?,
             bandwidth_limited: false,
 
             queue,
@@ -183,8 +210,8 @@ impl RakSession {
             outbound_resend: snapshot
                 .outbound_resend
                 .into_iter()
-                .map(|(offset, seq)| (Reverse(at(offset)), seq))
-                .collect(),
+                .map(|(offset, seq)| Ok((Reverse(at(offset)?), seq)))
+                .collect::<Result<_, RakSessionRestoreError>>()?,
             outbound_ord_idx: snapshot.outbound_ord_idx,
             outbound_seq_idx: snapshot.outbound_seq_idx,
 
@@ -209,10 +236,6 @@ fn payload_bytes<K>(map: &HashMap<K, HashMap<u32, Frame>>) -> usize {
         .flat_map(HashMap::values)
         .map(|f| f.payload.len())
         .sum()
-}
-
-fn millis_since(epoch: SystemTime, at: SystemTime) -> u64 {
-    at.duration_since(epoch).unwrap_or_default().as_millis() as u64
 }
 
 /// JSON object keys are strings, so maps keyed by an integer are carried as pairs.

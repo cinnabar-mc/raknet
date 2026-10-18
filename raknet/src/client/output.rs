@@ -2,7 +2,7 @@
 use super::MtuProbeId;
 use crate::session::RakSession;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub enum RakClientOutput {
@@ -16,5 +16,11 @@ pub enum RakClientOutput {
     SessionDatagram(Box<[u8]>),
     SessionConnected(Box<RakSession>),
     Wait(Duration),
-    Pong(SocketAddr, Box<[u8]>, SystemTime),
+    /// A reply with the echoed wire counter and measured monotonic latency.
+    Pong {
+        addr: SocketAddr,
+        message: Box<[u8]>,
+        echoed_timestamp: u64,
+        latency: Duration,
+    },
 }

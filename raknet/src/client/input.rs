@@ -2,13 +2,13 @@
 use super::{ClientGuid, MtuProbeId};
 use std::net::SocketAddr;
 use std::time::Duration;
-use std::time::SystemTime;
+use std::time::Instant;
 
 pub enum RakClientInput {
     /// Completes a probe write. `elapsed` covers the socket write only, including failures.
     MtuProbeResult {
         id: MtuProbeId,
-        now: SystemTime,
+        now: Instant,
         elapsed: Duration,
         too_large: bool,
     },
@@ -16,7 +16,7 @@ pub enum RakClientInput {
     Ping {
         remote: SocketAddr,
         guid: ClientGuid,
-        now: SystemTime,
+        now: Instant,
     },
     /// Starts negotiation with the remote endpoint and the adapter's bound local address.
     ///
@@ -27,9 +27,9 @@ pub enum RakClientInput {
         remote: SocketAddr,
         local: SocketAddr,
         guid: ClientGuid,
-        now: SystemTime,
+        now: Instant,
     },
-    Datagram(Box<[u8]>, SocketAddr, SystemTime),
-    Update(SystemTime),
+    Datagram(Box<[u8]>, SocketAddr, Instant),
+    Update(Instant),
     Disconnect,
 }

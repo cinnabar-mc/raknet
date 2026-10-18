@@ -4,7 +4,7 @@ pub mod command;
 use crate::session::command::RakSessionMsg;
 use raknet::prelude::{RakSession as RakSessionIntl, *};
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::sync::oneshot;
@@ -47,13 +47,13 @@ impl RakSession {
                     Some(msg) = msg_rx.recv() => {
                         match msg {
                             RakSessionMsg::Send(buf, reliability, priority, sender) => {
-                                let now = SystemTime::now();
+                                let now = Instant::now().into_std();
 
                                 let res = session.handle(RakSessionInput::Send(buf, reliability, priority, now));
                                 let _ = sender.send(res);
                             }
                             RakSessionMsg::Close(sender) => {
-                                let now = SystemTime::now();
+                                let now = Instant::now().into_std();
 
                                 let res = session.handle(RakSessionInput::Disconnect(now));
                                 let _ = sender.send(res);
@@ -63,7 +63,7 @@ impl RakSession {
                                 let _ = sender.send(closed);
                             },
                             RakSessionMsg::Snapshot(sender) => {
-                                let _ = sender.send(session.snapshot());
+                                let _ = sender.send(session.snapshot(Instant::now().into_std()));
                             },
                         }
                     }
@@ -72,11 +72,11 @@ impl RakSession {
                             let _ = session.handle(recv);
                         }
                         None => {
-                            let _ = session.handle(RakSessionInput::DisconnectNow(SystemTime::now()));
+                            let _ = session.handle(RakSessionInput::DisconnectNow(Instant::now().into_std()));
                         }
                     },
                     _ = &mut timer => {
-                        let now = SystemTime::now();
+                        let now = Instant::now().into_std();
 
                         let _ = session.handle(RakSessionInput::Update(now));
                     }
@@ -97,8 +97,9 @@ impl RakSession {
                                 debug!(
                                     "closing session with {addr}, its packets are not being read"
                                 );
-                                let _ = session
-                                    .handle(RakSessionInput::DisconnectNow(SystemTime::now()));
+                                let _ = session.handle(RakSessionInput::DisconnectNow(
+                                    Instant::now().into_std(),
+                                ));
                             }
                         }
                         RakSessionOutput::Disconnected(..) => {
@@ -191,13 +192,18 @@ mod tests {
 
     #[tokio::test]
     async fn max_message_len_comes_from_the_session_config() {
+        let now = Instant::now().into_std();
         let session = RakSessionIntl::new(
             RakSessionId(0),
             "127.0.0.1:19132".parse().unwrap(),
             0,
             1492,
-            SystemTime::now(),
-            |conf| conf.max_queued_bytes = 1 << 20,
+            now,
+            RakClock::new(now),
+            RakSessionConfig {
+                max_queued_bytes: 1 << 20,
+                ..Default::default()
+            },
         );
         let (datagram_tx, _datagram_rx) = unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = unbounded_channel();
@@ -209,27 +215,30 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_whose_packets_are_never_read_is_closed() {
+        let now = Instant::now().into_std();
         let local = RakSessionIntl::new(
             RakSessionId(7),
             "127.0.0.1:1".parse().unwrap(),
             0,
             1492,
-            SystemTime::now(),
-            |_| {},
+            now,
+            RakClock::new(now),
+            Default::default(),
         );
         let mut peer = RakSessionIntl::new(
             RakSessionId(8),
             "127.0.0.1:2".parse().unwrap(),
             1,
             1492,
-            SystemTime::now(),
-            |_| {},
+            now,
+            RakClock::new(now),
+            Default::default(),
         );
         let (datagram_tx, _datagram_rx) = unbounded_channel();
         let (disconnect_tx, mut disconnect_rx) = unbounded_channel();
         let (_session, input_tx) = RakSession::spawn(local, datagram_tx, disconnect_tx);
 
-        let now = SystemTime::now();
+        let now = Instant::now().into_std();
         for _ in 0..SESSION_QUEUE_CAPACITY + 64 {
             peer.handle(RakSessionInput::Send(
                 Box::new([0xFE, 1]),

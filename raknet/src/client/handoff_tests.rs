@@ -6,7 +6,7 @@ const PEER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOS
 const LOCAL: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
 
 /// Completes offline negotiation through the public inputs with instantaneous writes.
-fn start_reliable_handshake(client: &mut RakClient, now: SystemTime) {
+fn start_reliable_handshake(client: &mut RakClient, now: Instant) {
     client
         .handle(RakClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
@@ -47,9 +47,12 @@ fn start_reliable_handshake(client: &mut RakClient, now: SystemTime) {
 }
 
 /// Creates a client waiting for reliable connection acceptance at a fixed domain time.
-fn negotiating(config: RakClientConfig) -> (RakClient, SystemTime) {
-    let now = UNIX_EPOCH + Duration::from_secs(1000);
-    let mut client = RakClient::new(config);
+fn negotiating(config: RakClientConfig) -> (RakClient, Instant) {
+    let now = crate::clock::test_now() + Duration::from_secs(1000);
+    let mut client = RakClient::new(
+        config,
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     start_reliable_handshake(&mut client, now);
     (client, now)
 }
@@ -161,8 +164,16 @@ fn early_packets_survive_handoff_in_fifo_after_the_incoming_control_is_sent() {
 
 #[test]
 fn lost_connection_probe_emits_a_reliable_ping_instead_of_an_application_packet() {
-    let now = UNIX_EPOCH + Duration::from_secs(1000);
-    let mut session = RakSession::new(RakSessionId(0), PEER, 1, 1492, now, |_| {});
+    let now = crate::clock::test_now() + Duration::from_secs(1000);
+    let mut session = RakSession::new(
+        RakSessionId(0),
+        PEER,
+        1,
+        1492,
+        now,
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
+    );
     session
         .handle(RakSessionInput::Datagram(
             datagram(0, 0, vec![Box::new([0x04])]),

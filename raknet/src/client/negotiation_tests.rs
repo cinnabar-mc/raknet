@@ -4,7 +4,7 @@ use std::net::SocketAddrV4;
 const PEER: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19132));
 
 /// Collects complete wire outputs as an instantaneous synthetic socket would.
-fn collect(client: &mut RakClient, now: SystemTime) -> Vec<Box<[u8]>> {
+fn collect(client: &mut RakClient, now: Instant) -> Vec<Box<[u8]>> {
     let mut sent = Vec::new();
     while let Some(output) = client.poll() {
         match output {
@@ -27,7 +27,7 @@ fn collect(client: &mut RakClient, now: SystemTime) -> Vec<Box<[u8]>> {
 }
 
 /// Delivers one encoded peer packet and returns the client's immediate wire response.
-fn deliver(client: &mut RakClient, packet: impl RakCodec, now: SystemTime) -> Vec<Box<[u8]>> {
+fn deliver(client: &mut RakClient, packet: impl RakCodec, now: Instant) -> Vec<Box<[u8]>> {
     client
         .handle(RakClientInput::Datagram(
             packet.serialized().unwrap(),
@@ -39,12 +39,15 @@ fn deliver(client: &mut RakClient, packet: impl RakCodec, now: SystemTime) -> Ve
 }
 
 /// Starts a client at a fixed domain time, with no real sockets or clock reads.
-fn begin(cap: u16) -> (RakClient, SystemTime) {
-    let mut client = RakClient::new(RakClientConfig {
-        max_mtu_size: cap,
-        ..RakClientConfig::default()
-    });
-    let now = UNIX_EPOCH + Duration::from_secs(1000);
+fn begin(cap: u16) -> (RakClient, Instant) {
+    let mut client = RakClient::new(
+        RakClientConfig {
+            max_mtu_size: cap,
+            ..RakClientConfig::default()
+        },
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let now = crate::clock::test_now() + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
@@ -212,11 +215,14 @@ fn reply_two_selects_the_final_budget_independently_of_reply_one() {
 
 #[test]
 fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
-    let mut client = RakClient::new(RakClientConfig {
-        max_mtu_size: 400,
-        ..RakClientConfig::default()
-    });
-    let now = UNIX_EPOCH + Duration::from_secs(1000);
+    let mut client = RakClient::new(
+        RakClientConfig {
+            max_mtu_size: 400,
+            ..RakClientConfig::default()
+        },
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let now = crate::clock::test_now() + Duration::from_secs(1000);
     assert!(
         client
             .handle(RakClientInput::Connect {
@@ -258,8 +264,11 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         (Duration::ZERO, Duration::from_millis(101), false, 548, 111),
         (Duration::ZERO, Duration::from_millis(101), true, 1172, 111),
     ] {
-        let mut client = RakClient::new(RakClientConfig::default());
-        let start = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut client = RakClient::new(
+            RakClientConfig::default(),
+            crate::clock::RakClock::new(crate::clock::test_now()),
+        );
+        let start = crate::clock::test_now() + Duration::from_secs(1000);
         client
             .handle(RakClientInput::Connect {
                 guid: crate::client::TEST_CLIENT_GUID,
@@ -287,8 +296,11 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         assert_eq!(pending_probe(&mut client).unwrap().1, payload_len);
     }
 
-    let mut client = RakClient::new(RakClientConfig::default());
-    let mut now = UNIX_EPOCH + Duration::from_secs(1000);
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let mut now = crate::clock::test_now() + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
@@ -319,8 +331,11 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
 
 #[test]
 fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negotiation() {
-    let mut client = RakClient::new(RakClientConfig::default());
-    let first = UNIX_EPOCH + Duration::from_secs(1000);
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let first = crate::clock::test_now() + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
@@ -463,8 +478,11 @@ fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake
 
 #[test]
 fn cancellation_drops_unclaimed_session_handoffs() {
-    let mut client = RakClient::new(RakClientConfig::default());
-    let now = UNIX_EPOCH + Duration::from_secs(1000);
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
+    let now = crate::clock::test_now() + Duration::from_secs(1000);
     client
         .adopt(RakSession::new(
             RakSessionId(1),
@@ -472,7 +490,8 @@ fn cancellation_drops_unclaimed_session_handoffs() {
             1,
             constants::MAX_MTU_SIZE,
             now,
-            |_| {},
+            crate::clock::RakClock::new(crate::clock::test_now()),
+            Default::default(),
         ))
         .unwrap();
     client.handle(RakClientInput::Disconnect).unwrap();
@@ -484,10 +503,13 @@ fn cancellation_drops_unclaimed_session_handoffs() {
 
 #[test]
 fn identity_stays_with_each_attempt_through_challenges_retries_session_and_reconnect() {
-    let mut client = RakClient::new(RakClientConfig::default());
+    let mut client = RakClient::new(
+        RakClientConfig::default(),
+        crate::clock::RakClock::new(crate::clock::test_now()),
+    );
     let first = TEST_CLIENT_GUID;
     let second = ClientGuid::from_raw(first.as_u64() ^ 1);
-    let origin = UNIX_EPOCH + Duration::from_secs(1000);
+    let origin = crate::clock::test_now() + Duration::from_secs(1000);
     for (attempt, guid) in [first, second].into_iter().enumerate() {
         let now = origin + Duration::from_secs(attempt as u64);
         client

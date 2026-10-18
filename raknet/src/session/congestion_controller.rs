@@ -1,8 +1,10 @@
+use super::snapshot::RakSessionRestoreError;
+use crate::clock::RakClock;
 use crate::util::constants::{CC_ADDITIONAL_VARIANCE, CC_MAX_THRESHOLD};
 use crate::util::u24;
 use std::cmp::max;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct RakCongestionController {
@@ -18,7 +20,7 @@ pub struct RakCongestionController {
 
     bytes_not_acknowledged: usize,
 
-    sent_times: HashMap<u32, Option<SystemTime>>,
+    sent_times: HashMap<u32, Option<Instant>>,
 }
 
 /// [`RakCongestionController`] in a serializable form.
@@ -38,7 +40,7 @@ pub struct RakCongestionSnapshot {
 }
 
 impl RakCongestionController {
-    pub fn snapshot(&self, epoch: SystemTime) -> RakCongestionSnapshot {
+    pub fn snapshot(&self, clock: RakClock) -> RakCongestionSnapshot {
         RakCongestionSnapshot {
             mtu: self.mtu,
             congestion_window: self.congestion_window,
@@ -50,13 +52,16 @@ impl RakCongestionController {
             sent_times: self
                 .sent_times
                 .iter()
-                .map(|(seq, at)| (*seq, at.map(|at| millis_since(epoch, at))))
+                .map(|(seq, at)| (*seq, at.map(|at| clock.timestamp(at))))
                 .collect(),
         }
     }
 
-    pub fn restore(snapshot: RakCongestionSnapshot, epoch: SystemTime) -> Self {
-        Self {
+    pub fn restore(
+        snapshot: RakCongestionSnapshot,
+        clock: RakClock,
+    ) -> Result<Self, RakSessionRestoreError> {
+        Ok(Self {
             mtu: snapshot.mtu,
             congestion_window: snapshot.congestion_window,
             congestion_recovery_sequence: snapshot.congestion_recovery_sequence,
@@ -67,18 +72,19 @@ impl RakCongestionController {
             sent_times: snapshot
                 .sent_times
                 .into_iter()
-                .map(|(seq, offset)| (seq, offset.map(|ms| epoch + Duration::from_millis(ms))))
-                .collect(),
-        }
+                .map(|(seq, offset)| {
+                    let at = offset
+                        .map(|ms| clock.at(ms).ok_or(RakSessionRestoreError::TimeOutOfRange))
+                        .transpose()?;
+                    Ok((seq, at))
+                })
+                .collect::<Result<_, RakSessionRestoreError>>()?,
+        })
     }
 }
 
 fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
-}
-
-fn millis_since(epoch: SystemTime, at: SystemTime) -> u64 {
-    at.duration_since(epoch).unwrap_or_default().as_millis() as u64
 }
 
 impl RakCongestionController {
@@ -151,7 +157,7 @@ impl RakCongestionController {
         }
     }
 
-    pub fn acked(&mut self, now: SystemTime, seq: u32, size: usize, bandwidth_limited: bool) {
+    pub fn acked(&mut self, now: Instant, seq: u32, size: usize, bandwidth_limited: bool) {
         if let Some(sent_at) = self.sent_times.remove(&seq) {
             self.bytes_not_acknowledged -= size;
 
@@ -186,12 +192,8 @@ impl RakCongestionController {
         }
     }
 
-    fn sample_rtt(&mut self, now: SystemTime, sent_at: SystemTime) {
-        let rtt_ms = now
-            .duration_since(sent_at)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0;
+    fn sample_rtt(&mut self, now: Instant, sent_at: Instant) {
+        let rtt_ms = now.saturating_duration_since(sent_at).as_secs_f64() * 1000.0;
 
         if self.rtt_estimate_ms.is_infinite() {
             self.rtt_estimate_ms = rtt_ms;
@@ -205,7 +207,7 @@ impl RakCongestionController {
         }
     }
 
-    pub fn sent(&mut self, seq: u32, size: usize, now: SystemTime) {
+    pub fn sent(&mut self, seq: u32, size: usize, now: Instant) {
         self.bytes_not_acknowledged += size;
         self.sent_times.insert(seq, Some(now));
     }

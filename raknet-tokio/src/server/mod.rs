@@ -8,14 +8,14 @@ use crate::server::msg::RakServerMsg;
 use crate::server::state::RakServerState;
 use crate::session::RakSession;
 use raknet::prelude::{
-    RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput,
+    RakClock, RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput,
     RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
     constants,
 };
 use state::{Initialized, Running};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Sender, unbounded_channel};
@@ -100,7 +100,12 @@ impl RakServer {
                 let mut sessions: HashMap<RakSessionId, Sender<RakSessionInput>> = HashMap::new();
 
                 let mut buf = vec![0u8; config.max_mtu_size as usize].into_boxed_slice();
-                let mut server = RakServerIntl::new(config, addr);
+                let mut server = RakServerIntl::new(
+                    config,
+                    addr,
+                    RakClock::new(Instant::now().into_std()),
+                    Instant::now().into_std(),
+                );
 
                 let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
@@ -115,12 +120,12 @@ impl RakServer {
                 loop {
                     tokio::select! {
                         _ = update_interval.tick() => {
-                            let now = SystemTime::now();
+                            let now = Instant::now().into_std();
 
                             let _ = server.handle(RakServerInput::Update(now));
                         }
                         Ok((len, addr)) = socket.recv_from(&mut buf) => {
-                            let now = SystemTime::now();
+                            let now = Instant::now().into_std();
 
                             match server.handle(RakServerInput::Datagram(buf[..len].into(), addr, now)) {
                                 Ok(_) => {},
@@ -131,7 +136,7 @@ impl RakServer {
                             let _ = socket.send_to(buf.as_ref(), addr).await;
                         }
                         Some(id) = disconnect_rx.recv() => {
-                            let now = SystemTime::now();
+                            let now = Instant::now().into_std();
 
                             let _ = server.handle(RakServerInput::RemoveSession(id, now));
                             sessions.remove(&id);
@@ -145,7 +150,7 @@ impl RakServer {
                                     let _ = server.handle(RakServerInput::SetMaxConnections(n));
                                 }
                                 RakServerMsg::Block(ip, duration) => {
-                                    let _ = server.handle(RakServerInput::Block(ip, duration, SystemTime::now()));
+                                    let _ = server.handle(RakServerInput::Block(ip, duration, Instant::now().into_std()));
                                 }
                                 RakServerMsg::Unblock(ip) => {
                                     let _ = server.handle(RakServerInput::Unblock(ip));
@@ -167,7 +172,7 @@ impl RakServer {
                                     }
                                 }
                                 RakServerMsg::Stop => {
-                                    let now = SystemTime::now();
+                                    let now = Instant::now().into_std();
 
                                     for session in sessions.values() {
                                         let _ = session.try_send(RakSessionInput::Disconnect(now));
@@ -188,7 +193,7 @@ impl RakServer {
                             }
                             RakServerOutput::SessionDatagram(buf, id) => {
                                 if let Some(session) = sessions.get_mut(&id) {
-                                    let now = SystemTime::now();
+                                    let now = Instant::now().into_std();
 
                                     let input = RakSessionInput::Datagram(buf, now);
                                     if let Err(TrySendError::Full(_)) = session.try_send(input) {
@@ -211,8 +216,9 @@ impl RakServer {
                                 );
 
                                 if stop_deadline.is_some() {
-                                    let _ =
-                                        tx.try_send(RakSessionInput::Disconnect(SystemTime::now()));
+                                    let _ = tx.try_send(RakSessionInput::Disconnect(
+                                        Instant::now().into_std(),
+                                    ));
                                     sessions.insert(id, tx);
                                     continue;
                                 }
@@ -261,16 +267,17 @@ impl RakServer {
     }
 
     /// Resumes a session captured with [`crate::session::RakSession::snapshot`] on
-    /// another server, returning its handle here.
+    /// another server, returning its handle here. `elapsed` is the time since capture.
     pub async fn adopt(
         &mut self,
         snapshot: RakSessionSnapshot,
+        elapsed: Duration,
     ) -> Result<RakSession, RakServerError> {
         let RakServerState::Running(Running { msg_tx, .. }) = &self.state else {
             return Err(RakServerError::Closed);
         };
 
-        let session = RakSessionIntl::restore(snapshot, SystemTime::now())?;
+        let session = RakSessionIntl::restore(snapshot, Instant::now().into_std(), elapsed)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         msg_tx

@@ -1,10 +1,73 @@
 use super::*;
 
 /// Uses one explicit domain clock for session construction and protocol events.
-fn domain_time() -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(1000)
+fn domain_time() -> Instant {
+    crate::clock::test_now() + Duration::from_secs(1000)
 }
 use crate::protocol::packets::ack::MAX_ACK_ENTRIES;
+
+#[test]
+fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
+    let origin = crate::clock::test_now();
+    let start = origin + Duration::from_secs(5);
+    let mut session = RakSession::new(
+        RakSessionId(42),
+        "127.0.0.1:19132".parse().unwrap(),
+        7,
+        1492,
+        start,
+        RakClock::new(origin),
+        Default::default(),
+    );
+    send(&mut session, 4, start).unwrap();
+    session.tick(start).unwrap();
+    drain_outputs(&mut session);
+    let capture = start + Duration::from_millis(40);
+    let json = facet_json::to_string(&session.snapshot(capture)).unwrap();
+    let destination = origin + Duration::from_secs(3600);
+    let mut resumed = RakSession::restore(
+        facet_json::from_str(&json).unwrap(),
+        destination,
+        Duration::from_millis(60),
+    )
+    .unwrap();
+    assert_eq!(resumed.clock.timestamp(destination), 5100);
+    assert_eq!(
+        destination.duration_since(resumed.last_recv),
+        Duration::from_millis(100)
+    );
+    let due = resumed.outbound_resend.peek().unwrap().0.0;
+    assert_eq!(due.duration_since(destination), Duration::from_millis(1900));
+    resumed.tick(due - Duration::from_millis(1)).unwrap();
+    assert!(
+        drain_outputs(&mut resumed).is_empty(),
+        "resend must retain its remaining deadline"
+    );
+    resumed.tick(due).unwrap();
+    assert_eq!(sequences_of(&drain_outputs(&mut resumed)).len(), 1);
+
+    let mut acknowledged = RakSession::restore(
+        facet_json::from_str(&json).unwrap(),
+        destination,
+        Duration::from_millis(60),
+    )
+    .unwrap();
+    let ack = Ack::new(vec![0], false);
+    acknowledged
+        .handle(RakSessionInput::Datagram(
+            ack.serialized().unwrap(),
+            destination,
+        ))
+        .unwrap();
+    assert_eq!(acknowledged.rtt(), Duration::from_millis(100));
+    assert_eq!(acknowledged.outbound_bytes(), 0);
+
+    let snapshot = session.snapshot(capture);
+    assert!(matches!(
+        RakSession::restore(snapshot, destination, Duration::MAX),
+        Err(snapshot::RakSessionRestoreError::TimeOutOfRange)
+    ));
+}
 
 #[test]
 fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
@@ -14,7 +77,8 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
         0xDEAD_BEEF,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     let now = domain_time();
@@ -34,10 +98,12 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
         "sending a reliable frame should advance outbound_rel"
     );
 
-    let json = facet_json::to_string(&session.snapshot()).expect("snapshot must serialize");
+    let json =
+        facet_json::to_string(&session.snapshot(domain_time())).expect("snapshot must serialize");
     let mut resumed = RakSession::restore(
         facet_json::from_str(&json).expect("snapshot must deserialize"),
         domain_time(),
+        Duration::ZERO,
     )
     .expect("a snapshot's own address must parse");
 
@@ -67,11 +133,17 @@ fn an_unmeasured_rtt_survives_a_json_round_trip() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
-    let json = facet_json::to_string(&session.snapshot()).unwrap();
-    let resumed = RakSession::restore(facet_json::from_str(&json).unwrap(), domain_time()).unwrap();
+    let json = facet_json::to_string(&session.snapshot(domain_time())).unwrap();
+    let resumed = RakSession::restore(
+        facet_json::from_str(&json).unwrap(),
+        domain_time(),
+        Duration::ZERO,
+    )
+    .unwrap();
 
     assert_eq!(
         resumed.congestion_controller.retransmission_timeout(),
@@ -87,7 +159,8 @@ fn out_of_range_order_channel_does_not_panic() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([]));
@@ -104,7 +177,8 @@ fn max_message_len_is_the_outbound_split_limit() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     assert_eq!(
@@ -121,7 +195,11 @@ fn max_message_len_is_at_least_one_unsplit_frame() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |conf| conf.max_queued_bytes = 4,
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        RakSessionConfig {
+            max_queued_bytes: 4,
+            ..Default::default()
+        },
     );
 
     assert_eq!(session.max_message_len(), session.mtu as usize);
@@ -135,7 +213,11 @@ fn honors_configured_ordering_channels() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |conf| conf.ordering_channels = 4,
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        RakSessionConfig {
+            ordering_channels: 4,
+            ..Default::default()
+        },
     );
 
     let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([1]));
@@ -154,7 +236,8 @@ fn priority_routes_to_separate_queues() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     let now = domain_time();
@@ -185,7 +268,8 @@ fn rejects_out_of_range_split_index() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     let mut frame = Frame::new(RakReliability::Reliable, Box::new([1, 2, 3]));
@@ -206,7 +290,11 @@ fn drops_split_frame_exceeding_max_queued_bytes() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |conf| conf.max_queued_bytes = 4,
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        RakSessionConfig {
+            max_queued_bytes: 4,
+            ..Default::default()
+        },
     );
 
     let mut frame = Frame::new(RakReliability::Reliable, vec![0u8; 8].into_boxed_slice());
@@ -227,7 +315,8 @@ fn disconnect_reason_matches_cause() {
         0,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     );
 
     session
@@ -253,11 +342,12 @@ fn session(id: u64, port: u16) -> RakSession {
         id,
         crate::util::constants::MAX_MTU_SIZE,
         domain_time(),
-        |_| {},
+        crate::clock::RakClock::new(crate::clock::test_now()),
+        Default::default(),
     )
 }
 
-fn deliver(from: &mut RakSession, to: &mut RakSession, now: SystemTime) {
+fn deliver(from: &mut RakSession, to: &mut RakSession, now: Instant) {
     let datagrams: Vec<Box<[u8]>> = std::iter::from_fn(|| from.poll())
         .filter_map(|out| match out {
             RakSessionOutput::Datagram(buf, _) => Some(buf),
@@ -686,7 +776,7 @@ fn delivered_ordered_frames_release_their_byte_budget() {
     assert_eq!(session.inbound_ord_queue[&0].len(), 1);
 }
 
-fn datagram_at(sequence: u32, frames: Vec<Frame>, now: SystemTime) -> RakSessionInput {
+fn datagram_at(sequence: u32, frames: Vec<Frame>, now: Instant) -> RakSessionInput {
     let RakSessionInput::Datagram(buf, _) = datagram(sequence, frames) else {
         unreachable!()
     };
@@ -765,7 +855,8 @@ fn large_sends_split_into_datagrams_within_the_mtu() {
                 0,
                 mtu,
                 domain_time(),
-                |_| {},
+                crate::clock::RakClock::new(crate::clock::test_now()),
+                Default::default(),
             );
             for priority in [RakPriority::Immediate, RakPriority::Normal] {
                 session
@@ -947,7 +1038,7 @@ fn unacknowledged_sends_beyond_max_outbound_bytes_close_the_session() {
     );
 }
 
-fn send(session: &mut RakSession, len: usize, now: SystemTime) -> Result<(), RakSessionError> {
+fn send(session: &mut RakSession, len: usize, now: Instant) -> Result<(), RakSessionError> {
     session.handle(RakSessionInput::Send(
         vec![0xFE; len].into_boxed_slice(),
         RakReliability::ReliableOrdered,

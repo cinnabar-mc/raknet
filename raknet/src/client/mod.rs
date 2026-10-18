@@ -18,6 +18,7 @@ use crate::client::error::RakClientError;
 use crate::client::input::RakClientInput;
 use crate::client::output::RakClientOutput;
 use crate::client::state::{ClientPeer, RakClientState};
+use crate::clock::RakClock;
 use crate::prelude::{
     RakPriority, RakReliability, RakSession, RakSessionInput, RakSessionOutput, RakSessionState,
 };
@@ -39,23 +40,24 @@ use crate::util::{constants, packet_id};
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub struct RakClient {
     config: RakClientConfig,
+    clock: RakClock,
 
     state: RakClientState,
     probes: Option<MtuProbes>,
     next_probe_id: u64,
-    request_two_at: Option<SystemTime>,
+    request_two_at: Option<Instant>,
     mtu: u16,
     cookie: Option<i32>,
     session: Option<RakSession>,
     pending_packets: PendingPackets,
 
-    connect_deadline: Option<SystemTime>,
+    connect_deadline: Option<Instant>,
 
     output: VecDeque<RakClientOutput>,
 }
@@ -87,7 +89,7 @@ impl Sans for RakClient {
                 }
 
                 let ping = UnconnectedPing {
-                    timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                    timestamp: self.clock.timestamp(now),
                     client: guid.as_u64(),
                 };
 
@@ -253,11 +255,15 @@ impl Sans for RakClient {
                         if b == packet_id::UNCONNECTED_PONG {
                             let pong = UnconnectedPong::deserialize(&mut cursor)?;
 
-                            self.output.push_back(RakClientOutput::Pong(
+                            self.output.push_back(RakClientOutput::Pong {
                                 addr,
-                                pong.message,
-                                UNIX_EPOCH + Duration::from_millis(pong.timestamp),
-                            ))
+                                message: pong.message,
+                                echoed_timestamp: pong.timestamp,
+                                latency: self
+                                    .clock
+                                    .elapsed(now)
+                                    .saturating_sub(Duration::from_millis(pong.timestamp)),
+                            })
                         }
                     }
                 }
@@ -332,9 +338,11 @@ impl Sans for RakClient {
 }
 
 impl RakClient {
-    pub fn new(config: RakClientConfig) -> Self {
+    /// Creates a passive client using the caller's monotonic wire-counter origin.
+    pub fn new(config: RakClientConfig, clock: RakClock) -> Self {
         Self {
             config,
+            clock,
             state: RakClientState::Unconnected,
             probes: None,
             next_probe_id: 0,
@@ -381,7 +389,7 @@ impl RakClient {
     }
 
     /// Drives both retry schedules and the connected handshake under one deadline.
-    fn handle_timeout(&mut self, now: SystemTime) -> Result<(), RakClientError> {
+    fn handle_timeout(&mut self, now: Instant) -> Result<(), RakClientError> {
         match self.drive(now) {
             Ok(()) => Ok(()),
             Err(error) => Err(self.abort(error)),
@@ -389,7 +397,7 @@ impl RakClient {
     }
 
     /// Emits due protocol work without reading a clock or blocking on socket writes.
-    fn drive(&mut self, now: SystemTime) -> Result<(), RakClientError> {
+    fn drive(&mut self, now: Instant) -> Result<(), RakClientError> {
         let connected = matches!(self.state, RakClientState::Connected(_));
         if connected || matches!(self.state, RakClientState::Unconnected) {
             self.output
@@ -451,16 +459,15 @@ impl RakClient {
                 next = next.min(at);
             }
         }
-        self.output.push_back(RakClientOutput::Wait(
-            next.duration_since(now).unwrap_or_default(),
-        ));
+        self.output
+            .push_back(RakClientOutput::Wait(next.saturating_duration_since(now)));
         Ok(())
     }
 
     /// Cancels writes and unclaimed session handoffs while preserving completed discovery results.
     fn clear_connection_outputs(&mut self) {
         self.output
-            .retain(|output| matches!(output, RakClientOutput::Pong(..)));
+            .retain(|output| matches!(output, RakClientOutput::Pong { .. }));
     }
 
     /// Discards unsent offline work when a connection ends or hands off to its session.
@@ -479,7 +486,7 @@ impl RakClient {
         &mut self,
         peer: ClientPeer,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakClientError> {
         let reply = OpenConnectionReply1::deserialize(buf)?;
         let minimum = self.config.min_mtu_size.max(constants::MIN_MTU_SIZE);
@@ -525,7 +532,7 @@ impl RakClient {
         &mut self,
         peer: ClientPeer,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakClientError> {
         let addr = peer.remote;
         let reply = OpenConnectionReply2::deserialize(buf)?;
@@ -553,13 +560,14 @@ impl RakClient {
             peer.guid.as_u64(),
             self.mtu,
             now,
-            |_| {},
+            self.clock,
+            Default::default(),
         );
 
         session.state = RakSessionState::Connecting;
         let req = ConnectionRequest {
             security: false,
-            client_timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
+            client_timestamp: self.clock.timestamp(now),
             client_guid: peer.guid.as_u64(),
         };
 
@@ -612,7 +620,7 @@ impl RakClient {
         addr: SocketAddr,
         local: SocketAddr,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakClientError> {
         let acc = ConnectionRequestAccepted::deserialize(buf)?;
 
@@ -625,7 +633,7 @@ impl RakClient {
             server_address: addr,
             internal_addresses,
             incoming_timestamp: acc.timestamp,
-            server_timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
+            server_timestamp: session.clock.timestamp(now),
         };
 
         session.handle(RakSessionInput::Send(

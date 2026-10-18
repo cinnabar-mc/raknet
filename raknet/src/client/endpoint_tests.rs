@@ -10,8 +10,16 @@ fn incoming_connection_advertises_the_bound_endpoint_and_twenty_system_addresses
     ] {
         let remote: SocketAddr = remote.parse().unwrap();
         let local: SocketAddr = local.parse().unwrap();
-        let now = UNIX_EPOCH + Duration::from_secs(1000);
-        let mut session = RakSession::new(RakSessionId(0), remote, 1, 1492, now, |_| {});
+        let now = crate::clock::test_now() + Duration::from_secs(1000);
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            remote,
+            1,
+            1492,
+            now,
+            crate::clock::RakClock::new(crate::clock::test_now()),
+            Default::default(),
+        );
         let accepted = ConnectionRequestAccepted {
             client_address: "198.51.100.3:60000".parse().unwrap(),
             system_index: 0,
@@ -51,6 +59,7 @@ fn incoming_connection_advertises_the_bound_endpoint_and_twenty_system_addresses
                 .all(|addr| *addr == SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         );
         assert_eq!(incoming.incoming_timestamp, 100);
+        assert_eq!(incoming.server_timestamp, 1_000_000);
     }
 }
 
