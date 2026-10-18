@@ -1,6 +1,6 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
-use crate::prelude::RakSessionError;
 use crate::protocol::error::RakCodecError;
+use crate::session::error::RakSessionError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -4,8 +4,8 @@ use super::error::RakSessionError;
 use super::output::RakDisconnectReason;
 use super::state::RakSessionState;
 use super::{
-    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_SPLIT_COUNT, ORDER_WINDOW, RakSession,
-    SESSION_TIMEOUT, ranges,
+    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_SPLIT_COUNT, ORDER_WINDOW, SESSION_TIMEOUT,
+    SessionEngine, ranges,
 };
 use crate::protocol::codec::RakCodec;
 use crate::protocol::packets::frame_set::FrameSet;
@@ -27,7 +27,7 @@ pub(super) fn frame_cost(frame: &Frame) -> usize {
     size_of::<Frame>() + frame.payload.len()
 }
 
-impl RakSession {
+impl SessionEngine {
     /// Releases expired reassemblies and reports lost acknowledged fragment state.
     pub(super) fn evict_stale_splits(&mut self, now: Instant) -> bool {
         let last = &self.inbound_spl_last;

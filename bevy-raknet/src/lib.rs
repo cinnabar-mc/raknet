@@ -1,11 +1,19 @@
 pub mod client;
+mod configuration;
 pub mod server;
+mod session;
 
 pub mod prelude {
-    pub use crate::client::{RakClient, RakClientEvent, RakClientPlugin, RakClientSet};
-    pub use crate::server::{RakServer, RakServerEvent, RakServerPlugin, RakServerSet};
+    pub use crate::client::{
+        ClientCloseError, ClientStartError, RakClient, RakClientEvent, RakClientIdle,
+        RakClientPlugin, RakClientSession, RakClientSet,
+    };
+    pub use crate::server::{
+        RakServer, RakServerEvent, RakServerPlugin, RakServerSession, RakServerSet,
+        ServerCloseError, ServerStartError,
+    };
     pub use raknet::prelude::{
-        RakClientConfig, RakDisconnectReason, RakPriority, RakReliability, RakServerConfig,
-        RakSessionError, RakSessionId,
+        Closing, Established, RakClientConfig, RakDisconnectReason, RakPriority, RakReliability,
+        RakServerConfig, RakSessionError, RakSessionId,
     };
 }

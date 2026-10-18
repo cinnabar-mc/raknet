@@ -2,6 +2,8 @@
 //! Remote fixture sockets represent distinct servers, not per-client application sockets.
 
 use raknet::prelude::*;
+#[path = "support/negotiated.rs"]
+mod negotiated;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -14,8 +16,90 @@ const RECEIVE_LIMIT: usize = 16;
 const STEP: Duration = Duration::from_millis(10);
 type Pending = Option<(Box<[u8]>, SocketAddr)>;
 
+/// Test-owned phase slot; every session is obtained through genuine negotiation.
+enum SessionOwner {
+    Established(RakSession<Established>),
+    Closing(RakSession<Closing>),
+    Transition,
+}
+
+impl SessionOwner {
+    /// Applies common I/O without reopening a locally closing session.
+    fn handle(&mut self, input: RakSessionInput) -> Result<(), RakSessionError> {
+        match self {
+            Self::Established(s) => s.handle(input),
+            Self::Closing(s) => s.handle(input),
+            Self::Transition => Err(RakSessionError::Closed),
+        }
+    }
+    /// Takes the next ordered protocol/application output.
+    fn poll(&mut self) -> Option<RakSessionOutput> {
+        match self {
+            Self::Established(s) => s.poll(),
+            Self::Closing(s) => s.poll(),
+            Self::Transition => None,
+        }
+    }
+    /// Observes peer state without changing the owned local phase.
+    fn get_state(&self) -> RakSessionState {
+        match self {
+            Self::Established(s) => s.state(),
+            Self::Closing(s) => s.state(),
+            Self::Transition => RakSessionState::Disconnected,
+        }
+    }
+    /// Returns retained outbound work for the original fixture admission rule.
+    fn outbound_bytes(&self) -> usize {
+        match self {
+            Self::Established(s) => s.outbound_bytes(),
+            Self::Closing(s) => s.outbound_bytes(),
+            Self::Transition => 0,
+        }
+    }
+    /// Returns the negotiated send limit.
+    fn max_message_len(&self) -> usize {
+        match self {
+            Self::Established(s) => s.max_message_len(),
+            Self::Closing(s) => s.max_message_len(),
+            Self::Transition => 0,
+        }
+    }
+    /// Admits application bytes only into the actual Established owner.
+    fn send(
+        &mut self,
+        bytes: Box<[u8]>,
+        reliability: RakReliability,
+        priority: RakPriority,
+        now: Instant,
+    ) -> Result<(), RakSessionError> {
+        match self {
+            Self::Established(s) => s.send(bytes, reliability, priority, now),
+            _ => Err(RakSessionError::Closed),
+        }
+    }
+    /// Cancels one peer while keeping its terminal outputs in the same route table.
+    fn abort(&mut self, now: Instant) -> Result<(), RakSessionError> {
+        let result = match std::mem::replace(self, Self::Transition) {
+            Self::Established(s) => s.abort(now),
+            Self::Closing(s) => s.abort(now),
+            Self::Transition => return Err(RakSessionError::Closed),
+        };
+        match result {
+            Ok(s) => {
+                *self = Self::Closing(s);
+                Ok(())
+            }
+            Err(error) => {
+                let (s, cause) = error.into_parts();
+                *self = Self::Closing(s);
+                Err(cause)
+            }
+        }
+    }
+}
+
 struct Live {
-    session: RakSession,
+    session: SessionOwner,
     due: Option<Instant>,
     input_at: Instant,
 }
@@ -46,8 +130,8 @@ impl Caller {
     }
 
     /// Installs an owned handoff, rejecting ambiguous tuples before replacing any state.
-    fn insert(&mut self, mut session: RakSession, now: Instant) -> io::Result<()> {
-        let peer = canonical_socket_addr(session.addr);
+    fn insert(&mut self, session: RakSession<Established>, now: Instant) -> io::Result<()> {
+        let peer = canonical_socket_addr(session.addr());
         if peer.is_ipv4() != self.socket.local_addr()?.is_ipv4() {
             return Err(ErrorKind::InvalidInput.into());
         }
@@ -57,11 +141,11 @@ impl Caller {
         if self.live.len() == PEERS {
             return Err(ErrorKind::WouldBlock.into());
         }
-        session.addr = peer;
+        assert_eq!(session.addr(), peer, "negotiated peers are canonical");
         self.live.insert(
             peer,
             Live {
-                session,
+                session: SessionOwner::Established(session),
                 due: Some(now),
                 input_at: now,
             },
@@ -90,12 +174,12 @@ impl Caller {
         }
         live.input_at = now;
         live.session
-            .handle(RakSessionInput::Send(
+            .send(
                 bytes,
                 RakReliability::ReliableOrdered,
                 RakPriority::Normal,
                 now,
-            ))
+            )
             .unwrap();
         Ok(())
     }
@@ -227,22 +311,20 @@ fn write_pending(
     }
 }
 
-/// Models the established sessions transferred by RakClientOutput::SessionConnected.
-fn established(peer: SocketAddr, now: Instant) -> RakSession {
-    let config = RakSessionConfig {
+/// Obtains a genuine public handoff for tuple/family admission-only witnesses.
+fn established(peer: SocketAddr, now: Instant) -> RakSession<Established> {
+    let peer = canonical_socket_addr(peer);
+    let local = SocketAddr::new(peer.ip(), peer.port().wrapping_add(1));
+    negotiated::negotiated_pair(local, peer, now, now, limits()).0
+}
+
+/// Keeps the original bounded fixture policy in one constructor.
+fn limits() -> RakSessionConfig {
+    RakSessionConfig {
         max_queued_bytes: 64 * 1024,
         max_outbound_bytes: 64 * 1024,
         ..Default::default()
-    };
-    RakSession::new(
-        RakSessionId(0),
-        peer,
-        1 << 63,
-        constants::MAX_MTU_SIZE,
-        now,
-        RakClock::new(now),
-        config,
-    )
+    }
 }
 
 struct Fixture {
@@ -265,8 +347,10 @@ impl Fixture {
         let mut remotes = Vec::new();
         for _ in 0..PEERS {
             let mut remote = Caller::bind(local.ip())?;
-            application.insert(established(remote.socket.local_addr()?, now), now)?;
-            remote.insert(established(local, now), now)?;
+            let (client_session, server_session) =
+                negotiated::negotiated_pair(local, remote.socket.local_addr()?, now, now, limits());
+            application.insert(client_session, now)?;
+            remote.insert(server_session, now)?;
             remotes.push(remote);
         }
         Ok(Self {
@@ -370,10 +454,7 @@ fn shared_udp_cancel_and_timeout_are_owned_by_the_peer_route() {
     let canceled = fixture.remotes[0].socket.local_addr().unwrap();
     let canceled_route = fixture.application.live.get_mut(&canceled).unwrap();
     canceled_route.input_at = fixture.now;
-    canceled_route
-        .session
-        .handle(RakSessionInput::DisconnectNow(fixture.now))
-        .unwrap();
+    canceled_route.session.abort(fixture.now).unwrap();
     fixture.until(|fixture| !fixture.application.live.contains_key(&canceled));
     fixture.paused = Some(1);
     let expired = fixture.remotes[1].socket.local_addr().unwrap();
@@ -480,8 +561,10 @@ fn shared_udp_retains_the_real_session_deadline_across_a_blocked_datagram() {
     let now = Instant::now();
     let local = application.socket.local_addr().unwrap();
     let peer = remote.socket.local_addr().unwrap();
-    application.insert(established(peer, now), now).unwrap();
-    remote.insert(established(local, now), now).unwrap();
+    let (client_session, server_session) =
+        negotiated::negotiated_pair(local, peer, now, now, limits());
+    application.insert(client_session, now).unwrap();
+    remote.insert(server_session, now).unwrap();
     let message: Box<[u8]> = vec![0xfe, 7, 8].into();
     application.try_send(peer, message.clone(), now).unwrap();
     let update_at = now + STEP;

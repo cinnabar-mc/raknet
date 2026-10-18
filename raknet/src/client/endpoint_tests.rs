@@ -11,7 +11,7 @@ fn incoming_connection_advertises_the_bound_endpoint_and_twenty_system_addresses
         let remote: SocketAddr = remote.parse().unwrap();
         let local: SocketAddr = local.parse().unwrap();
         let now = crate::clock::test_now() + Duration::from_secs(1000);
-        let mut session = RakSession::new(
+        let mut session = SessionEngine::new(
             RakSessionId(0),
             remote,
             1,
@@ -29,7 +29,7 @@ fn incoming_connection_advertises_the_bound_endpoint_and_twenty_system_addresses
         }
         .serialized()
         .unwrap();
-        RakClient::handle_connection_request_accepted(
+        ClientEngine::handle_connection_request_accepted(
             &mut session,
             remote,
             local,

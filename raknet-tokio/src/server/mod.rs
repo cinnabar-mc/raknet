@@ -1,18 +1,17 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod error;
-pub mod msg;
-mod state;
+mod msg;
+mod phases;
+pub use phases::{ConfiguredServer, RunningServer};
 
 use crate::server::error::RakServerError;
 use crate::server::msg::RakServerMsg;
-use crate::server::state::RakServerState;
-use crate::session::RakSession;
+use crate::session::{RakSession, RestoredSession, SessionEvent, spawn_closing, spawn_established};
 use raknet::prelude::{
-    RakClock, RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput,
-    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
-    constants,
+    Established, RakClock, RakServer as RakServerIntl, RakServerConfig, RakServerInput,
+    RakServerOutput, RakSessionId, RakSessionInput, RakSessionSnapshot,
+    RestoredSession as CoreRestoredSession, Sans, constants,
 };
-use state::{Initialized, Running};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -22,11 +21,19 @@ use tokio::sync::mpsc::{Sender, unbounded_channel};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::debug;
 
-pub struct RakServer {
-    state: RakServerState,
+/// A configured or running server; only the running owner can accept sessions.
+///
+/// ```compile_fail
+/// use raknet_tokio::prelude::*;
+/// fn before_start(mut server: RakServer<ConfiguredServer>) {
+///     server.accept();
+/// }
+/// ```
+pub struct RakServer<S> {
+    state: S,
 }
 
-impl RakServer {
+impl RakServer<ConfiguredServer> {
     pub fn new<T>(addr: SocketAddr, conf: T) -> Self
     where
         T: FnOnce(&mut RakServerConfig),
@@ -35,69 +42,56 @@ impl RakServer {
         conf(&mut config);
 
         RakServer {
-            state: RakServerState::Initialized(Initialized { addr, config }),
+            state: ConfiguredServer { addr, config },
         }
     }
 
-    pub fn set_message<T>(&mut self, val: T)
-    where
-        T: Into<Box<[u8]>>,
-    {
-        let buf = val.into();
-        match &mut self.state {
-            RakServerState::Initialized(Initialized { config, .. }) => {
-                config.message = buf;
+    /// Updates the advertisement before socket binding.
+    pub fn set_message<T: Into<Box<[u8]>>>(&mut self, value: T) {
+        self.state.config.message = value.into();
+    }
+    /// Updates configured connection admission before socket binding.
+    pub fn set_max_connections(&mut self, value: usize) {
+        self.state.config.max_connections = value;
+    }
+
+    /// Binds an automatic socket owner, retaining configuration on validation or bind failure.
+    /// Manual session flushing is unsupported because this handle exposes no caller tick.
+    pub async fn start(self) -> Result<RakServer<RunningServer>, ServerStartError> {
+        if let Err(error) = self.state.config.session.validate() {
+            return Err(ServerStartError {
+                server: Box::new(self),
+                cause: raknet::prelude::RakServerError::from(error).into(),
+            });
+        }
+        if let Err(cause) =
+            crate::configuration::require_automatic_flush(&self.state.config.session)
+        {
+            return Err(ServerStartError {
+                server: Box::new(self),
+                cause: cause.into(),
+            });
+        }
+        let socket = match UdpSocket::bind(self.state.addr).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                return Err(ServerStartError {
+                    server: Box::new(self),
+                    cause: error.into(),
+                });
             }
-            RakServerState::Running(Running { msg_tx, .. }) => {
-                let _ = msg_tx.send(RakServerMsg::SetMessage(buf));
-            }
-            _ => {}
-        }
-    }
-
-    pub fn set_max_connections(&mut self, val: usize) {
-        match &mut self.state {
-            RakServerState::Initialized(Initialized { config, .. }) => {
-                config.max_connections = val;
-            }
-            RakServerState::Running(Running { msg_tx, .. }) => {
-                let _ = msg_tx.send(RakServerMsg::SetMaxConnections(val));
-            }
-            _ => {}
-        }
-    }
-
-    /// Drops every datagram from `ip` for `duration`. Takes effect once the server is running.
-    pub fn block(&mut self, ip: IpAddr, duration: Duration) {
-        if let RakServerState::Running(Running { msg_tx, .. }) = &mut self.state {
-            let _ = msg_tx.send(RakServerMsg::Block(ip, duration));
-        }
-    }
-
-    pub fn unblock(&mut self, ip: IpAddr) {
-        if let RakServerState::Running(Running { msg_tx, .. }) = &mut self.state {
-            let _ = msg_tx.send(RakServerMsg::Unblock(ip));
-        }
-    }
-
-    pub async fn start(&mut self) -> Result<(), RakServerError> {
-        let RakServerState::Initialized(Initialized { config, addr }) = &self.state else {
-            return Ok(());
         };
-
+        let config = self.state.config;
+        let addr = self.state.addr;
         let (session_tx, session_rx) = unbounded_channel();
         let (msg_tx, msg_rx) = unbounded_channel();
 
-        let socket = UdpSocket::bind(addr).await?;
-
         let handle = tokio::spawn({
-            let config = config.clone();
-            let addr = *addr;
             let socket = socket;
             let mut msg_rx = msg_rx;
 
             async move {
-                let mut sessions: HashMap<RakSessionId, Sender<RakSessionInput>> = HashMap::new();
+                let mut sessions: HashMap<RakSessionId, Sender<SessionEvent>> = HashMap::new();
 
                 let mut buf = vec![0u8; config.max_mtu_size as usize].into_boxed_slice();
                 let mut server = RakServerIntl::new(
@@ -105,12 +99,17 @@ impl RakServer {
                     addr,
                     RakClock::new(Instant::now().into_std()),
                     Instant::now().into_std(),
-                );
+                )
+                .expect("session configuration was validated before binding");
 
                 let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let mut stop_deadline: Option<Instant> = None;
+                let mut adoptions: HashMap<
+                    RakSessionId,
+                    tokio::sync::oneshot::Sender<Result<RestoredSession, RakServerError>>,
+                > = HashMap::new();
 
                 let mut update_interval = interval(Duration::from_millis(
                     constants::AUTOFLUSH_INTERVAL_MS as u64,
@@ -156,26 +155,24 @@ impl RakServer {
                                     let _ = server.handle(RakServerInput::Unblock(ip));
                                 }
                                 RakServerMsg::Adopt(session, reply) => {
-                                    server.adopt(*session);
-
-                                    if let Some(RakServerOutput::SessionConnected(session)) = server.poll() {
-                                        let id = session.id;
-
-                                        let (session, tx) = RakSession::spawn(
-                                            *session,
-                                            dgram_tx.clone(),
-                                            disconnect_tx.clone(),
-                                        );
-
-                                        sessions.insert(id, tx);
-                                        let _ = reply.send(session);
+                                    let id = match session {
+                                        CoreRestoredSession::Established(session) => server.adopt(session).map_err(|error| error.into_parts().1),
+                                        CoreRestoredSession::Closing(session) => server.adopt(session).map_err(|error| error.into_parts().1),
+                                        CoreRestoredSession::Closed(terminal) => {
+                                            let _ = reply.send(Ok(RestoredSession::Closed(terminal)));
+                                            continue;
+                                        }
+                                    };
+                                    match id {
+                                        Ok(id) => { adoptions.insert(id, reply); }
+                                        Err(cause) => { let _ = reply.send(Err(cause.into())); }
                                     }
                                 }
                                 RakServerMsg::Stop => {
                                     let now = Instant::now().into_std();
 
                                     for session in sessions.values() {
-                                        let _ = session.try_send(RakSessionInput::Disconnect(now));
+                                        let _ = session.try_send(SessionEvent::Close(now));
                                     }
 
                                     stop_deadline = Some(
@@ -196,7 +193,9 @@ impl RakServer {
                                     let now = Instant::now().into_std();
 
                                     let input = RakSessionInput::Datagram(buf, now);
-                                    if let Err(TrySendError::Full(_)) = session.try_send(input) {
+                                    if let Err(TrySendError::Full(_)) =
+                                        session.try_send(SessionEvent::Io(input))
+                                    {
                                         debug!("closing session {id:?}, its input queue is full");
                                         sessions.remove(&id);
                                     }
@@ -204,28 +203,40 @@ impl RakServer {
                                     debug!("no session found with id {id:?}");
                                 }
                             }
+                            RakServerOutput::SessionClosing(session) => {
+                                let id = session.id();
+                                let (session, tx) =
+                                    spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
+                                sessions.insert(id, tx);
+                                if let Some(reply) = adoptions.remove(&id) {
+                                    let _ = reply.send(Ok(RestoredSession::Closing(session)));
+                                }
+                            }
                             RakServerOutput::SessionConnected(session) => {
-                                let id = session.id;
+                                let id = session.id();
 
                                 debug!("session {:?} connected", id);
 
-                                let (session, tx) = RakSession::spawn(
-                                    *session,
+                                let (session, tx) = spawn_established(
+                                    session,
                                     dgram_tx.clone(),
                                     disconnect_tx.clone(),
                                 );
 
                                 if stop_deadline.is_some() {
-                                    let _ = tx.try_send(RakSessionInput::Disconnect(
-                                        Instant::now().into_std(),
-                                    ));
+                                    let _ =
+                                        tx.try_send(SessionEvent::Close(Instant::now().into_std()));
                                     sessions.insert(id, tx);
                                     continue;
                                 }
 
                                 sessions.insert(id, tx);
 
-                                let _ = session_tx.send(session);
+                                if let Some(reply) = adoptions.remove(&id) {
+                                    let _ = reply.send(Ok(RestoredSession::Established(session)));
+                                } else {
+                                    let _ = session_tx.send(session);
+                                }
                             }
                         }
                     }
@@ -243,91 +254,125 @@ impl RakServer {
             }
         });
 
-        self.state = RakServerState::Running(Running {
-            handle,
-            session_rx,
-            msg_tx,
-        });
-        Ok(())
+        Ok(RakServer {
+            state: RunningServer {
+                handle: Some(handle),
+                session_rx,
+                msg_tx,
+            },
+        })
     }
+}
 
-    pub async fn stop(&mut self) {
-        if !matches!(self.state, RakServerState::Running(_)) {
-            return;
+impl RakServer<RunningServer> {
+    /// Updates the running endpoint advertisement through its private actor.
+    pub fn set_message<T: Into<Box<[u8]>>>(&mut self, value: T) {
+        let _ = self
+            .state
+            .msg_tx
+            .send(RakServerMsg::SetMessage(value.into()));
+    }
+    /// Updates the running endpoint's admission limit.
+    pub fn set_max_connections(&mut self, value: usize) {
+        let _ = self
+            .state
+            .msg_tx
+            .send(RakServerMsg::SetMaxConnections(value));
+    }
+    /// Drops datagrams from an IP for a caller-selected duration.
+    pub fn block(&mut self, ip: IpAddr, duration: Duration) {
+        let _ = self.state.msg_tx.send(RakServerMsg::Block(ip, duration));
+    }
+    /// Removes the endpoint's explicit IP block.
+    pub fn unblock(&mut self, ip: IpAddr) {
+        let _ = self.state.msg_tx.send(RakServerMsg::Unblock(ip));
+    }
+    /// Consumes the running capability and awaits its graceful stop.
+    pub async fn stop(mut self) {
+        let _ = self.state.msg_tx.send(RakServerMsg::Stop);
+        if let Some(handle) = self.state.handle.take() {
+            let _ = handle.await;
         }
-
-        let RakServerState::Running(Running { handle, msg_tx, .. }) =
-            std::mem::replace(&mut self.state, RakServerState::Shutdown)
-        else {
-            unreachable!()
-        };
-
-        let _ = msg_tx.send(RakServerMsg::Stop);
-        let _ = handle.await;
     }
 
     /// Resumes a session captured with [`crate::session::RakSession::snapshot`] on
     /// another server, returning its handle here. `elapsed` is the time since capture.
+    /// Manual-flush captures are returned unchanged before restoration or dispatch;
+    /// other restore/actor errors consume the capture.
     pub async fn adopt(
         &mut self,
         snapshot: RakSessionSnapshot,
         elapsed: Duration,
-    ) -> Result<RakSession, RakServerError> {
-        let RakServerState::Running(Running { msg_tx, .. }) = &self.state else {
-            return Err(RakServerError::Closed);
-        };
+    ) -> Result<RestoredSession, ServerAdoptError> {
+        if let Err(cause) = crate::configuration::require_automatic_flush(snapshot.config()) {
+            return Err(ServerAdoptError::UnsupportedConfiguration {
+                snapshot: Box::new(snapshot),
+                cause,
+            });
+        }
+        let msg_tx = &self.state.msg_tx;
 
-        let session = RakSessionIntl::restore(snapshot, Instant::now().into_std(), elapsed)?;
+        let session = snapshot
+            .restore(Instant::now().into_std(), elapsed)
+            .map_err(RakServerError::from)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         msg_tx
-            .send(RakServerMsg::Adopt(Box::new(session), tx))
+            .send(RakServerMsg::Adopt(session, tx))
             .map_err(|_| RakServerError::Closed)?;
 
-        rx.await.map_err(|_| RakServerError::Closed)
+        Ok(rx.await.map_err(|_| RakServerError::Closed)??)
     }
 
-    pub async fn accept(&mut self) -> Result<RakSession, RakServerError> {
-        let RakServerState::Running(Running { session_rx, .. }) = &mut self.state else {
-            return Err(RakServerError::Closed);
-        };
+    pub async fn accept(&mut self) -> Result<RakSession<Established>, RakServerError> {
+        self.state
+            .session_rx
+            .recv()
+            .await
+            .ok_or(RakServerError::Closed)
+    }
+}
 
-        session_rx.recv().await.ok_or(RakServerError::Closed)
+/// An adapter-policy rejection retains the original capture before any restore or actor dispatch.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerAdoptError {
+    /// This automatic endpoint cannot drive the saved manual-flush policy.
+    #[error("server snapshot configuration is unsupported: {cause}")]
+    UnsupportedConfiguration {
+        /// The exact unconsumed application capture, without a rebased clock.
+        snapshot: Box<RakSessionSnapshot>,
+        /// Adapter-owned local validation failure.
+        #[source]
+        cause: std::io::Error,
+    },
+    /// Restoration or actor admission consumed the capture and failed.
+    #[error(transparent)]
+    Session(#[from] RakServerError),
+}
+
+/// A failed bind retains the original server configuration.
+#[derive(thiserror::Error)]
+#[error("server start failed: {cause}")]
+pub struct ServerStartError {
+    server: Box<RakServer<ConfiguredServer>>,
+    #[source]
+    cause: RakServerError,
+}
+
+impl std::fmt::Debug for ServerStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerStartError")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerStartError {
+    /// Recovers the unstarted owner and original socket failure.
+    pub fn into_parts(self) -> (RakServer<ConfiguredServer>, RakServerError) {
+        (*self.server, self.cause)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore]
-    async fn rak_server() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_line_number(true)
-            .with_test_writer()
-            .compact()
-            .try_init();
-
-        let mut server = RakServer::new("127.0.0.1:19132".parse().unwrap(), |config| {
-            config.guid = 123456789;
-            config.message = Box::new(*b"MCPE;Chorus;0;1.0.0;0;-1;123456789;Chorus;Survival");
-        });
-
-        let _ = server.start().await;
-
-        let mut sessions = Vec::new();
-
-        loop {
-            tokio::select! {
-                Ok(session) = server.accept() => {
-                    sessions.push(session);
-                    debug!("received session")
-                }
-            }
-        }
-    }
-}
+mod tests;

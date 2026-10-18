@@ -10,7 +10,7 @@ use crate::protocol::packets::ack::MAX_ACK_ENTRIES;
 fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
     let origin = crate::clock::test_now();
     let start = origin + Duration::from_secs(5);
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(42),
         "127.0.0.1:19132".parse().unwrap(),
         7,
@@ -25,7 +25,7 @@ fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
     let capture = start + Duration::from_millis(40);
     let json = facet_json::to_string(&session.snapshot(capture)).unwrap();
     let destination = origin + Duration::from_secs(3600);
-    let mut resumed = RakSession::restore(
+    let mut resumed = SessionEngine::restore(
         facet_json::from_str(&json).unwrap(),
         destination,
         Duration::from_millis(60),
@@ -46,7 +46,7 @@ fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
     resumed.tick(due).unwrap();
     assert_eq!(sequences_of(&drain_outputs(&mut resumed)).len(), 1);
 
-    let mut acknowledged = RakSession::restore(
+    let mut acknowledged = SessionEngine::restore(
         facet_json::from_str(&json).unwrap(),
         destination,
         Duration::from_millis(60),
@@ -54,7 +54,7 @@ fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
     .unwrap();
     let ack = Ack::new(vec![0], false);
     acknowledged
-        .handle(RakSessionInput::Datagram(
+        .handle(SessionInput::Datagram(
             ack.serialized().unwrap(),
             destination,
         ))
@@ -64,14 +64,14 @@ fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
 
     let snapshot = session.snapshot(capture);
     assert!(matches!(
-        RakSession::restore(snapshot, destination, Duration::MAX),
+        SessionEngine::restore(snapshot, destination, Duration::MAX),
         Err(snapshot::RakSessionRestoreError::TimeOutOfRange)
     ));
 }
 
 #[test]
 fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(42),
         "127.0.0.1:19132".parse().unwrap(),
         0xDEAD_BEEF,
@@ -83,7 +83,7 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
 
     let now = domain_time();
     session
-        .handle(RakSessionInput::Send(
+        .handle(SessionInput::Send(
             Box::from(*b"hello"),
             RakReliability::ReliableOrdered,
             RakPriority::Immediate,
@@ -100,7 +100,7 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
 
     let json =
         facet_json::to_string(&session.snapshot(domain_time())).expect("snapshot must serialize");
-    let mut resumed = RakSession::restore(
+    let mut resumed = SessionEngine::restore(
         facet_json::from_str(&json).expect("snapshot must deserialize"),
         domain_time(),
         Duration::ZERO,
@@ -113,7 +113,7 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
     assert_eq!(resumed.outbound_rel, before_seq);
 
     resumed
-        .handle(RakSessionInput::Send(
+        .handle(SessionInput::Send(
             Box::from(*b"world"),
             RakReliability::ReliableOrdered,
             RakPriority::Immediate,
@@ -127,7 +127,7 @@ fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
 /// as zero.
 #[test]
 fn an_unmeasured_rtt_survives_a_json_round_trip() {
-    let session = RakSession::new(
+    let session = SessionEngine::new(
         RakSessionId(1),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -138,7 +138,7 @@ fn an_unmeasured_rtt_survives_a_json_round_trip() {
     );
 
     let json = facet_json::to_string(&session.snapshot(domain_time())).unwrap();
-    let resumed = RakSession::restore(
+    let resumed = SessionEngine::restore(
         facet_json::from_str(&json).unwrap(),
         domain_time(),
         Duration::ZERO,
@@ -153,7 +153,7 @@ fn an_unmeasured_rtt_survives_a_json_round_trip() {
 
 #[test]
 fn out_of_range_order_channel_does_not_panic() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -171,7 +171,7 @@ fn out_of_range_order_channel_does_not_panic() {
 
 #[test]
 fn max_message_len_is_the_outbound_split_limit() {
-    let session = RakSession::new(
+    let session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -189,7 +189,7 @@ fn max_message_len_is_the_outbound_split_limit() {
 
 #[test]
 fn max_message_len_is_at_least_one_unsplit_frame() {
-    let session = RakSession::new(
+    let session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -207,7 +207,7 @@ fn max_message_len_is_at_least_one_unsplit_frame() {
 
 #[test]
 fn honors_configured_ordering_channels() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -230,7 +230,7 @@ fn honors_configured_ordering_channels() {
 
 #[test]
 fn priority_routes_to_separate_queues() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -262,7 +262,7 @@ fn priority_routes_to_separate_queues() {
 
 #[test]
 fn rejects_out_of_range_split_index() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -284,7 +284,7 @@ fn rejects_out_of_range_split_index() {
 
 #[test]
 fn drops_split_frame_exceeding_max_queued_bytes() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -309,7 +309,7 @@ fn drops_split_frame_exceeding_max_queued_bytes() {
 
 #[test]
 fn disconnect_reason_matches_cause() {
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         "127.0.0.1:19132".parse().unwrap(),
         0,
@@ -320,7 +320,7 @@ fn disconnect_reason_matches_cause() {
     );
 
     session
-        .handle(RakSessionInput::Disconnect(domain_time()))
+        .handle(SessionInput::Disconnect(domain_time()))
         .unwrap();
 
     let reason = session
@@ -335,8 +335,8 @@ fn disconnect_reason_matches_cause() {
     assert_eq!(reason, RakDisconnectReason::Requested);
 }
 
-fn session(id: u64, port: u16) -> RakSession {
-    RakSession::new(
+fn session(id: u64, port: u16) -> SessionEngine {
+    SessionEngine::new(
         RakSessionId(id),
         SocketAddr::from(([127, 0, 0, 1], port)),
         id,
@@ -347,7 +347,7 @@ fn session(id: u64, port: u16) -> RakSession {
     )
 }
 
-fn deliver(from: &mut RakSession, to: &mut RakSession, now: Instant) {
+fn deliver(from: &mut SessionEngine, to: &mut SessionEngine, now: Instant) {
     let datagrams: Vec<Box<[u8]>> = std::iter::from_fn(|| from.poll())
         .filter_map(|out| match out {
             RakSessionOutput::Datagram(buf, _) => Some(buf),
@@ -355,11 +355,11 @@ fn deliver(from: &mut RakSession, to: &mut RakSession, now: Instant) {
         })
         .collect();
     for buf in datagrams {
-        to.handle(RakSessionInput::Datagram(buf, now)).unwrap();
+        to.handle(SessionInput::Datagram(buf, now)).unwrap();
     }
 }
 
-fn packets(session: &mut RakSession) -> Vec<Box<[u8]>> {
+fn packets(session: &mut SessionEngine) -> Vec<Box<[u8]>> {
     std::iter::from_fn(|| session.poll())
         .filter_map(|out| match out {
             RakSessionOutput::Packet(buf) => Some(buf),
@@ -368,10 +368,10 @@ fn packets(session: &mut RakSession) -> Vec<Box<[u8]>> {
         .collect()
 }
 
-fn datagram(sequence: u32, frames: Vec<Frame>) -> RakSessionInput {
+fn datagram(sequence: u32, frames: Vec<Frame>) -> SessionInput {
     let set = FrameSet::new(sequence, frames, false, true, false);
 
-    RakSessionInput::Datagram(set.serialized().unwrap(), domain_time())
+    SessionInput::Datagram(set.serialized().unwrap(), domain_time())
 }
 
 fn unreliable(byte: u8) -> Vec<Frame> {
@@ -440,7 +440,7 @@ fn ordered(order_index: u32) -> Frame {
     frame
 }
 
-fn disconnect_reason(session: &RakSession) -> Option<RakDisconnectReason> {
+fn disconnect_reason(session: &SessionEngine) -> Option<RakDisconnectReason> {
     session.output.iter().find_map(|out| match out {
         RakSessionOutput::Disconnected(_, reason) => Some(*reason),
         _ => None,
@@ -509,7 +509,7 @@ fn fragment(split_id: u16, split_size: u32, split_index: u32, payload: &[u8]) ->
     frame
 }
 
-fn assert_closed_for_violation(session: &RakSession) {
+fn assert_closed_for_violation(session: &SessionEngine) {
     assert_eq!(session.state, RakSessionState::Disconnected);
     assert_eq!(
         disconnect_reason(session),
@@ -655,7 +655,7 @@ fn counters_wrap_at_24_bits_in_both_directions() {
     let now = domain_time();
     for i in 0..4u8 {
         sender
-            .handle(RakSessionInput::Send(
+            .handle(SessionInput::Send(
                 Box::new([0xFE, i]),
                 RakReliability::ReliableOrdered,
                 RakPriority::Immediate,
@@ -677,7 +677,7 @@ fn counters_wrap_at_24_bits_in_both_directions() {
     assert_eq!(receiver.inbound_ord_idx[0], 2);
 }
 
-fn outbound_acks(session: &mut RakSession) -> Vec<Box<[u8]>> {
+fn outbound_acks(session: &mut SessionEngine) -> Vec<Box<[u8]>> {
     std::iter::from_fn(|| session.poll())
         .filter_map(|out| match out {
             RakSessionOutput::Datagram(buf, _) if buf[0] & (flags::ACK | flags::NACK) != 0 => {
@@ -775,7 +775,7 @@ fn deferred_reliable_datagrams_are_retried_after_the_receive_budget_frees() {
         "unretained reliable data must not be acknowledged"
     );
     let saved = receiver.snapshot(now);
-    let mut receiver = RakSession::restore(saved, now, Duration::ZERO).unwrap();
+    let mut receiver = SessionEngine::restore(saved, now, Duration::ZERO).unwrap();
     receiver
         .handle(datagram_at(2, vec![ordered_payload(0, &[0xfe, 0])], now))
         .unwrap();
@@ -844,7 +844,7 @@ fn immediate_reliable_sends_obey_the_outstanding_window() {
     let now = domain_time();
     for _ in 0..MAX_UNACKED_RELIABLE + 20 {
         sender
-            .handle(RakSessionInput::Send(
+            .handle(SessionInput::Send(
                 Box::new([0xfe]),
                 RakReliability::ReliableOrdered,
                 RakPriority::Immediate,
@@ -870,7 +870,7 @@ fn terminal_notification_precedes_stopping_an_exhausted_sender() {
         let now = domain_time();
         for _ in 0..MAX_UNACKED_RELIABLE + 20 {
             sender
-                .handle(RakSessionInput::Send(
+                .handle(SessionInput::Send(
                     Box::new([0xfe]),
                     RakReliability::ReliableOrdered,
                     RakPriority::Immediate,
@@ -896,11 +896,11 @@ fn terminal_notification_precedes_stopping_an_exhausted_sender() {
             "protocol replies must progress while application sends are blocked"
         );
         if immediate {
-            sender.handle(RakSessionInput::DisconnectNow(now)).unwrap();
+            sender.handle(SessionInput::DisconnectNow(now)).unwrap();
         } else {
-            sender.handle(RakSessionInput::Disconnect(now)).unwrap();
+            sender.handle(SessionInput::Disconnect(now)).unwrap();
             sender
-                .handle(RakSessionInput::Update(
+                .handle(SessionInput::Update(
                     now + sender.config.close_timeout + Duration::from_millis(1),
                 ))
                 .unwrap();
@@ -942,15 +942,13 @@ fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
         drain_outputs(&mut receiver);
         let json = facet_json::to_string(&receiver.snapshot(capture)).unwrap();
         let destination = crate::clock::test_now() + Duration::from_secs(3600);
-        let mut receiver = RakSession::restore(
+        let mut receiver = SessionEngine::restore(
             facet_json::from_str(&json).unwrap(),
             destination,
             SESSION_TIMEOUT / 2 + Duration::from_millis(1),
         )
         .unwrap();
-        receiver
-            .handle(RakSessionInput::Update(destination))
-            .unwrap();
+        receiver.handle(SessionInput::Update(destination)).unwrap();
         assert_eq!(
             disconnect_reason(&receiver),
             Some(RakDisconnectReason::Timeout)
@@ -1010,11 +1008,11 @@ fn delivered_ordered_frames_release_their_byte_budget() {
     assert_eq!(session.inbound_ord_queue[&0].len(), 1);
 }
 
-fn datagram_at(sequence: u32, frames: Vec<Frame>, now: Instant) -> RakSessionInput {
-    let RakSessionInput::Datagram(buf, _) = datagram(sequence, frames) else {
+fn datagram_at(sequence: u32, frames: Vec<Frame>, now: Instant) -> SessionInput {
+    let SessionInput::Datagram(buf, _) = datagram(sequence, frames) else {
         unreachable!()
     };
-    RakSessionInput::Datagram(buf, now)
+    SessionInput::Datagram(buf, now)
 }
 
 #[test]
@@ -1029,7 +1027,7 @@ fn partial_split_without_a_fragment_for_the_session_timeout_is_evicted() {
         .handle(datagram_at(1, unreliable(0), start + SESSION_TIMEOUT / 2))
         .unwrap();
     session
-        .handle(RakSessionInput::Update(
+        .handle(SessionInput::Update(
             start + SESSION_TIMEOUT + Duration::from_millis(1),
         ))
         .unwrap();
@@ -1058,7 +1056,7 @@ fn partial_split_receiving_fragments_is_kept() {
         ))
         .unwrap();
     session
-        .handle(RakSessionInput::Update(
+        .handle(SessionInput::Update(
             start + SESSION_TIMEOUT + Duration::from_millis(1),
         ))
         .unwrap();
@@ -1083,7 +1081,7 @@ fn large_sends_split_into_datagrams_within_the_mtu() {
 
     for mtu in crate::util::constants::MTU_SIZES {
         for reliability in reliabilities {
-            let mut session = RakSession::new(
+            let mut session = SessionEngine::new(
                 RakSessionId(0),
                 "[::1]:19132".parse().unwrap(),
                 0,
@@ -1094,7 +1092,7 @@ fn large_sends_split_into_datagrams_within_the_mtu() {
             );
             for priority in [RakPriority::Immediate, RakPriority::Normal] {
                 session
-                    .handle(RakSessionInput::Send(
+                    .handle(SessionInput::Send(
                         vec![0xFE; 64 * 1024].into_boxed_slice(),
                         reliability,
                         priority,
@@ -1118,7 +1116,7 @@ fn large_sends_split_into_datagrams_within_the_mtu() {
     }
 }
 
-fn drain_outputs(session: &mut RakSession) -> Vec<RakSessionOutput> {
+fn drain_outputs(session: &mut SessionEngine) -> Vec<RakSessionOutput> {
     std::iter::from_fn(|| session.poll()).collect()
 }
 
@@ -1159,14 +1157,14 @@ fn close_sends_queued_data_and_waits_for_ack() {
     let t0 = domain_time();
     let payload: Box<[u8]> = vec![0xFE, 1, 2, 3].into();
 
-    a.handle(RakSessionInput::Send(
+    a.handle(SessionInput::Send(
         payload.clone(),
         RakReliability::ReliableOrdered,
         RakPriority::Normal,
         t0,
     ))
     .unwrap();
-    a.handle(RakSessionInput::Disconnect(t0)).unwrap();
+    a.handle(SessionInput::Disconnect(t0)).unwrap();
 
     let outputs = drain_outputs(&mut a);
     assert!(
@@ -1177,12 +1175,12 @@ fn close_sends_queued_data_and_waits_for_ack() {
     assert_eq!(a.state, RakSessionState::Closing);
 
     for buf in datagrams_of(&outputs) {
-        b.handle(RakSessionInput::Datagram(buf, t0)).unwrap();
+        b.handle(SessionInput::Datagram(buf, t0)).unwrap();
     }
     b.tick(t0).unwrap();
     deliver(&mut b, &mut a, t0);
 
-    a.handle(RakSessionInput::Update(t0 + Duration::from_millis(20)))
+    a.handle(SessionInput::Update(t0 + Duration::from_millis(20)))
         .unwrap();
     let outputs = drain_outputs(&mut a);
     assert!(
@@ -1202,21 +1200,21 @@ fn close_gives_up_after_close_timeout() {
     let mut a = session(1, 1);
     let t0 = domain_time();
 
-    a.handle(RakSessionInput::Send(
+    a.handle(SessionInput::Send(
         vec![0xFE, 1].into(),
         RakReliability::ReliableOrdered,
         RakPriority::Normal,
         t0,
     ))
     .unwrap();
-    a.handle(RakSessionInput::Disconnect(t0)).unwrap();
+    a.handle(SessionInput::Disconnect(t0)).unwrap();
     drain_outputs(&mut a);
 
-    a.handle(RakSessionInput::Update(t0 + Duration::from_secs(4)))
+    a.handle(SessionInput::Update(t0 + Duration::from_secs(4)))
         .unwrap();
     assert_eq!(disconnect_reason_of(&drain_outputs(&mut a)), None);
 
-    a.handle(RakSessionInput::Update(t0 + Duration::from_millis(5001)))
+    a.handle(SessionInput::Update(t0 + Duration::from_millis(5001)))
         .unwrap();
     assert_eq!(
         disconnect_reason_of(&drain_outputs(&mut a)),
@@ -1230,17 +1228,17 @@ fn close_resends_unacknowledged_data() {
     let t0 = domain_time();
     let payload: Box<[u8]> = vec![0xFE, 9, 9].into();
 
-    a.handle(RakSessionInput::Send(
+    a.handle(SessionInput::Send(
         payload.clone(),
         RakReliability::ReliableOrdered,
         RakPriority::Immediate,
         t0,
     ))
     .unwrap();
-    a.handle(RakSessionInput::Disconnect(t0)).unwrap();
+    a.handle(SessionInput::Disconnect(t0)).unwrap();
     drain_outputs(&mut a);
 
-    let result = a.handle(RakSessionInput::Update(t0 + Duration::from_millis(2100)));
+    let result = a.handle(SessionInput::Update(t0 + Duration::from_millis(2100)));
 
     assert!(result.is_ok(), "update while closing failed: {result:?}");
     assert!(payloads_of(&drain_outputs(&mut a)).contains(&payload));
@@ -1284,8 +1282,8 @@ fn unacknowledged_application_and_liveness_sends_respect_outbound_memory_limit()
     }
 }
 
-fn send(session: &mut RakSession, len: usize, now: Instant) -> Result<(), RakSessionError> {
-    session.handle(RakSessionInput::Send(
+fn send(session: &mut SessionEngine, len: usize, now: Instant) -> Result<(), RakSessionError> {
+    session.handle(SessionInput::Send(
         vec![0xFE; len].into_boxed_slice(),
         RakReliability::ReliableOrdered,
         RakPriority::Normal,
@@ -1314,7 +1312,7 @@ fn a_maximum_message_fits_the_receivers_fragment_storage_budget() {
         let outputs = drain_outputs(&mut b);
         reason = reason.or(disconnect_reason_of(&outputs));
         for buf in datagrams_of(&outputs) {
-            a.handle(RakSessionInput::Datagram(buf, now)).unwrap();
+            a.handle(SessionInput::Datagram(buf, now)).unwrap();
         }
         received.extend(outputs.into_iter().filter_map(|out| match out {
             RakSessionOutput::Packet(buf) => Some(buf),
@@ -1429,7 +1427,7 @@ fn congestion_reference_avoidance_grows_once_per_ack_independent_of_datagram_siz
 fn congestion_reference_nack_recovery_does_not_back_off_again_for_same_block_timeout() {
     let now = domain_time();
     for first_sequence in [0, u24::MASK - 1] {
-        let mut sender = RakSession::new(
+        let mut sender = SessionEngine::new(
             RakSessionId(0),
             "127.0.0.1:19132".parse().unwrap(),
             7,
@@ -1457,7 +1455,7 @@ fn congestion_reference_nack_recovery_does_not_back_off_again_for_same_block_tim
         let before = sender.congestion_controller.snapshot(sender.clock);
         let nack_at = now + Duration::from_millis(10);
         sender
-            .handle(RakSessionInput::Datagram(
+            .handle(SessionInput::Datagram(
                 Ack::new(vec![initial_sequences[0]], true)
                     .serialized()
                     .unwrap(),
@@ -1512,7 +1510,7 @@ fn congestion_reference_accounting_excludes_the_datagram_header_for_mixed_frames
     let mut sender = session(0, 1);
     for reliability in [RakReliability::Reliable, RakReliability::Unreliable] {
         sender
-            .handle(RakSessionInput::Send(
+            .handle(SessionInput::Send(
                 vec![0xfe; 100].into_boxed_slice(),
                 reliability,
                 RakPriority::Normal,
@@ -1535,7 +1533,7 @@ fn congestion_reference_accounting_excludes_the_datagram_header_for_mixed_frames
     assert_eq!(sender.outbound_bytes(), datagrams[0].len());
     let ack = Ack::new(vec![set.sequence], false).serialized().unwrap();
     sender
-        .handle(RakSessionInput::Datagram(
+        .handle(SessionInput::Datagram(
             ack.clone(),
             now + Duration::from_millis(10),
         ))
@@ -1544,10 +1542,7 @@ fn congestion_reference_accounting_excludes_the_datagram_header_for_mixed_frames
     let after = sender.congestion_controller.snapshot(sender.clock);
     assert_eq!(after.bytes_not_acknowledged, 0);
     sender
-        .handle(RakSessionInput::Datagram(
-            ack,
-            now + Duration::from_millis(20),
-        ))
+        .handle(SessionInput::Datagram(ack, now + Duration::from_millis(20)))
         .unwrap();
     let duplicate = sender.congestion_controller.snapshot(sender.clock);
     assert_eq!(duplicate.bytes_not_acknowledged, 0);
@@ -1609,7 +1604,7 @@ fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
         let boundary = sender.outbound_seq;
         let nack_at = now + Duration::from_millis(10);
         sender
-            .handle(RakSessionInput::Datagram(
+            .handle(SessionInput::Datagram(
                 Ack::new(vec![initial[0]], true).serialized().unwrap(),
                 nack_at,
             ))
@@ -1619,7 +1614,7 @@ fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
         let before = sender.congestion_controller.snapshot(sender.clock);
         let json = facet_json::to_string(&sender.snapshot(nack_at)).unwrap();
         let destination = now + Duration::from_secs(10);
-        let mut resumed = RakSession::restore(
+        let mut resumed = SessionEngine::restore(
             facet_json::from_str(&json).unwrap(),
             destination,
             Duration::from_millis(10),
@@ -1627,7 +1622,7 @@ fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
         .unwrap();
         // An ACK equal to the recovery boundary grows a busy window without ending its block.
         resumed
-            .handle(RakSessionInput::Datagram(
+            .handle(SessionInput::Datagram(
                 Ack::new(vec![boundary], false).serialized().unwrap(),
                 destination,
             ))
@@ -1636,7 +1631,7 @@ fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
         assert!(after_ack.congestion_window > before.congestion_window);
         assert_eq!(after_ack.congestion_recovery_sequence, Some(boundary));
         resumed
-            .handle(RakSessionInput::Datagram(
+            .handle(SessionInput::Datagram(
                 Ack::new(vec![initial[1]], true).serialized().unwrap(),
                 destination + Duration::from_millis(1),
             ))
@@ -1704,7 +1699,7 @@ fn ordered_sends_wait_for_a_lost_message_before_exceeding_the_receive_window() {
         let now = domain_time();
         // Establish enough congestion capacity for later datagrams to pass the loss.
         for _ in 0..3000 {
-            a.handle(RakSessionInput::Send(
+            a.handle(SessionInput::Send(
                 Box::new([0xfe]),
                 RakReliability::Reliable,
                 RakPriority::Normal,
@@ -1729,7 +1724,7 @@ fn ordered_sends_wait_for_a_lost_message_before_exceeding_the_receive_window() {
         for index in 0..total {
             let mut message = vec![0xfe];
             message.extend_from_slice(&(index as u32).to_le_bytes());
-            a.handle(RakSessionInput::Send(
+            a.handle(SessionInput::Send(
                 message.into_boxed_slice(),
                 RakReliability::ReliableOrdered,
                 RakPriority::Normal,
@@ -1751,7 +1746,7 @@ fn ordered_sends_wait_for_a_lost_message_before_exceeding_the_receive_window() {
                 for frame in frames {
                     highest = highest.max(u24::distance(first_index, frame.order_index));
                 }
-                b.handle(RakSessionInput::Datagram(datagram, now)).unwrap();
+                b.handle(SessionInput::Datagram(datagram, now)).unwrap();
                 assert_eq!(b.get_state(), RakSessionState::Connected);
             }
             b.tick(now).unwrap();
@@ -1765,7 +1760,7 @@ fn ordered_sends_wait_for_a_lost_message_before_exceeding_the_receive_window() {
         assert!(packets(&mut b).is_empty());
 
         for datagram in withheld {
-            b.handle(RakSessionInput::Datagram(datagram, now)).unwrap();
+            b.handle(SessionInput::Datagram(datagram, now)).unwrap();
         }
         let mut received = packets(&mut b);
         for _ in 0..500 {
@@ -1792,7 +1787,7 @@ fn reliable_sends_stop_4096_indices_past_the_oldest_unacknowledged() {
     let now = domain_time();
 
     for _ in 0..6000 {
-        a.handle(RakSessionInput::Send(
+        a.handle(SessionInput::Send(
             Box::new([0xFE]),
             RakReliability::Reliable,
             RakPriority::Normal,
@@ -1814,7 +1809,7 @@ fn reliable_sends_stop_4096_indices_past_the_oldest_unacknowledged() {
             highest = highest.max(frame.reliable_index);
         }
         for buf in datagrams {
-            b.handle(RakSessionInput::Datagram(buf, now)).unwrap();
+            b.handle(SessionInput::Datagram(buf, now)).unwrap();
         }
         b.tick(now).unwrap();
         deliver(&mut b, &mut a, now);
@@ -1856,7 +1851,7 @@ fn acknowledged_sends_release_outbound_bytes() {
     let mut b = session(1, 2);
     let now = domain_time();
 
-    a.handle(RakSessionInput::Send(
+    a.handle(SessionInput::Send(
         vec![0xFE; 1024].into_boxed_slice(),
         RakReliability::ReliableOrdered,
         RakPriority::Normal,
@@ -1907,11 +1902,11 @@ fn deferred_reliable_before_admission_times_out_despite_live_control_traffic() {
                 now,
             ))
             .unwrap();
-        receiver.handle(RakSessionInput::Update(now)).unwrap();
+        receiver.handle(SessionInput::Update(now)).unwrap();
         assert_eq!(receiver.state, RakSessionState::Connected);
     }
     receiver
-        .handle(RakSessionInput::Update(start + SESSION_TIMEOUT))
+        .handle(SessionInput::Update(start + SESSION_TIMEOUT))
         .unwrap();
     assert_eq!(
         disconnect_reason(&receiver),
@@ -1935,7 +1930,7 @@ fn deferred_reliable_deadline_survives_snapshot_without_retained_fragments() {
     drain_outputs(&mut receiver);
     let json = facet_json::to_string(&receiver.snapshot(capture)).unwrap();
     let destination = crate::clock::test_now() + Duration::from_secs(3600);
-    let mut resumed = RakSession::restore(
+    let mut resumed = SessionEngine::restore(
         facet_json::from_str(&json).unwrap(),
         destination,
         SESSION_TIMEOUT / 2,
@@ -1944,9 +1939,7 @@ fn deferred_reliable_deadline_survives_snapshot_without_retained_fragments() {
     resumed
         .handle(datagram_at(2, unreliable(0), destination))
         .unwrap();
-    resumed
-        .handle(RakSessionInput::Update(destination))
-        .unwrap();
+    resumed.handle(SessionInput::Update(destination)).unwrap();
     assert_eq!(
         disconnect_reason(&resumed),
         Some(RakDisconnectReason::Timeout)
@@ -1980,7 +1973,7 @@ fn admitted_retransmission_clears_a_transient_reliable_deferral() {
     assert_eq!(delivered[0][1200], 1);
     let now = start + SESSION_TIMEOUT;
     receiver.handle(datagram_at(2, unreliable(0), now)).unwrap();
-    receiver.handle(RakSessionInput::Update(now)).unwrap();
+    receiver.handle(SessionInput::Update(now)).unwrap();
     assert_eq!(
         receiver.state,
         RakSessionState::Connected,

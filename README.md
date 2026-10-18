@@ -1,145 +1,191 @@
-<br />
-<div align="center">
-
 # RakNet
 
-A RakNet transport library written in Rust.
+Rust RakNet transport for clients and servers, with a sans-I/O core and separate
+Tokio and Bevy adapters. The core owns negotiation, reliability, fragmentation,
+ordering and congestion control; your application can own the sockets, clock and
+scheduler.
 
-[![rust][rust_badge_url]][rust_url]
-[![transport][transport_badge_url]][transport_url]
-[![license][license_badge_url]][license_url]
+This is the [Cinnabar](https://github.com/cinnabar-mc) fork of
+[bedrock-crustaceans/raknet](https://github.com/bedrock-crustaceans/raknet).
+It transports application messages. Minecraft login, authentication, packet
+codecs and resource packs belong to the layer above it, such as
+[bedrock-net](https://github.com/cinnabar-mc/bedrock-net).
 
-</div>
+## Choose an integration
 
-<!-- BADGES -->
-[transport_badge_url]: https://img.shields.io/badge/transport-raknet-black?style=flat-square
-[transport_url]: https://github.com/facebookarchive/RakNet
+| Crate | Use it when | I/O and scheduling |
+| --- | --- | --- |
+| [`raknet`](raknet) | You have an event loop, frame scheduler or many sessions to multiplex. | Caller-owned sockets and time; no Tokio dependency or background tasks. |
+| [`raknet-tokio`](raknet-tokio) | Your application already runs Tokio. | Async client, server and session handles; adapter-owned sockets and tasks. |
+| [`bevy-raknet`](bevy-raknet) | You want a Bevy resource and connection messages. | Nonblocking UDP driven in `PreUpdate`, directly over the core; no Tokio dependency. |
 
-[rust_badge_url]: https://img.shields.io/badge/rust-2024-%23D34516?style=flat-square&logo=rust&logoColor=%23D34516&labelColor=white
-[rust_url]: https://rust-lang.org/
+The adapters are separate crates, rather than features of `raknet`. Their
+`RakClient`, `RakServer` and `RakSession` names refer to different integration
+types. Import from the chosen crate's `prelude`.
 
-[license_badge_url]: https://img.shields.io/github/license/bedrock-crustaceans/raknet?style=flat-square
-[license_url]: LICENSE
-<!-- BADGES -->
+Tokio and Bevy require `config.session.autoflush = true`, the default. They
+reject manual flushing before opening a socket because their handles expose no
+caller `tick`. Tokio also rejects manual-flush snapshots before restoration or
+actor dispatch, returning the original capture in its adoption error.
 
-### Crates
+## Add a dependency
 
-- **[`raknet`](raknet)** - a pure sans-io implementation (client, server, and session).
-- **[`raknet-tokio`](raknet-tokio)** - an async tokio wrapper over the sans-io crate.
-- **[`bevy-raknet`](bevy-raknet)** - a Bevy plugin wrapping the sans-io crate directly.
+Use the Cinnabar Git repository to select this implementation:
 
-### Usage
+```toml
+[dependencies]
+raknet = { git = "https://github.com/cinnabar-mc/raknet" }
+```
 
-- tokio server:
-    
-    ```rust
-    let mut server = RakServer::new(addr, |config| {
-        config.guid = 123456789;
-        config.message = Box::new(*b"my server message");
-    });
-    server.start().await?;
-    
-    loop {
-        let mut session = server.accept().await?;
-        tokio::spawn(async move {
-            while let Ok(packet) = session.recv::<Box<[u8]>>().await {
-                let _ = session
-                    .send(packet, RakReliability::ReliableOrdered, RakPriority::Immediate)
-                    .await;
-            }
-        });
-    }
-    ```
+For Tokio, use `raknet-tokio` instead:
 
-- bevy server:
+```toml
+[dependencies]
+raknet-tokio = { git = "https://github.com/cinnabar-mc/raknet" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
-    ```rust
-    app.add_plugins(RakServerPlugin)
-        .insert_resource(RakServer::new(addr, |_| {})?)
-        .add_systems(Update, (on_connect, echo).after(RakServerSet));
-    
-    fn on_connect(mut events: MessageReader<RakServerEvent>, mut commands: Commands) {
-        for event in events.read() {
-            if let RakServerEvent::SessionConnected { id, .. } = event {
-                commands.spawn(Player(*id));
-            }
-        }
-    }
-    
-    fn echo(mut server: ResMut<RakServer>) {
-        while let Some((id, packet)) = server.recv() {
-            let _ = server.send(id, packet, RakReliability::ReliableOrdered, RakPriority::Immediate);
-        }
-    }
-    ```
+For Bevy, use `bevy-raknet` from the same repository and match the Bevy version
+in its [manifest](bevy-raknet/Cargo.toml). Commit your application's `Cargo.lock`;
+if you use several crates from this repository, keep them on the same Git
+revision. The workspace uses Rust's 2024 edition. Its
+[CI configuration](.github/workflows/ci.yml) shows the toolchain and platforms
+currently checked.
 
-### Sans-I/O connection drivers
+## Start with the examples
 
-The core receives caller-supplied `std::time::Instant` values. Create a `RakClock`
-from the endpoint start time and reuse it across connection attempts; wire
-counters are milliseconds of monotonic uptime. Session construction takes an
-owned `RakSessionConfig`. Authentication UTC is independent of transport time.
+The examples are Cargo example targets using existing crate dependencies. Run
+these commands from this checkout:
 
-`snapshot(now)` captures portable millisecond offsets without serializing an
-`Instant`. To move a session between processes, call `restore(snapshot, now,
-elapsed)` with the destination clock and time since capture. SDK `adopt` takes
-the same elapsed duration. Invalid address or clock ranges return a typed error.
-Drain pending output before capture; a restored closing session receives a fresh
-close timeout. Use matching library revisions at both ends of a snapshot transfer.
+```sh
+# Advertise a message and echo one connected peer until it closes or you press Ctrl-C.
+cargo run --locked -p raknet-tokio --example echo -- 127.0.0.1:19132
 
-Congestion counts encapsulated bytes separately from retained datagram wire bytes.
-Each admitted ACK grows a busy window once; NACK recovery keeps its wrapping
-datagram-sequence boundary through retransmission and snapshots. Feedback flags
-use the current slow-start and send-burst state, which also survive transfer.
+# From another terminal, query that server's advertisement without connecting.
+cargo run --locked -p raknet-tokio --example ping -- 127.0.0.1:19132
+```
 
-A `RakClientOutput::MtuProbe` transfers one probe write to the I/O adapter. Measure
-only the socket write, then submit its opaque ID, completion time, elapsed write
-duration, and `is_mtu_probe_size_error` result through
-`RakClientInput::MtuProbeResult`. Submit a completion for failed writes too. The
-core keeps preparation time out of slow-write detection, continues MTU discovery
-while Request 2 retries, and ignores stale completions after cancellation or
-reconnection. Validate `RakClientConfig` before opening a socket.
+- [`ping.rs`](raknet-tokio/examples/ping.rs) creates a client, starts its socket
+  owner, awaits an advertisement and latency, then stops the owner on either
+  success or failure. It also accepts a numeric IPv6 endpoint such as
+  `[::1]:19132` when IPv6 is available.
+- [`echo.rs`](raknet-tokio/examples/echo.rs) accepts one peer and echoes complete
+  application messages using `ReliableOrdered` and `Normal` priority. It is a
+  transport example, not a Minecraft server.
+- [`shared_udp.rs`](raknet/tests/shared_udp.rs) demonstrates a controlled caller
+  loop for already established core sessions sharing one application socket.
+  See the [integration guide](docs/integration.md#many-sessions-on-shared-sockets)
+  for its routing and ownership constraints.
 
-### Sharing a caller-owned UDP socket
+For a connected Tokio client, `RakClient::new(...).start().await` consumes the
+configuration and returns `RakClient<RunningClient>`. Call `connect(remote).await`
+on that owner, then use the returned `RakSession<Established>`'s `send` and `recv`. Keep the
+client owner running while using its session. `recv::<Box<[u8]>>()` returns one
+complete application message. A successful `send` is not a remote delivery
+receipt. `session.close()` synchronously consumes send permission and returns a
+`RakSession<Closing>` that can drain the received prefix. Keep the socket owner
+running until terminal completion; `client.stop().await` or `server.stop().await`
+consumes that running owner and awaits its shutdown.
 
-The pure core can drive multiple sessions from one unconnected UDP socket per
-address family. Keep each `SessionConnected` handoff in a table keyed by its
-canonical remote `SocketAddr`; client-local session IDs are not globally unique.
-Reject a second live route for the same tuple. RakNet connected datagrams have no
-extra connection ID to distinguish two sessions using the same local socket and
-remote endpoint. Use separate family sockets rather than assuming IPv6 dual stack.
+## Drive the core yourself
 
-A frame or existing timer-wheel owner can use this concrete loop:
+Started core drivers implement `Sans`: feed typed I/O with `handle`, then drain
+output with `poll`. Setup, start and close use consuming methods. None opens a
+socket or reads the clock to advance the protocol.
 
-1. Retain an established-session datagram until `send_to` accepts it. `WouldBlock`
-   or interruption does not transfer ownership or reset its transport deadline.
-2. Read a bounded number of complete UDP datagrams, canonicalize each sender and
-   feed only the matching session with `RakSessionInput::Datagram(bytes, now)`.
-3. Feed due sessions `Update(now)`, using one caller-supplied monotonic time.
-   Anchor a relative `Wait` to its generating input's time, even when a blocked
-   datagram delays polling that output. Keep the prior timer obligation visible
-   until the new `Wait` or terminal is drained, and select the earliest peer
-   deadline for the next wake. Another route's wake must not restart a timeout.
-4. Drain each session's outputs in order. Route `Datagram` through the same socket,
-   retain application packets under the consumer's bounds, and retire only that
-   peer after its preceding outputs and `Disconnected`. Dropping a session sends
-   nothing; drive explicit disconnect when protocol notification is required.
+| Engine | Feed | Handle its output |
+| --- | --- | --- |
+| `RakClient<Active>` | Datagrams with their source address, timer updates and MTU write completions. | Send probes/datagrams, schedule a wake or take ownership of a negotiated session. |
+| `RakServer` | Received datagrams, periodic updates and endpoint configuration. | Send replies, route connected datagrams by session ID or take ownership of a new session. |
+| `RakSession<Established>` / `RakSession<Closing>` | Routed datagrams and timer updates. Only Established has `send`; consuming `close` returns Closing. | Send datagrams, deliver complete application packets, schedule a wake or retire a disconnected session. |
 
-[The controlled shared-UDP fixture](raknet/tests/shared_udp.rs) composes these
-public actions with four already established sessions, one application socket,
-explicit caller clocks, bounded one-message outbound admission, retained blocked
-writes and peer-specific cancellation/timeouts. Its remote sockets represent
-different servers. It also checks canonical duplicate/family rejection and has a
-separate IPv6 case that reports a missing loopback fixture when unavailable.
-The fixture sink is deliberately small and drained every round; it is not a
-general application receive-backpressure implementation.
+Create one `RakClock` from your endpoint's start time, and supply monotonic
+`Instant` values from that clock domain to subsequent inputs. A `Wait` is a
+relative deadline anchored to the input that generated it. The engine makes
+progress only when you service its outputs, socket input and timers.
 
-Negotiation still needs one `RakClient` attempt owner per remote and correct
-`MtuProbeResult` feedback for each write attempt, including failures, before
-handoff. Reconnect through that owner; merely inserting a new session at a reused
-tuple cannot distinguish old in-flight UDP from a new generation. This fixture
-does not qualify concurrent negotiation, large-scale scheduling, a live server
-or a Bevy application cutover.
-The existing Bevy client resource remains one client/socket; the optional Tokio
-edge keeps its own runtime policy. Sharing pure-core sessions requires neither
-adapter nor a new protocol engine, runtime, per-session task or timer abstraction.
+Client negotiation also requires feedback for **every MTU probe socket write**,
+including failed writes. A `SessionConnected` output transfers owned protocol
+state; immediately drain its existing outputs before processing newer input.
+These details are essential when building a frame-driven or shared-socket
+adapter. The [integration guide](docs/integration.md) covers negotiation,
+demultiplexing, deadlines, shutdown and snapshots.
+
+The core starts with `RakClient<Configured>`. Its consuming `connect(...)` returns
+`RakClient<Active>`; only a genuine `SessionConnected` handoff grants an
+established session. Live owners cannot be cloned or built from raw session
+metadata. Peer disconnection remains a runtime result. See the
+[integration guide](docs/integration.md) for the complete lifecycle.
+
+## Delivery and capacity
+
+Use `ReliableOrdered` for ordered reliable application traffic. Prefer queued
+priorities (`High`, `Normal`, `Low`) for sustained sends: `Immediate` bypasses
+congestion and receive-window scheduling.
+
+Set local limits through the client or server configuration's `session` field.
+`RakSessionConfig`, `max_message_len()` and `outbound_bytes()` configure and
+observe those bounds. Oversized messages return
+`RakSessionError::MessageSizeExceeded`; exceeding the outbound byte budget
+disconnects the session with `OutboundBytesExceeded`. Always inspect terminal
+outputs as well as the return value of `handle`.
+
+Drain application packets promptly and bound your own queues. Protocol retention
+limits do not bound every adapter or application queue. The Tokio adapter bounds
+session input and received-message channels and closes an overloaded session;
+its command and datagram channels are unbounded. The Bevy adapter's received
+message queues must be drained by application systems.
+
+## Bevy integration
+
+Add `RakClientPlugin` or `RakServerPlugin`, and insert the corresponding
+`RakClient::new(...)` or `RakServer::new(address, ...)` resource. These
+constructors bind nonblocking sockets and return `ClientStartError` or
+`ServerStartError` on failure. Their `into_parts()` methods recover the original
+configuration, bind address for servers, and I/O cause for an explicit retry.
+
+The plugins update their resources in `PreUpdate` and emit `RakClientEvent` or
+`RakServerEvent` messages. Order same-schedule consumers after `RakClientSet` or
+`RakServerSet`; drain packets through the resource's `recv` method.
+
+Start a client attempt through `client.idle()`'s consuming `connect(peer)`
+capability. Application sends require an exclusive established capability from
+`client.connected()` or `server.connected(id)`. Calling its consuming `close()`
+returns a closing capability without `send`; continue plugin updates until the
+disconnected event arrives. Neither resource exposes unrestricted application
+sends or mutable protocol state.
+
+The current Bevy client resource owns one IPv4 socket and one connection. For
+many clients, explicit IPv6 policy or stricter I/O backpressure, use the core
+with your own socket and scheduling owner rather than creating one plugin
+resource per session.
+
+## Compatibility and development
+
+This fork targets the RakNet transport used by Bedrock and incorporates fixes
+based on the public Lunar go-raknet implementation. The default protocol and
+transport limits are defined in [`constants`](raknet/src/util/constants.rs).
+This does not establish complete compatibility with every RakNet peer, network
+path or game version. Validate the servers and network conditions your
+application supports.
+
+From the repository root:
+
+```sh
+cargo fmt --all --check
+cargo test --locked -p raknet
+cargo check --locked -p raknet-tokio --examples
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo doc --locked --workspace --no-deps
+```
+
+Use the focused core command when working only on the protocol engine; workspace
+commands also build the Tokio and Bevy adapters.
+
+## License and attribution
+
+The original Rust implementation and this fork use the
+[Apache-2.0 license](LICENSE). Public Lunar go-raknet behavior references retain
+their [MIT notice](LICENSE-MIT-go-raknet). See [NOTICE](NOTICE) for the Cinnabar
+modifications and reference attribution.

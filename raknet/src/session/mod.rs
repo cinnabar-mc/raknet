@@ -3,6 +3,7 @@ pub mod config;
 pub mod congestion_controller;
 pub mod error;
 pub mod input;
+pub(crate) mod lifecycle;
 pub mod output;
 mod ranges;
 mod receive;
@@ -20,7 +21,7 @@ use crate::protocol::types::frame::Frame;
 use crate::sans::Sans;
 use crate::session::congestion_controller::RakCongestionController;
 use crate::session::error::RakSessionError;
-use crate::session::input::RakSessionInput;
+use crate::session::input::SessionInput;
 use crate::session::output::{RakDisconnectReason, RakSessionOutput};
 use crate::types::priority::RakPriority;
 use crate::types::reliability::RakReliability;
@@ -58,7 +59,7 @@ const MAX_SPLITS_IN_FLIGHT: usize = 256;
 const SESSION_TIMEOUT: Duration = Duration::from_millis(15000);
 
 #[derive(Clone, Debug)]
-pub struct RakSession {
+pub(crate) struct SessionEngine {
     pub id: RakSessionId,
     pub addr: SocketAddr,
     pub state: RakSessionState,
@@ -109,8 +110,8 @@ pub struct RakSession {
     output: VecDeque<RakSessionOutput>,
 }
 
-impl Sans for RakSession {
-    type Input = RakSessionInput;
+impl Sans for SessionEngine {
+    type Input = SessionInput;
     type Output = RakSessionOutput;
     type Error = RakSessionError;
 
@@ -120,7 +121,7 @@ impl Sans for RakSession {
         }
 
         match msg {
-            RakSessionInput::Datagram(buf, now) => {
+            SessionInput::Datagram(buf, now) => {
                 self.last_recv = now;
 
                 let Some(&b) = buf.first() else {
@@ -139,13 +140,13 @@ impl Sans for RakSession {
                     _ => self.handle_frame_set(&mut cursor, now)?,
                 }
             }
-            RakSessionInput::Send(..) if self.state == RakSessionState::Closing => {
+            SessionInput::Send(..) if self.state == RakSessionState::Closing => {
                 return Err(RakSessionError::Closed);
             }
-            RakSessionInput::Send(buf, ..) if buf.len() > self.max_message_len() => {
+            SessionInput::Send(buf, ..) if buf.len() > self.max_message_len() => {
                 return Err(RakSessionError::MessageSizeExceeded(buf.len()));
             }
-            RakSessionInput::Send(buf, _, _, now)
+            SessionInput::Send(buf, _, _, now)
                 if self.outbound_bytes + buf.len() > self.config.max_outbound_bytes as usize =>
             {
                 debug!(
@@ -154,12 +155,12 @@ impl Sans for RakSession {
                 );
                 self.disconnect(true, RakDisconnectReason::OutboundBytesExceeded, now)?
             }
-            RakSessionInput::Send(buf, reliability, priority, now) => {
+            SessionInput::Send(buf, reliability, priority, now) => {
                 self.send_frame(Frame::new(reliability, buf), priority, now)?
             }
-            RakSessionInput::Update(now) => self.handle_timeout(now)?,
-            RakSessionInput::Disconnect(now) => self.close(now)?,
-            RakSessionInput::DisconnectNow(now) => {
+            SessionInput::Update(now) => self.handle_timeout(now)?,
+            SessionInput::Disconnect(now) => self.close(now)?,
+            SessionInput::DisconnectNow(now) => {
                 self.send_queue(now)?;
                 self.flush();
                 self.disconnect(true, RakDisconnectReason::Requested, now)?
@@ -173,7 +174,7 @@ impl Sans for RakSession {
     }
 }
 
-impl RakSession {
+impl SessionEngine {
     /// Creates session timers in the same domain clock used by its subsequent inputs.
     pub fn new(
         id: RakSessionId,
@@ -243,10 +244,6 @@ impl RakSession {
         }
     }
 
-    pub fn get_addr(self) -> SocketAddr {
-        self.addr
-    }
-
     pub fn get_state(&self) -> RakSessionState {
         self.state
     }
@@ -270,7 +267,10 @@ impl RakSession {
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        if now >= self.last_recv + SESSION_TIMEOUT {
+        if now
+            .checked_duration_since(self.last_recv)
+            .is_some_and(|elapsed| elapsed >= SESSION_TIMEOUT)
+        {
             debug!(
                 "detected stale connection from {}, disconnecting...",
                 self.addr
@@ -288,27 +288,36 @@ impl RakSession {
             return self.update_closing(now);
         }
 
-        if self.config.autoflush && now >= self.last_tick + self.config.autoflush_interval_ms {
+        if self.config.autoflush
+            && now
+                .checked_duration_since(self.last_tick)
+                .is_some_and(|elapsed| elapsed >= self.config.autoflush_interval_ms)
+        {
             self.tick(now)?;
 
             self.last_tick = now;
         }
 
-        if now >= self.last_ping + Duration::from_millis(2000) {
+        let ping_interval = Duration::from_millis(2000);
+        if now
+            .checked_duration_since(self.last_ping)
+            .is_some_and(|elapsed| elapsed >= ping_interval)
+        {
             self.send_connected_ping(now, RakReliability::Unreliable)?;
 
             self.last_ping = now;
         }
 
-        let mut next = min(
-            self.last_ping + Duration::from_millis(2000),
-            self.last_recv + SESSION_TIMEOUT,
+        let mut duration = min(
+            remaining(self.last_ping, ping_interval, now),
+            remaining(self.last_recv, SESSION_TIMEOUT, now),
         );
         if self.config.autoflush {
-            next = min(next, self.last_tick + self.config.autoflush_interval_ms);
+            duration = min(
+                duration,
+                remaining(self.last_tick, self.config.autoflush_interval_ms, now),
+            );
         }
-
-        let duration = next.saturating_duration_since(now);
 
         self.output.push_back(RakSessionOutput::Wait(duration));
         Ok(())
@@ -329,7 +338,7 @@ impl RakSession {
         }
 
         self.output
-            .push_back(RakSessionOutput::Wait(self.config.autoflush_interval_ms));
+            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
         Ok(())
     }
 
@@ -340,23 +349,37 @@ impl RakSession {
     }
 
     fn update_closing(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        let deadline = self.closing_since.unwrap_or(now) + self.config.close_timeout;
+        let since = self.closing_since.unwrap_or(now);
 
         self.tick(now)?;
         self.last_tick = now;
 
-        if self.nothing_left_to_send() || now >= deadline {
+        if self.nothing_left_to_send()
+            || now
+                .checked_duration_since(since)
+                .is_some_and(|elapsed| elapsed >= self.config.close_timeout)
+        {
             return self.disconnect(true, RakDisconnectReason::Requested, now);
         }
 
-        let next = min(
-            min(deadline, self.last_recv + SESSION_TIMEOUT),
-            now + self.config.autoflush_interval_ms,
-        );
-        let duration = next.saturating_duration_since(now);
-
-        self.output.push_back(RakSessionOutput::Wait(duration));
+        self.output
+            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
         Ok(())
+    }
+
+    /// Bounds both the first close wait and later updates by the original session policy.
+    fn closing_wait(&self, now: Instant) -> Duration {
+        min(
+            min(
+                remaining(
+                    self.closing_since.unwrap_or(now),
+                    self.config.close_timeout,
+                    now,
+                ),
+                remaining(self.last_recv, SESSION_TIMEOUT, now),
+            ),
+            self.config.autoflush_interval_ms,
+        )
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<(), RakSessionError> {
@@ -797,7 +820,7 @@ impl RakSession {
         let payload = ping.serialized()?;
         if reliability.is_reliable() {
             // Reliable liveness needs the same retention and delivery limits as application data.
-            self.handle(RakSessionInput::Send(
+            self.handle(SessionInput::Send(
                 payload,
                 reliability,
                 RakPriority::Immediate,
@@ -895,6 +918,14 @@ impl RakSession {
             .push_back(RakSessionOutput::Disconnected(self.id, reason));
 
         Ok(())
+    }
+}
+
+/// Computes a relative wait without making a future caller timestamp prematurely due.
+fn remaining(since: Instant, interval: Duration, now: Instant) -> Duration {
+    match now.checked_duration_since(since) {
+        Some(elapsed) => interval.saturating_sub(elapsed),
+        None => interval.saturating_add(since.duration_since(now)),
     }
 }
 

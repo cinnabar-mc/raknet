@@ -2,6 +2,7 @@
 pub mod config;
 pub mod error;
 pub mod input;
+pub(crate) mod lifecycle;
 pub mod output;
 
 use crate::clock::RakClock;
@@ -22,17 +23,16 @@ use crate::protocol::packets::unconnected_pong::UnconnectedPong;
 use crate::sans::Sans;
 use crate::server::error::RakServerError;
 use crate::server::input::RakServerInput;
-use crate::session::config::RakSessionConfig;
-use crate::session::input::RakSessionInput;
+use crate::session::input::SessionInput;
 use crate::session::output::RakSessionOutput;
 use crate::session::state::RakSessionState;
-use crate::session::{RakSession, RakSessionId};
+use crate::session::{RakSessionId, SessionEngine};
 use crate::types::priority::RakPriority;
 use crate::types::reliability::RakReliability;
 use crate::util::socket_addr::get_overhead;
 use crate::util::{constants, flags, packet_id};
 use config::RakServerConfig;
-use output::RakServerOutput;
+use output::ServerOutput;
 use rand::random;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -47,7 +47,7 @@ const OFFLINE_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_millis(10_000);
 const COOKIE_ROTATION_INTERVAL: Duration = Duration::from_secs(2);
 
-pub struct RakServer {
+pub(crate) struct ServerEngine {
     addr: SocketAddr,
     config: RakServerConfig,
     clock: RakClock,
@@ -55,7 +55,7 @@ pub struct RakServer {
     session_id: RakSessionId,
     session_map: HashMap<SocketAddr, RakSessionId>,
     session_addr: HashMap<RakSessionId, SocketAddr>,
-    session_pending: HashMap<SocketAddr, (Instant, RakSession)>,
+    session_pending: HashMap<SocketAddr, (Instant, SessionEngine)>,
 
     recently_disconnected: HashMap<SocketAddr, Instant>,
 
@@ -71,12 +71,12 @@ pub struct RakServer {
     cookie_salts: [u64; 2],
     cookie_rotated: Instant,
 
-    output: VecDeque<RakServerOutput>,
+    output: VecDeque<ServerOutput>,
 }
 
-impl Sans for RakServer {
+impl Sans for ServerEngine {
     type Input = RakServerInput;
-    type Output = RakServerOutput;
+    type Output = ServerOutput;
     type Error = RakServerError;
 
     fn handle(&mut self, msg: Self::Input) -> Result<(), Self::Error> {
@@ -134,7 +134,7 @@ impl Sans for RakServer {
     }
 }
 
-impl RakServer {
+impl ServerEngine {
     /// Creates an endpoint with explicit wire-counter origin and initial timer time.
     pub fn new(config: RakServerConfig, addr: SocketAddr, clock: RakClock, now: Instant) -> Self {
         Self {
@@ -163,13 +163,13 @@ impl RakServer {
         }
     }
 
-    /// Takes over a session from another `RakServer`, continuing its protocol state
+    /// Takes over a session from another `ServerEngine`, continuing its protocol state
     /// rather than handshaking the peer again.
     ///
     /// The session is given a fresh local [`RakSessionId`], since the two servers count
-    /// ids independently, and is emitted as [`RakServerOutput::SessionConnected`] so it
+    /// ids independently, and is emitted as [`ServerOutput::SessionConnected`] so it
     /// arrives through the same `poll()` path as one this server handshaked itself.
-    pub fn adopt(&mut self, mut session: RakSession) {
+    pub fn adopt(&mut self, mut session: SessionEngine) -> RakSessionId {
         let id = self.session_id.increment();
 
         let addr = session.addr;
@@ -179,7 +179,8 @@ impl RakServer {
         self.session_addr.insert(id, addr);
 
         self.output
-            .push_back(RakServerOutput::SessionConnected(Box::new(session)));
+            .push_back(ServerOutput::SessionConnected(Box::new(session)));
+        id
     }
 
     fn rotate_cookie_salt(&mut self, now: Instant) {
@@ -272,13 +273,17 @@ impl RakServer {
         let mut closed = Vec::new();
 
         for (&addr, (_, session)) in self.session_pending.iter_mut() {
-            session.handle(RakSessionInput::Update(now))?;
+            session.handle(SessionInput::Update(now))?;
+            if !self.config.session.autoflush {
+                // The endpoint owns handshake progress until the application receives its session.
+                session.tick(now)?;
+            }
 
             while let Some(msg) = session.poll() {
                 match msg {
-                    RakSessionOutput::Datagram(buf, to) => self
-                        .output
-                        .push_back(RakServerOutput::SocketDatagram(buf, to)),
+                    RakSessionOutput::Datagram(buf, to) => {
+                        self.output.push_back(ServerOutput::SocketDatagram(buf, to))
+                    }
                     RakSessionOutput::Disconnected(..) => closed.push(addr),
                     _ => {}
                 }
@@ -359,13 +364,13 @@ impl RakServer {
 
             let (_, session) = entry.get_mut();
 
-            session.handle(RakSessionInput::Datagram(buf, now))?;
+            session.handle(SessionInput::Datagram(buf, now))?;
 
             while let Some(msg) = session.poll() {
                 match msg {
                     RakSessionOutput::Datagram(buf, addr) => self
                         .output
-                        .push_back(RakServerOutput::SocketDatagram(buf, addr)),
+                        .push_back(ServerOutput::SocketDatagram(buf, addr)),
                     RakSessionOutput::Packet(buf) => {
                         if let Some(&b) = buf.first() {
                             let mut cursor = Cursor::new(buf.as_ref());
@@ -412,7 +417,7 @@ impl RakServer {
                 let (_, session) = entry.remove();
 
                 self.output
-                    .push_back(RakServerOutput::SessionConnected(Box::new(session)));
+                    .push_back(ServerOutput::SessionConnected(Box::new(session)));
             }
 
             return Ok(());
@@ -420,7 +425,7 @@ impl RakServer {
 
         if let Some(&id) = self.session_map.get(&addr) {
             self.output
-                .push_back(RakServerOutput::SessionDatagram(buf, id));
+                .push_back(ServerOutput::SessionDatagram(buf, id));
         }
         Ok(())
     }
@@ -439,7 +444,7 @@ impl RakServer {
         };
 
         self.output
-            .push_back(RakServerOutput::SocketDatagram(pong.serialized()?, addr));
+            .push_back(ServerOutput::SocketDatagram(pong.serialized()?, addr));
         Ok(())
     }
 
@@ -465,7 +470,7 @@ impl RakServer {
                 constants::PROTOCOL
             );
 
-            self.output.push_back(RakServerOutput::SocketDatagram(
+            self.output.push_back(ServerOutput::SocketDatagram(
                 incompatible.serialized()?,
                 addr,
             ));
@@ -482,10 +487,8 @@ impl RakServer {
                 guid: self.config.guid,
             };
 
-            self.output.push_back(RakServerOutput::SocketDatagram(
-                recently.serialized()?,
-                addr,
-            ));
+            self.output
+                .push_back(ServerOutput::SocketDatagram(recently.serialized()?, addr));
 
             return Ok(());
         }
@@ -503,7 +506,7 @@ impl RakServer {
         };
 
         self.output
-            .push_back(RakServerOutput::SocketDatagram(reply1.serialized()?, addr));
+            .push_back(ServerOutput::SocketDatagram(reply1.serialized()?, addr));
 
         Ok(())
     }
@@ -555,7 +558,7 @@ impl RakServer {
             };
 
             self.output
-                .push_back(RakServerOutput::SocketDatagram(already.serialized()?, addr));
+                .push_back(ServerOutput::SocketDatagram(already.serialized()?, addr));
 
             return Ok(());
         }
@@ -574,7 +577,7 @@ impl RakServer {
             };
 
             self.output
-                .push_back(RakServerOutput::SocketDatagram(no_free.serialized()?, addr));
+                .push_back(ServerOutput::SocketDatagram(no_free.serialized()?, addr));
 
             return Ok(());
         }
@@ -587,24 +590,21 @@ impl RakServer {
         let reply2 = OpenConnectionReply2::new(self.config.guid, addr, mtu, false);
 
         self.output
-            .push_back(RakServerOutput::SocketDatagram(reply2.serialized()?, addr));
+            .push_back(ServerOutput::SocketDatagram(reply2.serialized()?, addr));
 
         let id = self.session_id.increment();
 
         self.session_map.insert(addr, id);
         self.session_addr.insert(id, addr);
 
-        let session = RakSession::new(
+        let session = SessionEngine::new(
             id,
             addr,
             request.client,
             request.mtu,
             now,
             self.clock,
-            RakSessionConfig {
-                ordering_channels: self.config.max_ordering_channels,
-                ..Default::default()
-            },
+            self.config.session.clone(),
         );
 
         self.session_pending.insert(addr, (now, session));
@@ -613,7 +613,7 @@ impl RakServer {
     }
 
     fn handle_connection_request(
-        session: &mut RakSession,
+        session: &mut SessionEngine,
         addr: SocketAddr,
         buf: &mut Cursor<&[u8]>,
         now: Instant,
@@ -630,7 +630,7 @@ impl RakServer {
             timestamp: session.clock.timestamp(now),
         };
 
-        session.handle(RakSessionInput::Send(
+        session.handle(SessionInput::Send(
             accepted.serialized()?,
             RakReliability::ReliableOrdered,
             RakPriority::Immediate,
@@ -641,7 +641,7 @@ impl RakServer {
     }
 
     fn handle_new_incoming_connection(
-        session: &mut RakSession,
+        session: &mut SessionEngine,
         addr: SocketAddr,
         buf: &mut Cursor<&[u8]>,
     ) -> Result<(), RakServerError> {

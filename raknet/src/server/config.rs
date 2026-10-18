@@ -4,7 +4,8 @@ use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct RakServerConfig {
-    pub max_ordering_channels: i32,
+    /// Local limits applied to every genuinely negotiated server session.
+    pub session: crate::session::config::RakSessionConfig,
 
     pub guid: u64,
     pub protocols: Box<[u8]>,
@@ -31,7 +32,7 @@ pub struct RakServerConfig {
 impl Default for RakServerConfig {
     fn default() -> RakServerConfig {
         Self {
-            max_ordering_channels: constants::MAX_ORDERING_CHANNELS,
+            session: Default::default(),
 
             guid: random(),
             protocols: Box::new([constants::PROTOCOL]),

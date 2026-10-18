@@ -5,6 +5,8 @@ use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct RakClientConfig {
+    /// Bounds and flush policy applied to the genuinely negotiated local session.
+    pub session: crate::session::config::RakSessionConfig,
     pub local_port: u16,
     pub protocol: u8,
     pub min_mtu_size: u16,
@@ -22,6 +24,7 @@ pub struct RakClientConfig {
 impl RakClientConfig {
     /// Validates capacities and cadence before an adapter opens its socket.
     pub fn validate(&self) -> Result<(), RakClientError> {
+        self.session.validate()?;
         if self.max_mtu_size < self.min_mtu_size.max(constants::MIN_PROBE_MTU_SIZE)
             || self.max_mtu_size > constants::MAX_MTU_SIZE
         {
@@ -44,6 +47,7 @@ impl RakClientConfig {
 impl Default for RakClientConfig {
     fn default() -> Self {
         Self {
+            session: Default::default(),
             local_port: 0,
             min_mtu_size: constants::MIN_MTU_SIZE,
             max_mtu_size: constants::MAX_MTU_SIZE,
