@@ -1896,7 +1896,7 @@ fn deferred_reliable_before_admission_times_out_despite_live_control_traffic() {
             .handle(datagram_at(0, vec![frame.clone()], now))
             .unwrap();
         let ping = ConnectedPing {
-            timestamp: sequence as i64,
+            timestamp: u64::from(sequence),
         }
         .serialized()
         .unwrap();
