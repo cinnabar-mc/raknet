@@ -37,6 +37,10 @@ pub struct RakSessionSnapshot {
     pub last_pong_ms: u64,
 
     pub congestion_controller: RakCongestionSnapshot,
+    /// Demand remaining after the last application drain, including across transfer.
+    pub bandwidth_limited: bool,
+    /// The continuous-send indicator for the next datagram in the current drain.
+    pub wire_continuous: bool,
 
     pub queue: Vec<(Box<[u8]>, String)>,
 
@@ -92,6 +96,8 @@ impl RakSession {
             last_pong_ms: clock.timestamp(self.last_pong),
 
             congestion_controller: self.congestion_controller.snapshot(clock),
+            bandwidth_limited: self.bandwidth_limited,
+            wire_continuous: self.wire_continuous,
 
             queue: self
                 .queue
@@ -206,7 +212,8 @@ impl RakSession {
                 snapshot.congestion_controller,
                 clock,
             )?,
-            bandwidth_limited: false,
+            bandwidth_limited: snapshot.bandwidth_limited,
+            wire_continuous: snapshot.wire_continuous,
 
             queue,
 

@@ -1506,6 +1506,184 @@ fn congestion_reference_nack_recovery_does_not_back_off_again_for_same_block_tim
     }
 }
 
+#[test]
+fn congestion_reference_accounting_excludes_the_datagram_header_for_mixed_frames() {
+    let now = domain_time();
+    let mut sender = session(0, 1);
+    for reliability in [RakReliability::Reliable, RakReliability::Unreliable] {
+        sender
+            .handle(RakSessionInput::Send(
+                vec![0xfe; 100].into_boxed_slice(),
+                reliability,
+                RakPriority::Normal,
+                now,
+            ))
+            .unwrap();
+    }
+    sender.tick(now).unwrap();
+    let outputs = drain_outputs(&mut sender);
+    let datagrams = datagrams_of(&outputs);
+    assert_eq!(datagrams.len(), 1);
+    let set = FrameSet::deserialize(&mut Cursor::new(datagrams[0].as_ref())).unwrap();
+    assert_eq!(set.frames.len(), 2);
+    let before = sender.congestion_controller.snapshot(sender.clock);
+    assert_eq!(
+        before.bytes_not_acknowledged,
+        datagrams[0].len() - DGRAM_HEADER_SIZE as usize,
+        "congestion counts the encapsulated bytes of the retained datagram"
+    );
+    assert_eq!(sender.outbound_bytes(), datagrams[0].len());
+    let ack = Ack::new(vec![set.sequence], false).serialized().unwrap();
+    sender
+        .handle(RakSessionInput::Datagram(
+            ack.clone(),
+            now + Duration::from_millis(10),
+        ))
+        .unwrap();
+    assert_eq!(sender.outbound_bytes(), 0);
+    let after = sender.congestion_controller.snapshot(sender.clock);
+    assert_eq!(after.bytes_not_acknowledged, 0);
+    sender
+        .handle(RakSessionInput::Datagram(
+            ack,
+            now + Duration::from_millis(20),
+        ))
+        .unwrap();
+    let duplicate = sender.congestion_controller.snapshot(sender.clock);
+    assert_eq!(duplicate.bytes_not_acknowledged, 0);
+    assert_eq!(duplicate.congestion_window, after.congestion_window);
+}
+
+#[test]
+fn congestion_reference_feedback_bits_follow_the_actual_window_and_send_burst() {
+    let now = domain_time();
+    let mut sender = session(0, 1);
+    let mut snapshot = sender.congestion_controller.snapshot(sender.clock);
+    snapshot.congestion_window = 4.0 * sender.mtu as f64;
+    snapshot.slow_start_threshold = 2.0 * sender.mtu as f64;
+    sender.congestion_controller =
+        RakCongestionController::restore(snapshot, sender.clock).unwrap();
+    for _ in 0..2 {
+        send(&mut sender, 1000, now).unwrap();
+    }
+    sender.tick(now).unwrap();
+    let sets: Vec<_> = datagrams_of(&drain_outputs(&mut sender))
+        .iter()
+        .map(|bytes| FrameSet::deserialize(&mut Cursor::new(bytes.as_ref())).unwrap())
+        .collect();
+    assert_eq!(sets.len(), 2);
+    assert!(!sets[0].continuous_send);
+    assert!(sets[1].continuous_send);
+    assert!(sets.iter().all(|set| !set.needs_b_and_as));
+    assert!(
+        sets.iter()
+            .flat_map(|set| &set.frames)
+            .all(|frame| !frame.is_split())
+    );
+
+    let mut slow = session(1, 2);
+    send(&mut slow, 100, now).unwrap();
+    slow.tick(now).unwrap();
+    let first = datagrams_of(&drain_outputs(&mut slow));
+    let set = FrameSet::deserialize(&mut Cursor::new(first[0].as_ref())).unwrap();
+    assert!(set.needs_b_and_as);
+    assert!(!set.continuous_send);
+}
+
+#[test]
+fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
+    let now = domain_time();
+    for first_sequence in [0, u24::MASK - 2] {
+        let mut sender = session(0, 1);
+        let mut snapshot = sender.congestion_controller.snapshot(sender.clock);
+        snapshot.congestion_window = 4.0 * sender.mtu as f64;
+        sender.congestion_controller =
+            RakCongestionController::restore(snapshot, sender.clock).unwrap();
+        sender.outbound_seq = first_sequence;
+        for _ in 0..12 {
+            send(&mut sender, 1000, now).unwrap();
+        }
+        sender.tick(now).unwrap();
+        let initial = sequences_of(&drain_outputs(&mut sender));
+        assert!(initial.len() >= 2);
+        let boundary = sender.outbound_seq;
+        let nack_at = now + Duration::from_millis(10);
+        sender
+            .handle(RakSessionInput::Datagram(
+                Ack::new(vec![initial[0]], true).serialized().unwrap(),
+                nack_at,
+            ))
+            .unwrap();
+        let nacked = drain_outputs(&mut sender);
+        assert_eq!(sequences_of(&nacked), [boundary]);
+        let before = sender.congestion_controller.snapshot(sender.clock);
+        let json = facet_json::to_string(&sender.snapshot(nack_at)).unwrap();
+        let destination = now + Duration::from_secs(10);
+        let mut resumed = RakSession::restore(
+            facet_json::from_str(&json).unwrap(),
+            destination,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        // An ACK equal to the recovery boundary grows a busy window without ending its block.
+        resumed
+            .handle(RakSessionInput::Datagram(
+                Ack::new(vec![boundary], false).serialized().unwrap(),
+                destination,
+            ))
+            .unwrap();
+        let after_ack = resumed.congestion_controller.snapshot(resumed.clock);
+        assert!(after_ack.congestion_window > before.congestion_window);
+        assert_eq!(after_ack.congestion_recovery_sequence, Some(boundary));
+        resumed
+            .handle(RakSessionInput::Datagram(
+                Ack::new(vec![initial[1]], true).serialized().unwrap(),
+                destination + Duration::from_millis(1),
+            ))
+            .unwrap();
+        let repeated = datagrams_of(&drain_outputs(&mut resumed));
+        assert_eq!(repeated.len(), 1);
+        let set = FrameSet::deserialize(&mut Cursor::new(repeated[0].as_ref())).unwrap();
+        assert!(set.continuous_send);
+        let after_nack = resumed.congestion_controller.snapshot(resumed.clock);
+        assert_eq!(after_nack.slow_start_threshold, before.slow_start_threshold);
+        assert_eq!(after_nack.congestion_recovery_sequence, Some(boundary));
+        resumed.tick(destination + Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            resumed
+                .congestion_controller
+                .snapshot(resumed.clock)
+                .congestion_window,
+            after_ack.congestion_window,
+            "transfer must preserve the original loss block across a due retransmission"
+        );
+    }
+}
+
+#[test]
+fn congestion_reference_newer_ack_opens_the_next_wrapping_loss_block() {
+    let now = domain_time();
+    let clock = RakClock::new(now);
+    for boundary in [20, u24::MASK] {
+        let mut snapshot = RakCongestionController::new(1200).snapshot(clock);
+        snapshot.congestion_window = 4800.0;
+        let mut controller = RakCongestionController::restore(snapshot, clock).unwrap();
+        controller.nacked(boundary, true);
+        controller.resent(u24::add(boundary, 1), true);
+        assert_eq!(controller.snapshot(clock).congestion_window, 4800.0);
+        let newer = u24::add(boundary, 1);
+        controller.sent(newer, 100, now);
+        controller.acked(now + Duration::from_millis(10), newer, 100, true);
+        assert!(controller.snapshot(clock).congestion_window > 4800.0);
+        controller.resent(u24::add(newer, 1), true);
+        assert_eq!(
+            controller.snapshot(clock).congestion_window,
+            1200.0,
+            "an admitted ACK past the old boundary permits a new timeout backoff"
+        );
+    }
+}
+
 fn frames_of(datagrams: &[Box<[u8]>]) -> Vec<Frame> {
     datagrams
         .iter()

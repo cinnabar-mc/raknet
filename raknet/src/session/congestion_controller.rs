@@ -151,9 +151,11 @@ impl RakCongestionController {
         }
     }
 
-    pub fn nacked(&mut self, bandwidth_limited: bool) {
+    /// Marks one loss block before retransmission assigns its next datagram sequence.
+    pub fn nacked(&mut self, next_sequence: u32, bandwidth_limited: bool) {
         if bandwidth_limited && self.congestion_recovery_sequence.is_none() {
             self.slow_start_threshold = self.congestion_window * 0.5;
+            self.congestion_recovery_sequence = Some(next_sequence);
         }
     }
 
@@ -186,8 +188,7 @@ impl RakCongestionController {
                         + (self.mtu as f64).powi(2) / self.congestion_window;
                 }
             } else {
-                self.congestion_window +=
-                    size as f64 * (self.mtu as f64).powi(2) / self.congestion_window.powi(2);
+                self.congestion_window += (self.mtu as f64).powi(2) / self.congestion_window;
             }
         }
     }

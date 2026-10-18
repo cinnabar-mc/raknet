@@ -87,6 +87,11 @@ the same elapsed duration. Invalid address or clock ranges return a typed error.
 Drain pending output before capture; a restored closing session receives a fresh
 close timeout. Use matching library revisions at both ends of a snapshot transfer.
 
+Congestion counts encapsulated bytes separately from retained datagram wire bytes.
+Each admitted ACK grows a busy window once; NACK recovery keeps its wrapping
+datagram-sequence boundary through retransmission and snapshots. Feedback flags
+use the current slow-start and send-burst state, which also survive transfer.
+
 A `RakClientOutput::MtuProbe` transfers one probe write to the I/O adapter. Measure
 only the socket write, then submit its opaque ID, completion time, elapsed write
 duration, and `is_mtu_probe_size_error` result through
