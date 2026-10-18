@@ -131,10 +131,15 @@ that a peer remains reachable between calls.
 | `session.tick(now)` | Explicitly flushes existing work when the caller owns the flush cadence. |
 | `session.finish()` | Consumes a terminal, fully drained owner into opaque terminal metadata; otherwise returns the owner unchanged. |
 
-For a manual-flush core session, call `tick(now)` explicitly to advance ACKs,
-retransmission and queued delivery. This capability is on the handed-off session;
-client/server endpoints do not expose a separate manual tick during online
-negotiation.
+During negotiation, client/server endpoint `Update(now)` inputs advance their
+privately owned handshake ACKs and retransmissions even when
+`session.autoflush = false`. Service the client's `Wait` outputs and choose a
+periodic server update cadence as usual. The original flush policy is retained
+when the actual session is handed off.
+
+For a handed-off manual-flush core session, call `tick(now)` explicitly to
+advance ACKs, retransmission and queued application delivery. Endpoint updates
+never tick an adopted or handed-off session on the application's behalf.
 
 A close error returns the Closing owner and cause through `into_parts()`. It
 never drops pending packet/terminal output or restores send permission. Continue

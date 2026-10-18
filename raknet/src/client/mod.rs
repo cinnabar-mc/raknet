@@ -413,6 +413,10 @@ impl ClientEngine {
             (&self.state, self.session.as_mut())
         {
             session.handle(SessionInput::Update(now))?;
+            if !self.config.session.autoflush {
+                // The endpoint owns handshake progress until the application receives its session.
+                session.tick(now)?;
+            }
             while let Some(output) = session.poll() {
                 match output {
                     RakSessionOutput::Datagram(bytes, peer) => self
