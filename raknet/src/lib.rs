@@ -10,7 +10,7 @@ mod util;
 pub mod prelude {
     pub use crate::client::{
         MtuProbeId, RakClient, config::RakClientConfig, error::RakClientError,
-        input::RakClientInput, is_mtu_probe_size_error, output::RakClientOutput,
+        input::RakClientInput, output::RakClientOutput,
     };
     pub use crate::sans::Sans;
     pub use crate::server::{
@@ -28,5 +28,6 @@ pub mod prelude {
     };
     pub use crate::types::*;
     pub use crate::util::constants;
+    pub use crate::util::io_error::{is_mtu_probe_size_error, is_transient_udp_read_error};
     pub use crate::util::socket_addr::canonical_socket_addr;
 }

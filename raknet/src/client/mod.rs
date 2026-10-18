@@ -6,7 +6,7 @@ pub mod output;
 mod probe;
 pub mod state;
 
-pub use probe::{MtuProbeId, is_mtu_probe_size_error};
+pub use probe::MtuProbeId;
 use probe::{MtuProbes, deadline};
 
 use crate::client::config::RakClientConfig;
@@ -303,6 +303,17 @@ impl RakClient {
         self.output
             .push_back(RakClientOutput::Wait(self.config.conn_attempt_interval));
         error
+    }
+
+    /// Returns whether the initial Reply 1 / Reply 2 negotiation is still active.
+    ///
+    /// Socket adapters may retry a bounded number of transient reads only during
+    /// this phase. It ends when Reply 2 starts the reliable connected handshake.
+    pub fn is_offline_negotiating(&self) -> bool {
+        matches!(
+            self.state,
+            RakClientState::Handshake1 { .. } | RakClientState::Handshake2 { .. }
+        )
     }
 
     pub fn is_connecting(&self) -> bool {

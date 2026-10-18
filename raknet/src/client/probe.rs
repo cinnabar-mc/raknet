@@ -2,8 +2,6 @@
 
 use super::{RakClientConfig, RakClientError};
 use crate::util::constants;
-use std::error::Error;
-use std::io;
 use std::time::{Duration, SystemTime};
 
 use constants::MTU_PROBE_ATTEMPTS_PER_SIZE as ATTEMPTS_PER_SIZE;
@@ -119,28 +117,4 @@ pub(super) fn deadline(now: SystemTime, after: Duration) -> Result<SystemTime, R
     now.checked_add(after).ok_or(RakClientError::InvalidConfig(
         "connection deadline is too large",
     ))
-}
-
-/// Classifies an oversized UDP write at the I/O boundary, including wrapped OS errors.
-pub fn is_mtu_probe_size_error(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    let code = Some(libc::EMSGSIZE);
-    #[cfg(windows)]
-    let code = Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE);
-    #[cfg(not(any(unix, windows)))]
-    let code: Option<i32> = None;
-    let Some(code) = code else { return false };
-    let mut current: &(dyn Error + 'static) = error;
-    loop {
-        let next = if let Some(error) = current.downcast_ref::<io::Error>() {
-            if error.raw_os_error() == Some(code) {
-                return true;
-            }
-            error.get_ref().map(|inner| inner as &(dyn Error + 'static))
-        } else {
-            current.source()
-        };
-        let Some(next) = next else { return false };
-        current = next;
-    }
 }

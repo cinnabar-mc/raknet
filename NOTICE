@@ -7,7 +7,8 @@ protected challenge, cookie refresh and final-grant handling to caller-driven
 Rust protocol state and explicit socket-write completion inputs. Client system
 addresses, mapped IPv4 normalization and IPv6 wire fields also follow this
 reference. System-address codecs retain short-list support and reject excess
-entries with bounded input allocation.
+entries with bounded input allocation. UDP error classification follows the
+reference's Unix and Winsock handshake read policies.
 
 That reference is MIT-licensed, copyright 2019 Sander ten Veldhuis.
 See LICENSE-MIT-go-raknet for the retained notice and license.

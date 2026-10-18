@@ -186,6 +186,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
 fn reply_two_selects_the_final_budget_independently_of_reply_one() {
     for (grant, expected) in [(1280, 1280), (900, 900), (20, 576), (u16::MAX, 1400)] {
         let (mut client, now) = begin(1400);
+        assert!(client.is_offline_negotiating());
         deliver(
             &mut client,
             OpenConnectionReply1 {
@@ -195,6 +196,7 @@ fn reply_two_selects_the_final_budget_independently_of_reply_one() {
             },
             now,
         );
+        assert!(client.is_offline_negotiating());
         deliver(
             &mut client,
             OpenConnectionReply2::new(1, PEER, grant, false),
@@ -202,6 +204,8 @@ fn reply_two_selects_the_final_budget_independently_of_reply_one() {
         );
         assert_eq!(client.mtu, expected);
         assert!(client.session.is_some());
+        assert!(!client.is_offline_negotiating());
+        assert!(client.is_connecting());
     }
 }
 
@@ -470,22 +474,4 @@ fn cancellation_drops_unclaimed_session_handoffs() {
         client.poll().is_none(),
         "a cancelled session must not be handed to its consumer"
     );
-}
-
-#[test]
-fn wrapped_udp_size_errors_are_classified() {
-    #[cfg(unix)]
-    let code = libc::EMSGSIZE;
-    #[cfg(windows)]
-    let code = windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
-    #[cfg(any(unix, windows))]
-    {
-        let error = std::io::Error::from_raw_os_error(code);
-        assert!(is_mtu_probe_size_error(&error));
-        let wrapped = std::io::Error::other(error);
-        assert!(is_mtu_probe_size_error(&wrapped));
-    }
-    assert!(!is_mtu_probe_size_error(&std::io::Error::other(
-        "other write failure"
-    )));
 }
