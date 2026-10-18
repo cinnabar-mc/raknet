@@ -103,9 +103,13 @@ impl Caller {
     }
 
     /// Drains accepted outputs before terminal removal; a blocked write stays owned for the next call.
-    fn drain(&mut self, now: Instant) -> io::Result<bool> {
+    fn drain_with(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(&UdpSocket, &[u8], SocketAddr) -> io::Result<usize>,
+    ) -> io::Result<bool> {
         if !write_pending(&mut self.pending, |bytes, peer| {
-            self.socket.send_to(bytes, peer)
+            send(&self.socket, bytes, peer)
         })? {
             return Ok(false);
         }
@@ -119,7 +123,7 @@ impl Caller {
                         assert_eq!(canonical_socket_addr(destination), peer);
                         self.pending = Some((bytes, peer));
                         if !write_pending(&mut self.pending, |bytes, peer| {
-                            self.socket.send_to(bytes, peer)
+                            send(&self.socket, bytes, peer)
                         })? {
                             return Ok(false);
                         }
@@ -151,7 +155,16 @@ impl Caller {
 
     /// Routes only known endpoints, then drives due sessions with the same explicit caller time.
     fn step(&mut self, now: Instant) -> io::Result<()> {
-        if !self.drain(now)? {
+        self.step_with_send(now, |socket, bytes, peer| socket.send_to(bytes, peer))
+    }
+
+    /// Lets a controlled write failure exercise this same public-session/socket scheduling path.
+    fn step_with_send(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(&UdpSocket, &[u8], SocketAddr) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        if !self.drain_with(now, &mut send)? {
             return Ok(());
         }
         // A full UDP-sized buffer avoids accepting a silently truncated prefix.
@@ -183,7 +196,7 @@ impl Caller {
                 live.session.handle(RakSessionInput::Update(now)).unwrap();
             }
         }
-        self.drain(now)?;
+        self.drain_with(now, send)?;
         Ok(())
     }
 }
@@ -454,5 +467,68 @@ fn shared_udp_retains_a_blocked_datagram_until_the_same_socket_accepts_it() {
     assert_eq!(
         received,
         Some((vec![0xfe, 1, 2], source.socket.local_addr().unwrap()))
+    );
+}
+
+#[test]
+fn shared_udp_retains_the_real_session_deadline_across_a_blocked_datagram() {
+    let mut application = Caller::bind(Ipv4Addr::LOCALHOST.into()).unwrap();
+    let mut remote = Caller::bind(Ipv4Addr::LOCALHOST.into()).unwrap();
+    let now = Instant::now();
+    let local = application.socket.local_addr().unwrap();
+    let peer = remote.socket.local_addr().unwrap();
+    application.insert(established(peer, now), now).unwrap();
+    remote.insert(established(local, now), now).unwrap();
+    let message: Box<[u8]> = vec![0xfe, 7, 8].into();
+    application.try_send(peer, message.clone(), now).unwrap();
+    let update_at = now + STEP;
+    let original_deadline = update_at + RakSessionConfig::default().autoflush_interval_ms;
+    let mut blocked_writes = 0;
+    application
+        .step_with_send(update_at, |_, _, _| {
+            blocked_writes += 1;
+            Err(ErrorKind::WouldBlock.into())
+        })
+        .unwrap();
+    assert_eq!(blocked_writes, 1);
+    let retained = application.pending.as_ref().unwrap().clone();
+    assert!(
+        application
+            .next_deadline()
+            .is_some_and(|due| due <= original_deadline),
+        "a blocked real-session datagram must retain its timer obligation"
+    );
+    let retry_at = update_at + Duration::from_secs(1);
+    assert!(
+        !application
+            .drain_with(retry_at, |_, _, _| Err(ErrorKind::Interrupted.into()))
+            .unwrap()
+    );
+    assert_eq!(application.pending.as_ref(), Some(&retained));
+    assert!(
+        application
+            .drain_with(retry_at, |socket, bytes, peer| socket.send_to(bytes, peer))
+            .unwrap()
+    );
+    assert!(application.pending.is_none());
+    assert_eq!(
+        application.next_deadline(),
+        Some(original_deadline),
+        "a queued Wait must remain anchored to its generating Update"
+    );
+    for _ in 0..1000 {
+        remote.step(retry_at).unwrap();
+        if !remote.received.is_empty() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(remote.received.pop_front(), Some((local, message)));
+    assert!(remote.received.is_empty());
+    application.step(retry_at).unwrap();
+    assert!(
+        application
+            .next_deadline()
+            .is_some_and(|due| due >= retry_at)
     );
 }
