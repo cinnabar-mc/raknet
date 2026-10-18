@@ -207,10 +207,11 @@ mod tests {
         );
         let (datagram_tx, _datagram_rx) = unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = unbounded_channel();
+        let expected = session.max_message_len();
 
         let (session, _input_tx) = RakSession::spawn(session, datagram_tx, disconnect_tx);
 
-        assert_eq!(session.max_message_len(), 1 << 20);
+        assert_eq!(session.max_message_len(), expected);
     }
 
     #[tokio::test]

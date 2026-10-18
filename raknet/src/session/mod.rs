@@ -4,6 +4,7 @@ pub mod congestion_controller;
 pub mod error;
 pub mod input;
 pub mod output;
+mod ranges;
 mod receive;
 pub(crate) mod snapshot;
 pub mod state;
@@ -47,7 +48,6 @@ impl RakSessionId {
     }
 }
 
-const RELIABLE_WINDOW: usize = 8192;
 const DATAGRAM_WINDOW: usize = 2048;
 const ORDER_WINDOW: usize = 2048;
 const MAX_SPLIT_COUNT: u32 = 8192;
@@ -92,8 +92,8 @@ pub struct RakSession {
     outbound_seq_idx: [u32; 32],
 
     inbound_seq: u32,
-    inbound_rel_seen: HashSet<u32>,
-    inbound_rel_order: VecDeque<u32>,
+    inbound_rel_base: u32,
+    inbound_rel_ahead: Vec<ranges::Range>,
     inbound_spl_queue: HashMap<u16, HashMap<u32, Frame>>,
     inbound_spl_bytes: usize,
     inbound_spl_last: HashMap<u16, Instant>,
@@ -101,6 +101,9 @@ pub struct RakSession {
     inbound_ord_bytes: usize,
     inbound_ord_idx: [u32; 32],
     inbound_seq_idx: [u32; 32],
+    inbound_progress: u64,
+    inbound_deferred: bool,
+    inbound_stall: Option<(Instant, u64)>,
 
     output: VecDeque<RakSessionOutput>,
 }
@@ -221,8 +224,8 @@ impl RakSession {
             outbound_seq_idx: [0; 32],
 
             inbound_seq: 0,
-            inbound_rel_seen: HashSet::new(),
-            inbound_rel_order: VecDeque::new(),
+            inbound_rel_base: 0,
+            inbound_rel_ahead: Vec::new(),
             inbound_spl_queue: HashMap::new(),
             inbound_spl_bytes: 0,
             inbound_spl_last: HashMap::new(),
@@ -230,6 +233,9 @@ impl RakSession {
             inbound_ord_bytes: 0,
             inbound_ord_idx: [0; 32],
             inbound_seq_idx: [0; 32],
+            inbound_progress: 0,
+            inbound_deferred: false,
+            inbound_stall: None,
 
             output: VecDeque::new(),
         }
@@ -252,11 +258,13 @@ impl RakSession {
     }
 
     pub fn max_message_len(&self) -> usize {
-        let split_limit = MAX_OUTBOUND_SPLIT_COUNT * (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
-        usize::try_from(self.config.max_queued_bytes)
-            .unwrap_or(0)
-            .min(split_limit)
-            .max(self.mtu as usize)
+        let payload_per_fragment = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
+        let storage_per_fragment = payload_per_fragment + size_of::<Frame>();
+        let budget = usize::try_from(self.config.max_queued_bytes).unwrap_or(0);
+        let payload_budget = (budget / storage_per_fragment) * payload_per_fragment
+            + (budget % storage_per_fragment).saturating_sub(size_of::<Frame>());
+        let split_limit = MAX_OUTBOUND_SPLIT_COUNT * payload_per_fragment;
+        payload_budget.min(split_limit).max(self.mtu as usize)
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
@@ -270,7 +278,9 @@ impl RakSession {
             return Ok(());
         }
 
-        self.evict_stale_splits(now);
+        if self.evict_stale_splits(now) || self.inbound_stalled(now) {
+            return self.disconnect(true, RakDisconnectReason::Timeout, now);
+        }
 
         if self.state == RakSessionState::Closing {
             return self.update_closing(now);
@@ -635,7 +645,7 @@ impl RakSession {
         }
 
         let split_size = payloads.len();
-        let frames = payloads
+        let frames: Vec<Frame> = payloads
             .into_iter()
             .enumerate()
             .map(|(i, payload)| Frame {
@@ -658,7 +668,14 @@ impl RakSession {
             })
             .collect();
 
-        self.queue_frames(frames, priority, now)?;
+        if priority == RakPriority::Immediate {
+            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
+            self.outbound_queue[priority as usize].extend(frames);
+            self.send_queue(now)?;
+            self.flush();
+        } else {
+            self.queue_frames(frames, priority, now)?;
+        }
         Ok(())
     }
 

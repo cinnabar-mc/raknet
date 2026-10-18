@@ -4,28 +4,44 @@ use super::error::RakSessionError;
 use super::output::RakDisconnectReason;
 use super::state::RakSessionState;
 use super::{
-    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_SPLIT_COUNT, ORDER_WINDOW, RELIABLE_WINDOW,
-    RakSession, SESSION_TIMEOUT,
+    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_SPLIT_COUNT, ORDER_WINDOW, RakSession,
+    SESSION_TIMEOUT, ranges,
 };
 use crate::protocol::codec::RakCodec;
 use crate::protocol::packets::frame_set::FrameSet;
 use crate::protocol::types::frame::Frame;
 use crate::util::u24;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::time::Instant;
 use tracing::debug;
 
+enum ReliableArrival {
+    New,
+    Duplicate,
+    OverBudget,
+}
+
+/// Charges a retained frame's inline storage as well as its owned payload.
+pub(super) fn frame_cost(frame: &Frame) -> usize {
+    size_of::<Frame>() + frame.payload.len()
+}
+
 impl RakSession {
-    /// Releases fragment payloads whose reassemblies have stopped making progress.
-    pub(super) fn evict_stale_splits(&mut self, now: Instant) {
+    /// Releases expired reassemblies and reports lost acknowledged fragment state.
+    pub(super) fn evict_stale_splits(&mut self, now: Instant) -> bool {
         let last = &self.inbound_spl_last;
         let mut freed = 0;
+        let mut stale = false;
         self.inbound_spl_queue.retain(|split_id, fragments| {
             let fresh = last
                 .get(split_id)
                 .is_some_and(|&at| now < at + SESSION_TIMEOUT);
             if !fresh {
-                freed += fragments.values().map(|f| f.payload.len()).sum::<usize>();
+                freed += fragments.values().map(frame_cost).sum::<usize>();
+                stale |= fragments
+                    .values()
+                    .any(|frame| frame.reliability.is_reliable());
             }
             fresh
         });
@@ -40,9 +56,10 @@ impl RakSession {
                 freed, self.addr
             );
         }
+        stale
     }
 
-    /// Tracks the datagram receive window before dispatching its encapsulated frames.
+    /// Acknowledges a datagram only when every reliable frame was retained or delivered.
     pub(super) fn handle_frame_set(
         &mut self,
         buf: &mut Cursor<&[u8]>,
@@ -83,27 +100,76 @@ impl RakSession {
             self.inbound_seq = u24::add(set.sequence, 1);
         }
 
+        self.inbound_deferred = false;
         for frame in set.frames {
             if matches!(self.state, RakSessionState::Disconnected) {
                 break;
             }
             self.handle_frame(frame, now)?;
         }
+        if self.inbound_deferred {
+            self.sequences_recv.remove(&set.sequence);
+        }
+        self.refresh_stall(now);
         Ok(())
     }
 
-    /// Filters duplicate reliable frames and invalid channels before payload admission.
+    /// Tracks receive progress while a reliable or ordered gap remains.
+    fn refresh_stall(&mut self, now: Instant) {
+        let waiting = !self.inbound_rel_ahead.is_empty() || self.inbound_ord_bytes > 0;
+        self.inbound_stall = match (waiting, self.inbound_stall) {
+            (false, _) => None,
+            (true, Some((since, progress))) if progress == self.inbound_progress => {
+                Some((since, progress))
+            }
+            (true, _) => Some((now, self.inbound_progress)),
+        };
+    }
+
+    /// Reports a gap with no delivery progress for the session timeout.
+    pub(super) fn inbound_stalled(&mut self, now: Instant) -> bool {
+        self.refresh_stall(now);
+        self.inbound_stall
+            .is_some_and(|(since, _)| now >= since + SESSION_TIMEOUT)
+    }
+
+    /// Admits buffering before committing reliable duplicate-detection state.
     pub(super) fn handle_frame(
         &mut self,
         frame: Frame,
         now: Instant,
     ) -> Result<(), RakSessionError> {
-        if frame.reliability.is_reliable() && !self.track_reliable(frame.reliable_index) {
+        let cost = self.admission_cost(&frame);
+        if cost > 0
+            && (self.exceeds_queued_bytes(cost)
+                || (frame.is_split() && self.split_slots_full(frame.split_id)))
+        {
             debug!(
-                "received duplicate reliable frame {} from {}",
+                "deferring frame {} from {}, buffering it would exceed max_queued_bytes",
                 frame.reliable_index, self.addr
             );
+            self.inbound_deferred |= frame.reliability.is_reliable();
             return Ok(());
+        }
+
+        if frame.reliability.is_reliable() {
+            match self.track_reliable(frame.reliable_index) {
+                ReliableArrival::New => {}
+                ReliableArrival::Duplicate => {
+                    debug!(
+                        "received duplicate reliable frame {} from {}",
+                        frame.reliable_index, self.addr
+                    );
+                    return Ok(());
+                }
+                ReliableArrival::OverBudget => {
+                    debug!(
+                        "closing session with {}, tracking reliable frame {} would exceed max_queued_bytes",
+                        self.addr, frame.reliable_index
+                    );
+                    return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
+                }
+            }
         }
 
         let max_channels = (self.config.ordering_channels as usize).min(self.inbound_ord_idx.len());
@@ -124,24 +190,83 @@ impl RakSession {
         Ok(())
     }
 
-    /// Retains a bounded duplicate-detection window and reports whether an index is new.
-    pub(super) fn track_reliable(&mut self, index: u32) -> bool {
-        if !self.inbound_rel_seen.insert(index) {
-            return false;
-        }
+    /// Estimates additional retained frame and range storage before admission.
+    fn admission_cost(&self, frame: &Frame) -> usize {
+        let mut cost = 0;
 
-        self.inbound_rel_order.push_back(index);
-
-        while self.inbound_rel_order.len() > RELIABLE_WINDOW {
-            if let Some(old) = self.inbound_rel_order.pop_front() {
-                self.inbound_rel_seen.remove(&old);
+        if frame.reliability.is_reliable() {
+            let ahead = u24::distance(self.inbound_rel_base, frame.reliable_index);
+            let seen = ahead < 0
+                || (ahead > 0
+                    && ranges::contains(
+                        &self.inbound_rel_ahead,
+                        self.inbound_rel_base,
+                        frame.reliable_index,
+                    ));
+            if seen {
+                return 0;
+            }
+            if ahead > 0 {
+                cost += size_of::<ranges::Range>();
             }
         }
 
-        true
+        let max_channels = (self.config.ordering_channels as usize).min(self.inbound_ord_idx.len());
+        let buffered = frame.reliability.is_ordered() || frame.reliability.is_sequenced();
+        if buffered && frame.order_channel as usize >= max_channels {
+            return cost;
+        }
+
+        if frame.is_split() {
+            if self.split_violation(frame).is_some() {
+                return 0;
+            }
+            let fragments = self.inbound_spl_queue.get(&frame.split_id);
+            let held = fragments.map_or(0, HashMap::len);
+            let duplicate = fragments.is_some_and(|f| f.contains_key(&frame.split_index));
+            if !duplicate && held + 1 < frame.split_size as usize {
+                cost += frame_cost(frame);
+            } else if !duplicate
+                && frame.reliability.is_ordered()
+                && u24::distance(
+                    self.inbound_ord_idx[frame.order_channel as usize],
+                    frame.order_index,
+                ) > 0
+            {
+                // Completion replaces retained fragments with one future ordered frame.
+                cost += frame_cost(frame).saturating_sub(held * size_of::<Frame>());
+            }
+        } else if frame.reliability.is_ordered() {
+            let channel = frame.order_channel as usize;
+            if u24::distance(self.inbound_ord_idx[channel], frame.order_index) > 0 {
+                cost += frame_cost(frame);
+            }
+        }
+        cost
     }
 
-    /// Delivers complete payloads in sequence, retaining bounded ordered gaps.
+    /// Advances contiguous receipt and retains compact ranges across gaps.
+    fn track_reliable(&mut self, index: u32) -> ReliableArrival {
+        let ahead = u24::distance(self.inbound_rel_base, index);
+        if ahead < 0 {
+            return ReliableArrival::Duplicate;
+        }
+        if ahead == 0 {
+            self.inbound_progress += 1;
+            let next = u24::add(self.inbound_rel_base, 1);
+            self.inbound_rel_base = ranges::take_contiguous(&mut self.inbound_rel_ahead, next);
+            return ReliableArrival::New;
+        }
+        if self.exceeds_queued_bytes(size_of::<ranges::Range>()) {
+            return ReliableArrival::OverBudget;
+        }
+        match ranges::insert(&mut self.inbound_rel_ahead, self.inbound_rel_base, index) {
+            true => ReliableArrival::New,
+            false => ReliableArrival::Duplicate,
+        }
+    }
+
+    /// Delivers ordered payloads while retaining bounded future messages.
     pub(super) fn handle_full_frame(
         &mut self,
         frame: Frame,
@@ -169,6 +294,7 @@ impl RakSession {
             let ahead = u24::distance(self.inbound_ord_idx[channel], frame.order_index);
 
             if ahead == 0 {
+                self.inbound_progress += 1;
                 self.inbound_seq_idx[channel] = 0;
                 self.inbound_ord_idx[channel] = u24::add(frame.order_index, 1);
 
@@ -185,7 +311,7 @@ impl RakSession {
                     while let Some(unord_frame) = unord_queue.remove(&idx) {
                         self.inbound_ord_bytes = self
                             .inbound_ord_bytes
-                            .saturating_sub(unord_frame.payload.len());
+                            .saturating_sub(frame_cost(&unord_frame));
                         packets.push(unord_frame.payload);
 
                         idx = u24::add(idx, 1);
@@ -200,15 +326,11 @@ impl RakSession {
             }
 
             if ahead >= ORDER_WINDOW as i32 {
-                debug!(
-                    "closing session with {}, order index {} too far ahead of {}",
-                    self.addr, frame.order_index, self.inbound_ord_idx[channel]
-                );
                 return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
             }
 
             if ahead > 0 {
-                if self.exceeds_queued_bytes(frame.payload.len()) {
+                if self.exceeds_queued_bytes(frame_cost(&frame)) {
                     debug!(
                         "closing session with {}, buffered ordered bytes would exceed max_queued_bytes",
                         self.addr
@@ -216,16 +338,15 @@ impl RakSession {
                     return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
                 }
 
-                self.inbound_ord_bytes += frame.payload.len();
+                self.inbound_ord_bytes += frame_cost(&frame);
                 if let Some(replaced) = self
                     .inbound_ord_queue
                     .entry(frame.order_channel)
                     .or_default()
                     .insert(frame.order_index, frame)
                 {
-                    self.inbound_ord_bytes = self
-                        .inbound_ord_bytes
-                        .saturating_sub(replaced.payload.len());
+                    self.inbound_ord_bytes =
+                        self.inbound_ord_bytes.saturating_sub(frame_cost(&replaced));
                 }
             }
             return Ok(());
@@ -235,7 +356,7 @@ impl RakSession {
         Ok(())
     }
 
-    /// Owns admitted fragments until the complete payload can be delivered once.
+    /// Owns admitted fragments until complete reassembly and delivery.
     pub(super) fn handle_split_frame(
         &mut self,
         frame: Frame,
@@ -254,22 +375,6 @@ impl RakSession {
             return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
         }
 
-        if self.split_slots_full(frame.split_id) {
-            debug!(
-                "dropping split frame from {}, {} splits already in reassembly",
-                self.addr, MAX_CONCURRENT_SPLITS
-            );
-            return Ok(());
-        }
-
-        if self.exceeds_queued_bytes(frame.payload.len()) {
-            debug!(
-                "dropping split frame from {}, buffered split bytes would exceed max_queued_bytes",
-                self.addr
-            );
-            return Ok(());
-        }
-
         let split_id = frame.split_id;
         let split_size = frame.split_size;
 
@@ -277,7 +382,7 @@ impl RakSession {
         if fragments.contains_key(&frame.split_index) {
             return Ok(());
         }
-        self.inbound_spl_bytes += frame.payload.len();
+        self.inbound_spl_bytes += frame_cost(&frame);
         fragments.insert(frame.split_index, frame);
         self.inbound_spl_last.insert(split_id, now);
 
@@ -290,7 +395,8 @@ impl RakSession {
             return Ok(());
         };
         let buffered: usize = fragments.values().map(|f| f.payload.len()).sum();
-        self.inbound_spl_bytes = self.inbound_spl_bytes.saturating_sub(buffered);
+        let cost: usize = fragments.values().map(frame_cost).sum();
+        self.inbound_spl_bytes = self.inbound_spl_bytes.saturating_sub(cost);
 
         let mut payload = Vec::with_capacity(buffered);
         let mut whole = None;
@@ -313,13 +419,16 @@ impl RakSession {
         self.handle_full_frame(whole, now)
     }
 
-    /// Checks the shared payload budget for fragments and future ordered messages.
+    /// Checks the shared frame, payload and reliable-range storage budget.
     pub(super) fn exceeds_queued_bytes(&self, additional: usize) -> bool {
-        self.inbound_spl_bytes + self.inbound_ord_bytes + additional
+        self.inbound_spl_bytes
+            + self.inbound_ord_bytes
+            + self.inbound_rel_ahead.len() * size_of::<ranges::Range>()
+            + additional
             > self.config.max_queued_bytes as usize
     }
 
-    /// Identifies invalid fragment metadata against the current reassembly.
+    /// Identifies invalid fragment metadata against an existing reassembly.
     pub(super) fn split_violation(&self, frame: &Frame) -> Option<&'static str> {
         if frame.payload.is_empty() {
             return Some("empty split fragment");

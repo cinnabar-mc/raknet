@@ -546,7 +546,10 @@ fn concurrent_splits_above_limit_are_dropped() {
             .inbound_spl_queue
             .contains_key(&(MAX_CONCURRENT_SPLITS as u16))
     );
-    assert_eq!(session.inbound_spl_bytes, MAX_CONCURRENT_SPLITS);
+    assert_eq!(
+        session.inbound_spl_bytes,
+        MAX_CONCURRENT_SPLITS * (size_of::<Frame>() + 1)
+    );
     assert_eq!(disconnect_reason(&session), None);
 }
 
@@ -597,7 +600,7 @@ fn split_size_mismatch_closes_the_session() {
 #[test]
 fn completed_split_is_delivered_and_releases_its_byte_budget() {
     let mut session = session(0, 1);
-    session.config.max_queued_bytes = 4;
+    session.config.max_queued_bytes = (2 * size_of::<Frame>() + 4) as i32;
 
     let now = domain_time();
     session
@@ -615,6 +618,27 @@ fn completed_split_is_delivered_and_releases_its_byte_budget() {
 }
 
 #[test]
+fn completing_a_split_reclaims_its_fragment_storage() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = (2 * size_of::<Frame>() + 3) as i32;
+    let now = domain_time();
+    receiver
+        .handle_frame(fragment(1, 2, 0, &[0xfe]), now)
+        .unwrap();
+    receiver
+        .handle_frame(fragment(2, 2, 0, &[0xfe]), now)
+        .unwrap();
+    receiver.handle_frame(fragment(1, 2, 1, &[1]), now).unwrap();
+    assert_eq!(receiver.state, RakSessionState::Connected);
+    assert_eq!(packets(&mut receiver), vec![Box::<[u8]>::from([0xfe, 1])]);
+    assert_eq!(receiver.inbound_spl_queue[&2].len(), 1);
+    receiver
+        .handle_frame(fragment(2, 2, 0, &[0xfe]), now)
+        .unwrap();
+    assert_eq!(receiver.state, RakSessionState::Connected);
+}
+
+#[test]
 fn counters_wrap_at_24_bits_in_both_directions() {
     let near_top = u24::MASK - 1;
 
@@ -625,6 +649,7 @@ fn counters_wrap_at_24_bits_in_both_directions() {
 
     let mut receiver = session(2, 2);
     receiver.inbound_seq = near_top;
+    receiver.inbound_rel_base = near_top;
     receiver.inbound_ord_idx[0] = near_top;
 
     let now = domain_time();
@@ -727,7 +752,110 @@ fn ordered_payload(order_index: u32, payload: &[u8]) -> Frame {
 }
 
 #[test]
-fn ordered_frames_beyond_max_queued_bytes_close_the_session() {
+fn deferred_reliable_datagrams_are_retried_after_the_receive_budget_frees() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = (size_of::<Frame>() + 2 + 2 * size_of::<u32>()) as i32;
+    let now = domain_time();
+    receiver
+        .handle(datagram_at(0, vec![ordered_payload(1, &[0xfe, 1])], now))
+        .unwrap();
+    receiver
+        .handle(datagram_at(1, vec![ordered_payload(2, &[0xfe, 2])], now))
+        .unwrap();
+    receiver.tick(now).unwrap();
+    let acknowledgments = outbound_acks(&mut receiver)
+        .into_iter()
+        .map(|bytes| Ack::deserialize(&mut bytes.as_ref()).unwrap())
+        .filter(|ack| !ack.is_nack)
+        .flat_map(|ack| ack.sequences)
+        .collect::<Vec<_>>();
+    assert!(acknowledgments.contains(&0));
+    assert!(
+        !acknowledgments.contains(&1),
+        "unretained reliable data must not be acknowledged"
+    );
+    let saved = receiver.snapshot(now);
+    let mut receiver = RakSession::restore(saved, now, Duration::ZERO).unwrap();
+    receiver
+        .handle(datagram_at(2, vec![ordered_payload(0, &[0xfe, 0])], now))
+        .unwrap();
+    receiver
+        .handle(datagram_at(1, vec![ordered_payload(2, &[0xfe, 2])], now))
+        .unwrap();
+    assert_eq!(
+        packets(&mut receiver),
+        vec![
+            vec![0xfe, 0].into_boxed_slice(),
+            vec![0xfe, 1].into_boxed_slice(),
+            vec![0xfe, 2].into_boxed_slice()
+        ]
+    );
+    assert_eq!(receiver.state, RakSessionState::Connected);
+}
+
+#[test]
+fn immediate_reliable_sends_obey_the_outstanding_window() {
+    let mut sender = session(0, 1);
+    let now = domain_time();
+    for _ in 0..MAX_UNACKED_RELIABLE + 20 {
+        sender
+            .handle(RakSessionInput::Send(
+                Box::new([0xfe]),
+                RakReliability::ReliableOrdered,
+                RakPriority::Immediate,
+                now,
+            ))
+            .unwrap();
+    }
+    let oldest = sender.oldest_unacked_reliable().unwrap();
+    assert!(
+        sender
+            .outbound_cache
+            .values()
+            .flat_map(|set| &set.frames)
+            .all(|frame| u24::distance(oldest, frame.reliable_index) < MAX_UNACKED_RELIABLE)
+    );
+    assert!(!sender.outbound_queue[RakPriority::Immediate as usize].is_empty());
+}
+
+#[test]
+fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
+    for split in [false, true] {
+        let mut receiver = session(0, 1);
+        let start = domain_time();
+        let frame = if split {
+            let mut frame = fragment(1, 2, 0, &[0xfe]);
+            frame.reliability = RakReliability::Reliable;
+            frame
+        } else {
+            ordered_payload(1, &[0xfe])
+        };
+        receiver.handle(datagram_at(0, vec![frame], start)).unwrap();
+        let capture = start + SESSION_TIMEOUT / 2;
+        receiver
+            .handle(datagram_at(1, unreliable(0), capture))
+            .unwrap();
+        drain_outputs(&mut receiver);
+        let json = facet_json::to_string(&receiver.snapshot(capture)).unwrap();
+        let destination = crate::clock::test_now() + Duration::from_secs(3600);
+        let mut receiver = RakSession::restore(
+            facet_json::from_str(&json).unwrap(),
+            destination,
+            SESSION_TIMEOUT / 2 + Duration::from_millis(1),
+        )
+        .unwrap();
+        receiver
+            .handle(RakSessionInput::Update(destination))
+            .unwrap();
+        assert_eq!(
+            disconnect_reason(&receiver),
+            Some(RakDisconnectReason::Timeout)
+        );
+    }
+}
+
+#[test]
+fn ordered_frames_beyond_max_queued_bytes_are_deferred() {
     let mut session = session(0, 1);
     session.config.max_queued_bytes = 4;
 
@@ -736,13 +864,13 @@ fn ordered_frames_beyond_max_queued_bytes_close_the_session() {
         .unwrap();
 
     assert!(session.inbound_ord_queue.values().all(HashMap::is_empty));
-    assert_closed_for_violation(&session);
+    assert_eq!(session.state, RakSessionState::Connected);
 }
 
 #[test]
 fn ordered_queue_shares_the_byte_budget_with_split_reassembly() {
     let mut session = session(0, 1);
-    session.config.max_queued_bytes = 4;
+    session.config.max_queued_bytes = (size_of::<Frame>() + 3) as i32;
 
     let now = domain_time();
     session
@@ -752,13 +880,15 @@ fn ordered_queue_shares_the_byte_budget_with_split_reassembly() {
         .handle_frame(ordered_payload(1, &[0xFE, 1]), now)
         .unwrap();
 
-    assert_closed_for_violation(&session);
+    assert_eq!(session.state, RakSessionState::Connected);
+    assert_eq!(session.inbound_spl_queue[&1].len(), 1);
+    assert!(session.inbound_ord_queue.values().all(HashMap::is_empty));
 }
 
 #[test]
 fn delivered_ordered_frames_release_their_byte_budget() {
     let mut session = session(0, 1);
-    session.config.max_queued_bytes = 4;
+    session.config.max_queued_bytes = (size_of::<Frame>() + 3 + 2 * size_of::<u32>()) as i32;
 
     let now = domain_time();
     session
@@ -830,7 +960,7 @@ fn partial_split_receiving_fragments_is_kept() {
         .unwrap();
 
     assert_eq!(session.inbound_spl_queue[&1].len(), 2);
-    assert_eq!(session.inbound_spl_bytes, 2);
+    assert_eq!(session.inbound_spl_bytes, 2 * size_of::<Frame>() + 2);
 }
 
 #[test]
@@ -1048,12 +1178,15 @@ fn send(session: &mut RakSession, len: usize, now: Instant) -> Result<(), RakSes
 }
 
 #[test]
-fn a_one_mib_send_reaches_our_own_receiver() {
+fn a_maximum_message_fits_the_receivers_fragment_storage_budget() {
     let mut a = session(0, 1);
     let mut b = session(1, 2);
+    a.config.max_queued_bytes = 1 << 20;
+    b.config.max_queued_bytes = a.config.max_queued_bytes;
     let now = domain_time();
 
-    send(&mut a, 1024 * 1024, now).unwrap();
+    let length = a.max_message_len();
+    send(&mut a, length, now).unwrap();
 
     let mut received = Vec::new();
     let mut reason = None;
@@ -1078,7 +1211,7 @@ fn a_one_mib_send_reaches_our_own_receiver() {
 
     assert_eq!(reason, None);
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].len(), 1024 * 1024);
+    assert_eq!(received[0].len(), length);
 }
 
 #[test]

@@ -85,7 +85,7 @@ owned `RakSessionConfig`. Authentication UTC is independent of transport time.
 elapsed)` with the destination clock and time since capture. SDK `adopt` takes
 the same elapsed duration. Invalid address or clock ranges return a typed error.
 Drain pending output before capture; a restored closing session receives a fresh
-close timeout.
+close timeout. Use matching library revisions at both ends of a snapshot transfer.
 
 A `RakClientOutput::MtuProbe` transfers one probe write to the I/O adapter. Measure
 only the socket write, then submit its opaque ID, completion time, elapsed write

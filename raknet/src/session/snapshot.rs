@@ -53,8 +53,11 @@ pub struct RakSessionSnapshot {
     pub outbound_seq_idx: [u32; 32],
 
     pub inbound_seq: u32,
-    pub inbound_rel_seen: HashSet<u32>,
-    pub inbound_rel_order: Vec<u32>,
+    pub inbound_rel_base: u32,
+    pub inbound_rel_ahead: Vec<(u32, u32)>,
+    pub inbound_progress: u64,
+    pub inbound_stall: Option<(u64, u64)>,
+    pub inbound_spl_last: Vec<(u16, u64)>,
     pub inbound_spl_queue: Vec<(u16, Vec<(u32, Frame)>)>,
     pub inbound_ord_queue: Vec<(u8, Vec<(u32, Frame)>)>,
     pub inbound_ord_idx: [u32; 32],
@@ -117,8 +120,17 @@ impl RakSession {
             outbound_seq_idx: self.outbound_seq_idx,
 
             inbound_seq: self.inbound_seq,
-            inbound_rel_seen: self.inbound_rel_seen.clone(),
-            inbound_rel_order: self.inbound_rel_order.iter().copied().collect(),
+            inbound_rel_base: self.inbound_rel_base,
+            inbound_rel_ahead: self.inbound_rel_ahead.clone(),
+            inbound_progress: self.inbound_progress,
+            inbound_stall: self
+                .inbound_stall
+                .map(|(since, progress)| (clock.timestamp(since), progress)),
+            inbound_spl_last: self
+                .inbound_spl_last
+                .iter()
+                .map(|(&id, &last)| (id, clock.timestamp(last)))
+                .collect(),
             inbound_spl_queue: flatten_nested(&self.inbound_spl_queue),
             inbound_ord_queue: flatten_nested(&self.inbound_ord_queue),
             inbound_ord_idx: self.inbound_ord_idx,
@@ -145,7 +157,6 @@ impl RakSession {
                 .at(offset)
                 .ok_or(RakSessionRestoreError::TimeOutOfRange)
         };
-        let last_recv = at(snapshot.last_recv_ms)?;
 
         let mut outbound_queue: [VecDeque<Frame>; 4] = Default::default();
         for (channel, frames) in snapshot.outbound_queue.into_iter().enumerate().take(4) {
@@ -161,13 +172,14 @@ impl RakSession {
             .sum();
 
         let inbound_spl_queue = rebuild_nested(snapshot.inbound_spl_queue);
-        let inbound_spl_bytes = payload_bytes(&inbound_spl_queue);
-        let inbound_spl_last = inbound_spl_queue
-            .keys()
-            .map(|&split_id| (split_id, last_recv))
-            .collect();
+        let inbound_spl_bytes = retained_bytes(&inbound_spl_queue);
+        let inbound_spl_last = snapshot
+            .inbound_spl_last
+            .into_iter()
+            .map(|(id, offset)| Ok((id, at(offset)?)))
+            .collect::<Result<_, RakSessionRestoreError>>()?;
         let inbound_ord_queue = rebuild_nested(snapshot.inbound_ord_queue);
-        let inbound_ord_bytes = payload_bytes(&inbound_ord_queue);
+        let inbound_ord_bytes = retained_bytes(&inbound_ord_queue);
 
         let queue = snapshot
             .queue
@@ -216,8 +228,14 @@ impl RakSession {
             outbound_seq_idx: snapshot.outbound_seq_idx,
 
             inbound_seq: snapshot.inbound_seq,
-            inbound_rel_seen: snapshot.inbound_rel_seen,
-            inbound_rel_order: snapshot.inbound_rel_order.into(),
+            inbound_rel_base: snapshot.inbound_rel_base,
+            inbound_rel_ahead: snapshot.inbound_rel_ahead,
+            inbound_progress: snapshot.inbound_progress,
+            inbound_deferred: false,
+            inbound_stall: snapshot
+                .inbound_stall
+                .map(|(offset, progress)| Ok::<_, RakSessionRestoreError>((at(offset)?, progress)))
+                .transpose()?,
             inbound_spl_queue,
             inbound_spl_bytes,
             inbound_spl_last,
@@ -231,10 +249,11 @@ impl RakSession {
     }
 }
 
-fn payload_bytes<K>(map: &HashMap<K, HashMap<u32, Frame>>) -> usize {
+/// Reconstructs retained inline-frame and owned-payload charges from saved queues.
+fn retained_bytes<K>(map: &HashMap<K, HashMap<u32, Frame>>) -> usize {
     map.values()
         .flat_map(HashMap::values)
-        .map(|f| f.payload.len())
+        .map(super::receive::frame_cost)
         .sum()
 }
 
