@@ -116,8 +116,10 @@ A frame or existing timer-wheel owner can use this concrete loop:
 2. Read a bounded number of complete UDP datagrams, canonicalize each sender and
    feed only the matching session with `RakSessionInput::Datagram(bytes, now)`.
 3. Feed due sessions `Update(now)`, using one caller-supplied monotonic time.
-   Retain their `Wait` deadlines and select the earliest for the next wake. Do not
-   restart a peer's timeout when another route wakes.
+   Anchor a relative `Wait` to its generating input's time, even when a blocked
+   datagram delays polling that output. Keep the prior timer obligation visible
+   until the new `Wait` or terminal is drained, and select the earliest peer
+   deadline for the next wake. Another route's wake must not restart a timeout.
 4. Drain each session's outputs in order. Route `Datagram` through the same socket,
    retain application packets under the consumer's bounds, and retire only that
    peer after its preceding outputs and `Disconnected`. Dropping a session sends

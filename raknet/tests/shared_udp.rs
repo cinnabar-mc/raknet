@@ -17,6 +17,7 @@ type Pending = Option<(Box<[u8]>, SocketAddr)>;
 struct Live {
     session: RakSession,
     due: Option<Instant>,
+    input_at: Instant,
 }
 
 /// Test-owned socket and routing table; no task, runtime, timer wheel or protocol implementation.
@@ -62,6 +63,7 @@ impl Caller {
             Live {
                 session,
                 due: Some(now),
+                input_at: now,
             },
         );
         Ok(())
@@ -86,6 +88,7 @@ impl Caller {
         {
             return Err(bytes);
         }
+        live.input_at = now;
         live.session
             .handle(RakSessionInput::Send(
                 bytes,
@@ -136,8 +139,8 @@ impl Caller {
                         self.received.push_back((peer, bytes));
                     }
                     RakSessionOutput::Wait(after) => {
-                        let next = now.checked_add(after).unwrap();
-                        live.due = Some(live.due.map_or(next, |due| due.min(next)));
+                        assert!(now >= live.input_at, "caller time must not go backwards");
+                        live.due = Some(live.input_at.checked_add(after).unwrap());
                     }
                     RakSessionOutput::Disconnected(_, reason) => {
                         self.closed.push((peer, reason));
@@ -175,6 +178,7 @@ impl Caller {
                     let peer = canonical_socket_addr(peer);
                     if let Some(live) = self.live.get_mut(&peer) {
                         if live.session.get_state() != RakSessionState::Disconnected {
+                            live.input_at = now;
                             live.session
                                 .handle(RakSessionInput::Datagram(buffer[..len].into(), now))
                                 .unwrap();
@@ -192,7 +196,8 @@ impl Caller {
             if live.session.get_state() != RakSessionState::Disconnected
                 && live.due.is_some_and(|due| now >= due)
             {
-                live.due = None;
+                // Keep the prior obligation visible until this batch's Wait or terminal is drained.
+                live.input_at = now;
                 live.session.handle(RakSessionInput::Update(now)).unwrap();
             }
         }
@@ -363,11 +368,9 @@ fn shared_udp_cancel_and_timeout_are_owned_by_the_peer_route() {
     let mut fixture = Fixture::new(Ipv4Addr::LOCALHOST.into()).unwrap();
     fixture.exchange();
     let canceled = fixture.remotes[0].socket.local_addr().unwrap();
-    fixture
-        .application
-        .live
-        .get_mut(&canceled)
-        .unwrap()
+    let canceled_route = fixture.application.live.get_mut(&canceled).unwrap();
+    canceled_route.input_at = fixture.now;
+    canceled_route
         .session
         .handle(RakSessionInput::DisconnectNow(fixture.now))
         .unwrap();
