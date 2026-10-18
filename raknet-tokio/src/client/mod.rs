@@ -78,11 +78,35 @@ impl ClientSockets {
 }
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+type PingResult = Result<(Box<[u8]>, Duration), RakClientError>;
 
 struct PendingPing {
     sent_ms: u64,
     sent: SystemTime,
-    sender: oneshot::Sender<(Box<[u8]>, Duration)>,
+    sender: oneshot::Sender<PingResult>,
+}
+
+/// Builds ping input and reply metadata, or reports generation failure to the caller.
+fn prepare_ping(
+    guid: std::io::Result<ClientGuid>,
+    remote: SocketAddr,
+    now: SystemTime,
+    sender: oneshot::Sender<PingResult>,
+) -> Option<(RakClientInput, PendingPing)> {
+    match guid {
+        Ok(guid) => Some((
+            RakClientInput::Ping { remote, guid, now },
+            PendingPing {
+                sent_ms: millis_since_epoch(now),
+                sent: now,
+                sender,
+            },
+        )),
+        Err(error) => {
+            let _ = sender.send(Err(RakClientError::IdentityGeneration(error)));
+            None
+        }
+    }
 }
 
 fn millis_since_epoch(time: SystemTime) -> u64 {
@@ -180,15 +204,11 @@ impl RakClient {
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
-                                    match ClientGuid::generate() {
-                                        Ok(guid) => {
-                                            let _ = client.handle(RakClientInput::Ping { remote: addr, guid, now });
-                                            let sent_ms = millis_since_epoch(now);
-                                            let queue = pings.entry(addr).or_default();
-                                            queue.retain(|ping| !ping.sender.is_closed());
-                                            queue.push(PendingPing { sent_ms, sent: now, sender });
-                                        }
-                                        Err(error) => debug!("client ping identity generation failed: {error}"),
+                                    if let Some((input, ping)) = prepare_ping(ClientGuid::generate(), addr, now, sender) {
+                                        let _ = client.handle(input);
+                                        let queue = pings.entry(addr).or_default();
+                                        queue.retain(|ping| !ping.sender.is_closed());
+                                        queue.push(ping);
                                     }
                                 }
                                 RakClientMsg::Connect(addr, sender) => {
@@ -308,7 +328,7 @@ impl RakClient {
                                         let latency = SystemTime::now()
                                             .duration_since(ping.sent)
                                             .unwrap_or_default();
-                                        let _ = ping.sender.send((msg, latency));
+                                        let _ = ping.sender.send(Ok((msg, latency)));
                                     }
                                 }
                             }
@@ -358,7 +378,7 @@ impl RakClient {
         timeout(PING_TIMEOUT, rx)
             .await
             .map_err(|_| RakClientError::Timeout)?
-            .map_err(|_| RakClientError::Closed)
+            .map_err(|_| RakClientError::Closed)?
     }
 
     /// Resumes a session captured with [`RakSession::snapshot`] on another client.
@@ -395,6 +415,46 @@ impl RakClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_ping_identity_reaches_the_reply_without_blocking_the_next_ping() {
+        let mut core = RakClientIntl::new(RakClientConfig::default());
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, 19132));
+        let now = UNIX_EPOCH + Duration::from_secs(1);
+        let (sender, reply) = oneshot::channel();
+        assert!(
+            prepare_ping(
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "entropy unavailable"
+                )),
+                remote,
+                now,
+                sender,
+            )
+            .is_none()
+        );
+        let Err(RakClientError::IdentityGeneration(error)) = reply.await.unwrap() else {
+            panic!("the entropy error must reach the ping caller");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "entropy unavailable");
+        assert!(
+            core.poll().is_none(),
+            "failed identity must not send anything"
+        );
+
+        let (sender, reply) = oneshot::channel();
+        let (input, ping) = prepare_ping(Ok(ClientGuid::from_raw(7)), remote, now, sender).unwrap();
+        core.handle(input).unwrap();
+        assert!(
+            matches!(core.poll(), Some(RakClientOutput::SocketDatagram(_, peer)) if peer == remote)
+        );
+        ping.sender
+            .send(Ok((Box::from(*b"ok"), Duration::ZERO)))
+            .unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().0.as_ref(), b"ok");
+    }
 
     async fn fake_server(reply_after: Option<Duration>) -> SocketAddr {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
