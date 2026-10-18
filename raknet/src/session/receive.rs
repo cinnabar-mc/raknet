@@ -101,17 +101,21 @@ impl RakSession {
         }
 
         self.inbound_deferred = false;
+        let mut result = Ok(());
         for frame in set.frames {
             if matches!(self.state, RakSessionState::Disconnected) {
                 break;
             }
-            self.handle_frame(frame, now)?;
+            result = self.handle_frame(frame, now);
+            if result.is_err() {
+                break;
+            }
         }
-        if self.inbound_deferred {
+        if self.inbound_deferred || result.is_err() {
             self.sequences_recv.remove(&set.sequence);
         }
         self.refresh_stall(now);
-        Ok(())
+        result
     }
 
     /// Tracks receive progress while a reliable or ordered gap remains.
@@ -256,6 +260,9 @@ impl RakSession {
             let next = u24::add(self.inbound_rel_base, 1);
             self.inbound_rel_base = ranges::take_contiguous(&mut self.inbound_rel_ahead, next);
             return ReliableArrival::New;
+        }
+        if ranges::contains(&self.inbound_rel_ahead, self.inbound_rel_base, index) {
+            return ReliableArrival::Duplicate;
         }
         if self.exceeds_queued_bytes(size_of::<ranges::Range>()) {
             return ReliableArrival::OverBudget;

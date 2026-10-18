@@ -794,6 +794,51 @@ fn deferred_reliable_datagrams_are_retried_after_the_receive_budget_frees() {
 }
 
 #[test]
+fn reliable_duplicates_remain_harmless_under_receive_pressure() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = (size_of::<Frame>() + 2 + 2 * size_of::<u32>()) as i32;
+    let now = domain_time();
+    receiver
+        .handle(datagram_at(0, vec![ordered_payload(1, &[0xfe, 1])], now))
+        .unwrap();
+    receiver
+        .handle(datagram_at(1, vec![ordered_payload(1, &[0xfe, 1])], now))
+        .unwrap();
+    assert_eq!(receiver.state, RakSessionState::Connected);
+    receiver
+        .handle(datagram_at(2, vec![ordered_payload(0, &[0xfe, 0])], now))
+        .unwrap();
+    assert_eq!(
+        packets(&mut receiver),
+        vec![Box::<[u8]>::from([0xfe, 0]), Box::from([0xfe, 1])]
+    );
+}
+
+#[test]
+fn control_decode_errors_cancel_acknowledgments_under_receive_pressure() {
+    let mut receiver = session(0, 1);
+    receiver.config.max_queued_bytes = (size_of::<Frame>() + 2 + 2 * size_of::<u32>()) as i32;
+    let now = domain_time();
+    let frames = vec![
+        ordered_payload(1, &[0xfe, 1]),
+        ordered_payload(2, &[0xfe, 2]),
+        Frame::new(
+            RakReliability::Unreliable,
+            Box::new([packet_id::CONNECTED_PING]),
+        ),
+    ];
+    assert!(receiver.handle(datagram_at(0, frames, now)).is_err());
+    receiver.tick(now).unwrap();
+    assert!(
+        outbound_acks(&mut receiver)
+            .into_iter()
+            .map(|bytes| Ack::deserialize(&mut bytes.as_ref()).unwrap())
+            .filter(|ack| !ack.is_nack)
+            .all(|ack| !ack.sequences.contains(&0))
+    );
+}
+
+#[test]
 fn immediate_reliable_sends_obey_the_outstanding_window() {
     let mut sender = session(0, 1);
     let now = domain_time();
