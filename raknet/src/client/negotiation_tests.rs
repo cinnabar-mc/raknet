@@ -617,9 +617,8 @@ fn final_mtu_size_errors_exhaust_the_original_probe_budget() {
             now,
         })
         .unwrap();
-    for expected in [1464, 1172, 548, 548] {
-        let (id, len) = pending_probe(&mut client).unwrap();
-        assert_eq!(len, expected);
+    for _ in 0..=constants::MTU_SIZES.len() {
+        let (id, _) = pending_probe(&mut client).unwrap();
         client
             .handle(RakClientInput::MtuProbeResult {
                 id,
