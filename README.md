@@ -72,3 +72,16 @@ A RakNet transport library written in Rust.
         }
     }
     ```
+
+### Sans-I/O connection drivers
+
+The core receives caller-supplied `SystemTime` values. Pass the same clock to
+`RakSession::new` and `RakSession::restore` that drives subsequent session inputs.
+
+A `RakClientOutput::MtuProbe` transfers one probe write to the I/O adapter. Measure
+only the socket write, then submit its opaque ID, completion time, elapsed write
+duration, and `is_mtu_probe_size_error` result through
+`RakClientInput::MtuProbeResult`. Submit a completion for failed writes too. The
+core keeps preparation time out of slow-write detection, continues MTU discovery
+while Request 2 retries, and ignores stale completions after cancellation or
+reconnection. Validate `RakClientConfig` before opening a socket.

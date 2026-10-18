@@ -1,0 +1,11 @@
+Cinnabar RakNet modifications
+Copyright 2026 Cinnabar contributors
+
+The client MTU negotiation state machine follows public Lunar go-raknet behavior
+at commit 6124f52657d4d5f006ea2af2d525260998dd3173. It adapts its probe scheduling,
+protected challenge, cookie refresh and final-grant handling to caller-driven
+Rust protocol state and explicit socket-write completion inputs.
+
+That reference is MIT-licensed, copyright 2019 Sander ten Veldhuis.
+See LICENSE-MIT-go-raknet for the retained notice and license.
+The original RakNet project's Apache-2.0 license and notices remain in effect.

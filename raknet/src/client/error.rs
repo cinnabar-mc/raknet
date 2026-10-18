@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 use crate::prelude::RakSessionError;
 use crate::protocol::error::RakCodecError;
 use std::time::SystemTimeError;
@@ -5,6 +6,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RakClientError {
+    #[error("Invalid client configuration: {0}")]
+    InvalidConfig(&'static str),
     #[error("RakCodecError: {0}")]
     RakCodecError(#[from] RakCodecError),
     #[error("RakSessionError: {0}")]

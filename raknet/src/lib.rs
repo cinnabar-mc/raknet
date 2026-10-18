@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 mod client;
 mod protocol;
 mod sans;
@@ -8,16 +9,17 @@ mod util;
 
 pub mod prelude {
     pub use crate::client::{
-        RakClient, config::RakClientConfig, error::RakClientError, input::RakClientInput,
-        output::RakClientOutput,
+        MtuProbeId, RakClient, config::RakClientConfig, error::RakClientError,
+        input::RakClientInput, is_mtu_probe_size_error, output::RakClientOutput,
     };
     pub use crate::sans::Sans;
     pub use crate::server::{
         RakServer, config::RakServerConfig, error::RakServerError, input::RakServerInput,
         output::RakServerOutput,
     };
+    pub use crate::session::snapshot::RakSessionSnapshot;
     pub use crate::session::{
-        RakSession, RakSessionId, RakSessionSnapshot,
+        RakSession, RakSessionId,
         config::RakSessionConfig,
         error::RakSessionError,
         input::RakSessionInput,

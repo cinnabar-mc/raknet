@@ -1,10 +1,11 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use raknet::prelude::{RakClient as RakClientIntl, RakSession as RakSessionIntl, *};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::debug;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
@@ -63,6 +64,9 @@ impl RakClient {
         let mut config = RakClientConfig::default();
         conf(&mut config);
 
+        config
+            .validate()
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_nonblocking(true)?;
 
@@ -181,6 +185,20 @@ impl RakClient {
 
         while let Some(output) = self.intl.poll() {
             match output {
+                RakClientOutput::MtuProbe { id, datagram, peer } => {
+                    let started = Instant::now();
+                    let result = self.socket.send_to(&datagram, peer);
+                    let elapsed = started.elapsed();
+                    let input = RakClientInput::MtuProbeResult {
+                        id,
+                        now: SystemTime::now(),
+                        elapsed,
+                        too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
+                    };
+                    if let Err(error) = self.intl.handle(input) {
+                        debug!("client failed to complete an MTU probe: {error}");
+                    }
+                }
                 RakClientOutput::SocketDatagram(buf, addr) => {
                     let _ = self.socket.send_to(&buf, addr);
                 }

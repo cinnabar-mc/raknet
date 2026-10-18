@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod command;
 
 use crate::session::command::RakSessionMsg;
@@ -195,6 +196,7 @@ mod tests {
             "127.0.0.1:19132".parse().unwrap(),
             0,
             1492,
+            SystemTime::now(),
             |conf| conf.max_queued_bytes = 1 << 20,
         );
         let (datagram_tx, _datagram_rx) = unbounded_channel();
@@ -212,6 +214,7 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             0,
             1492,
+            SystemTime::now(),
             |_| {},
         );
         let mut peer = RakSessionIntl::new(
@@ -219,6 +222,7 @@ mod tests {
             "127.0.0.1:2".parse().unwrap(),
             1,
             1492,
+            SystemTime::now(),
             |_| {},
         );
         let (datagram_tx, _datagram_rx) = unbounded_channel();

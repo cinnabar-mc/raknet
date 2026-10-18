@@ -1,3 +1,5 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
+use super::RakClientError;
 use crate::util::constants;
 use rand::random;
 use std::time::Duration;
@@ -11,7 +13,25 @@ pub struct RakClientConfig {
     pub max_mtu_size: u16,
     pub conn_attempt_timeout: Duration,
     pub conn_attempt_interval: Duration,
+    /// Maximum ordinary Request 1 probes; Request 2 retries are bounded by the overall timeout.
     pub conn_attempt_max: usize,
+}
+
+impl RakClientConfig {
+    /// Validates capacities and cadence before an adapter opens its socket.
+    pub fn validate(&self) -> Result<(), RakClientError> {
+        if self.max_mtu_size < self.min_mtu_size.max(constants::MIN_PROBE_MTU_SIZE)
+            || self.max_mtu_size > constants::MAX_MTU_SIZE
+        {
+            return Err(RakClientError::InvalidMtu(self.max_mtu_size));
+        }
+        if self.conn_attempt_interval.is_zero() || self.conn_attempt_max == 0 {
+            return Err(RakClientError::InvalidConfig(
+                "probe cadence and attempt count must be positive",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RakClientConfig {

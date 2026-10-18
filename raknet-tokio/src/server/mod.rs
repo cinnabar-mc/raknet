@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod error;
 pub mod msg;
 mod state;
@@ -269,7 +270,7 @@ impl RakServer {
             return Err(RakServerError::Closed);
         };
 
-        let session = RakSessionIntl::restore(snapshot)?;
+        let session = RakSessionIntl::restore(snapshot, SystemTime::now())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         msg_tx

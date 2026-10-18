@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod msg;
 pub mod state;
 
@@ -7,7 +8,7 @@ use crate::prelude::{RakServerError, RakSession};
 use raknet::prelude::{
     RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
     RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
-    constants,
+    constants, is_mtu_probe_size_error,
 };
 use std::collections::HashMap;
 use std::mem::take;
@@ -113,6 +114,9 @@ impl RakClient {
             return Ok(());
         };
 
+        config
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let (msg_tx, msg_rx) = unbounded_channel();
 
         let sockets = ClientSockets::bind(config.local_port).await?;
@@ -174,7 +178,7 @@ impl RakClient {
                                     }
                                 }
                                 RakClientMsg::Adopt(snapshot, reply) => {
-                                    match RakSessionIntl::restore(*snapshot) {
+                                    match RakSessionIntl::restore(*snapshot, now) {
                                         Ok(session) => match client.adopt(session) {
                                             Ok(()) => connect = Some(reply),
                                             Err(e) => {
@@ -209,6 +213,19 @@ impl RakClient {
 
                     while let Some(msg) = client.poll() {
                         match msg {
+                            RakClientOutput::MtuProbe { id, datagram, peer } => {
+                                let started = Instant::now();
+                                let result = sockets.send_to(&datagram, peer).await;
+                                let elapsed = started.elapsed();
+                                let input = RakClientInput::MtuProbeResult {
+                                    id,
+                                    now: SystemTime::now(),
+                                    elapsed,
+                                    too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
+                                };
+                                let result = client.handle(input);
+                                fail_pending_connect(&client, &mut connect, result);
+                            }
                             RakClientOutput::SocketDatagram(buf, addr) => {
                                 let _ = sockets.send_to(&buf, addr).await;
                             }
