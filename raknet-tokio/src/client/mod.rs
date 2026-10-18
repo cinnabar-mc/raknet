@@ -8,7 +8,7 @@ use crate::prelude::{RakServerError, RakSession};
 use raknet::prelude::{
     RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
     RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
-    constants, is_mtu_probe_size_error,
+    canonical_socket_addr, constants, is_mtu_probe_size_error,
 };
 use std::collections::HashMap;
 use std::mem::take;
@@ -52,11 +52,28 @@ impl ClientSockets {
         }
     }
 
-    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
-        match &self.v6 {
-            Some(socket) if addr.is_ipv6() => socket.send_to(buf, addr).await,
-            _ => self.v4.send_to(buf, addr).await,
+    /// Selects the socket matching the canonical endpoint family.
+    fn socket(&self, addr: SocketAddr) -> std::io::Result<&UdpSocket> {
+        if canonical_socket_addr(addr).is_ipv6() {
+            self.v6.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "IPv6 client socket is unavailable",
+                )
+            })
+        } else {
+            Ok(&self.v4)
         }
+    }
+
+    /// Returns the selected unconnected socket's actual bound endpoint.
+    fn local_addr(&self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        self.socket(addr)?.local_addr().map(canonical_socket_addr)
+    }
+
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+        let addr = canonical_socket_addr(addr);
+        self.socket(addr)?.send_to(buf, addr).await
     }
 }
 
@@ -162,6 +179,7 @@ impl RakClient {
                             let now = SystemTime::now();
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
+                                    let addr = canonical_socket_addr(addr);
                                     let _ = client.handle(RakClientInput::Ping(addr, now));
 
                                     let sent_ms = millis_since_epoch(now);
@@ -170,7 +188,11 @@ impl RakClient {
                                     queue.push(PendingPing { sent_ms, sent: now, sender });
                                 }
                                 RakClientMsg::Connect(addr, sender) => {
-                                    match client.handle(RakClientInput::Connect(addr, now)) {
+                                    let addr = canonical_socket_addr(addr);
+                                    let result = sockets.local_addr(addr)
+                                        .map_err(|_| RakClientError::InvalidConfig("client socket address is unavailable"))
+                                        .and_then(|local| client.handle(RakClientInput::Connect { remote: addr, local, now }));
+                                    match result {
                                         Ok(()) => connect = Some(sender),
                                         Err(e) => {
                                             let _ = sender.send(Err(e));

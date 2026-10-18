@@ -28,4 +28,5 @@ pub mod prelude {
     };
     pub use crate::types::*;
     pub use crate::util::constants;
+    pub use crate::util::socket_addr::canonical_socket_addr;
 }

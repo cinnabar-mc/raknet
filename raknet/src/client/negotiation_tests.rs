@@ -1,4 +1,5 @@
 use super::*;
+use std::net::SocketAddrV4;
 
 const PEER: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19132));
 
@@ -44,7 +45,13 @@ fn begin(cap: u16) -> (RakClient, SystemTime) {
         ..RakClientConfig::default()
     });
     let now = UNIX_EPOCH + Duration::from_secs(1000);
-    client.handle(RakClientInput::Connect(PEER, now)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: PEER,
+            local: SocketAddr::new(PEER.ip(), 54321),
+            now,
+        })
+        .unwrap();
     assert_eq!(
         collect(&mut client, now)[0][0],
         packet_id::OPEN_CONNECTION_REQUEST_1
@@ -100,7 +107,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
     let sent = deliver(&mut client, challenge, start);
     let request = OpenConnectionRequest2::deserialize(&mut Cursor::new(&sent[0])).unwrap();
     assert_eq!((request.mtu, request.cookie), (24, Some(17)));
-    assert!(matches!(client.state, RakClientState::Handshake1(_)));
+    assert!(matches!(client.state, RakClientState::Handshake1 { .. }));
     assert!(
         deliver(
             &mut client,
@@ -205,7 +212,15 @@ fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
         ..RakClientConfig::default()
     });
     let now = UNIX_EPOCH + Duration::from_secs(1000);
-    assert!(client.handle(RakClientInput::Connect(PEER, now)).is_err());
+    assert!(
+        client
+            .handle(RakClientInput::Connect {
+                remote: PEER,
+                local: SocketAddr::new(PEER.ip(), 54321),
+                now
+            })
+            .is_err()
+    );
     assert!(collect(&mut client, now).is_empty());
     assert!(!client.is_connecting());
 }
@@ -239,7 +254,13 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
     ] {
         let mut client = RakClient::new(RakClientConfig::default());
         let start = UNIX_EPOCH + Duration::from_secs(1000);
-        client.handle(RakClientInput::Connect(PEER, start)).unwrap();
+        client
+            .handle(RakClientInput::Connect {
+                remote: PEER,
+                local: SocketAddr::new(PEER.ip(), 54321),
+                now: start,
+            })
+            .unwrap();
         let (id, _) = pending_probe(&mut client).unwrap();
         client
             .handle(RakClientInput::MtuProbeResult {
@@ -261,7 +282,13 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
 
     let mut client = RakClient::new(RakClientConfig::default());
     let mut now = UNIX_EPOCH + Duration::from_secs(1000);
-    client.handle(RakClientInput::Connect(PEER, now)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: PEER,
+            local: SocketAddr::new(PEER.ip(), 54321),
+            now,
+        })
+        .unwrap();
     for (payload_len, too_large) in [(1464, true), (1172, true), (548, true), (548, false)] {
         let (id, len) = pending_probe(&mut client).unwrap();
         assert_eq!(len, payload_len);
@@ -286,11 +313,23 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
 fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negotiation() {
     let mut client = RakClient::new(RakClientConfig::default());
     let first = UNIX_EPOCH + Duration::from_secs(1000);
-    client.handle(RakClientInput::Connect(PEER, first)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: PEER,
+            local: SocketAddr::new(PEER.ip(), 54321),
+            now: first,
+        })
+        .unwrap();
     let (old, _) = pending_probe(&mut client).unwrap();
     client.handle(RakClientInput::Disconnect).unwrap();
     let start = first + Duration::from_secs(1);
-    client.handle(RakClientInput::Connect(PEER, start)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: PEER,
+            local: SocketAddr::new(PEER.ip(), 54321),
+            now: start,
+        })
+        .unwrap();
     let (current, _) = pending_probe(&mut client).unwrap();
     assert_ne!(old, current);
     client

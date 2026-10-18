@@ -1,8 +1,11 @@
+// Modified by Cinnabar contributors for explicit connection endpoints and wire address bounds.
 use crate::protocol::codec::RakCodec;
 use crate::protocol::error::RakCodecError;
+use crate::protocol::types::socket_addr::read_system_addresses_and_timestamps;
+use crate::util::constants::SYSTEM_ADDRESS_COUNT;
 use crate::util::packet_id::CONNECTION_REQUEST_ACCEPTED;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +19,9 @@ pub struct ConnectionRequestAccepted {
 
 impl RakCodec for ConnectionRequestAccepted {
     fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), RakCodecError> {
+        if self.system_addresses.len() > SYSTEM_ADDRESS_COUNT {
+            return Err(RakCodecError::Malformed("too many system addresses"));
+        }
         writer.write_u8(CONNECTION_REQUEST_ACCEPTED)?;
         SocketAddr::serialize(&self.client_address, writer)?;
         writer.write_u16::<BigEndian>(self.system_index)?;
@@ -40,18 +46,8 @@ impl RakCodec for ConnectionRequestAccepted {
         let client_address = SocketAddr::deserialize(reader)?;
         let system_index = reader.read_u16::<BigEndian>()?;
 
-        let mut system_addresses = Vec::new();
-
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-
-        let mut reader = Cursor::new(buf);
-        while reader.get_ref().len() - reader.position() as usize > 16 {
-            system_addresses.push(SocketAddr::deserialize(&mut reader)?);
-        }
-
-        let request_timestamp = reader.read_u64::<BigEndian>()?;
-        let timestamp = reader.read_u64::<BigEndian>()?;
+        let (system_addresses, request_timestamp, timestamp) =
+            read_system_addresses_and_timestamps(reader)?;
 
         Ok(Self {
             client_address,

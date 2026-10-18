@@ -82,7 +82,11 @@ fn connect_all(
         .map(|&addr| {
             let mut client = RakClient::new(RakClientConfig::default());
             client
-                .handle(RakClientInput::Connect(server_addr, now))
+                .handle(RakClientInput::Connect {
+                    remote: server_addr,
+                    local: SocketAddr::new(server_addr.ip(), 54321),
+                    now,
+                })
                 .unwrap();
             (addr, Some(client))
         })
@@ -749,7 +753,11 @@ fn pending_session_acks_and_resends_connection_request_accepted() {
     let now = SystemTime::now();
     let mut client = RakClient::new(RakClientConfig::default());
     client
-        .handle(RakClientInput::Connect(server_addr, now))
+        .handle(RakClientInput::Connect {
+            remote: server_addr,
+            local: SocketAddr::new(server_addr.ip(), 54321),
+            now,
+        })
         .unwrap();
 
     loop {

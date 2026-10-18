@@ -2,6 +2,8 @@
 use std::time::Duration;
 
 pub const PROTOCOL: u8 = 11;
+/// Maximum system-address entries in connected handshake messages.
+pub const SYSTEM_ADDRESS_COUNT: usize = 20;
 
 pub const UDP_HEADER_SIZE: u16 = 8;
 pub const MIN_MTU_SIZE: u16 = 400;

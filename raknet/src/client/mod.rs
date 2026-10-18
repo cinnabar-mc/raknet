@@ -30,11 +30,11 @@ use crate::protocol::packets::unconnected_ping::UnconnectedPing;
 use crate::protocol::packets::unconnected_pong::UnconnectedPong;
 use crate::sans::Sans;
 use crate::session::RakSessionId;
-use crate::util::socket_addr::get_overhead;
+use crate::util::socket_addr::{canonical_socket_addr, get_overhead};
 use crate::util::{constants, packet_id};
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
@@ -89,15 +89,22 @@ impl Sans for RakClient {
                 self.output
                     .push_back(RakClientOutput::SocketDatagram(ping.serialized()?, addr))
             }
-            RakClientInput::Connect(remote, now) => {
+            RakClientInput::Connect { remote, local, now } => {
                 if !matches!(self.state, RakClientState::Unconnected) {
                     return Err(RakClientError::AlreadyConnected);
                 }
 
                 self.config.validate()?;
+                let remote = canonical_socket_addr(remote);
+                let local = canonical_socket_addr(local);
+                if remote.is_ipv4() != local.is_ipv4() {
+                    return Err(RakClientError::InvalidConfig(
+                        "local and remote address families differ",
+                    ));
+                }
                 let timeout = deadline(now, self.config.conn_attempt_timeout)?;
                 self.clear_connection_outputs();
-                self.state = RakClientState::Handshake1(remote);
+                self.state = RakClientState::Handshake1 { remote, local };
                 self.mtu = 0;
                 self.cookie = None;
                 self.request_two_at = None;
@@ -106,8 +113,8 @@ impl Sans for RakClient {
                 self.handle_timeout(now)?;
             }
             RakClientInput::Datagram(buf, addr, now) => match self.state {
-                RakClientState::HandshakeCompleted(remote) => {
-                    if remote != addr {
+                RakClientState::HandshakeCompleted { remote, local } => {
+                    if remote != canonical_socket_addr(addr) {
                         return Ok(());
                     }
 
@@ -130,6 +137,7 @@ impl Sans for RakClient {
                                                     Self::handle_connection_request_accepted(
                                                         session,
                                                         remote,
+                                                        local,
                                                         &mut cursor,
                                                         now,
                                                     )?;
@@ -155,7 +163,7 @@ impl Sans for RakClient {
                                 }
                             }
                         }
-                        None => self.output.push_back(RakClientOutput::SessionDatagram(buf)),
+                        None => return Err(self.abort(RakClientError::ConnectionFailed)),
                     }
 
                     if session_closed && success.is_none() {
@@ -166,14 +174,23 @@ impl Sans for RakClient {
                         && let Some(session) = self.session.take()
                     {
                         match succeeded {
-                            true => self
-                                .output
-                                .push_back(RakClientOutput::SessionConnected(Box::new(session))),
+                            true => {
+                                self.state = RakClientState::Connected(remote);
+                                self.output
+                                    .push_back(RakClientOutput::SessionConnected(Box::new(
+                                        session,
+                                    )));
+                            }
                             false => {
                                 debug!("connection attempt failed");
                                 return Err(self.abort(RakClientError::ConnectionAttemptFailed));
                             }
                         }
+                    }
+                }
+                RakClientState::Connected(remote) => {
+                    if canonical_socket_addr(addr) == remote {
+                        self.output.push_back(RakClientOutput::SessionDatagram(buf));
                     }
                 }
                 RakClientState::Unconnected => {
@@ -190,8 +207,9 @@ impl Sans for RakClient {
                         }
                     }
                 }
-                RakClientState::Handshake1(remote) | RakClientState::Handshake2(remote) => {
-                    if remote != addr {
+                RakClientState::Handshake1 { remote, local }
+                | RakClientState::Handshake2 { remote, local } => {
+                    if remote != canonical_socket_addr(addr) {
                         return Ok(());
                     }
 
@@ -199,12 +217,12 @@ impl Sans for RakClient {
                         let mut cursor = Cursor::new(buf.as_ref());
                         let replied = match b {
                             packet_id::OPEN_CONNECTION_REPLY_1 => {
-                                self.handle_open_connection_reply_1(remote, &mut cursor, now)
+                                self.handle_open_connection_reply_1(remote, local, &mut cursor, now)
                             }
                             packet_id::OPEN_CONNECTION_REPLY_2
-                                if matches!(self.state, RakClientState::Handshake2(_)) =>
+                                if matches!(self.state, RakClientState::Handshake2 { .. }) =>
                             {
-                                self.handle_open_connection_reply_2(remote, &mut cursor, now)
+                                self.handle_open_connection_reply_2(remote, local, &mut cursor, now)
                             }
                             packet_id::INCOMPATIBLE_PROTOCOL => {
                                 debug!(
@@ -289,9 +307,9 @@ impl RakClient {
 
     pub fn is_connecting(&self) -> bool {
         match self.state {
-            RakClientState::Handshake1(_) | RakClientState::Handshake2(_) => true,
-            RakClientState::HandshakeCompleted(_) => self.session.is_some(),
-            RakClientState::Unconnected => false,
+            RakClientState::Handshake1 { .. } | RakClientState::Handshake2 { .. } => true,
+            RakClientState::HandshakeCompleted { .. } => true,
+            RakClientState::Unconnected | RakClientState::Connected(_) => false,
         }
     }
 
@@ -305,8 +323,7 @@ impl RakClient {
 
     /// Emits due protocol work without reading a clock or blocking on socket writes.
     fn drive(&mut self, now: SystemTime) -> Result<(), RakClientError> {
-        let connected =
-            matches!(self.state, RakClientState::HandshakeCompleted(_)) && self.session.is_none();
+        let connected = matches!(self.state, RakClientState::Connected(_));
         if connected || matches!(self.state, RakClientState::Unconnected) {
             self.output
                 .push_back(RakClientOutput::Wait(self.config.conn_attempt_interval));
@@ -319,7 +336,7 @@ impl RakClient {
             return Err(RakClientError::ConnectionFailed);
         }
         let mut next = timeout;
-        if let (RakClientState::HandshakeCompleted(_), Some(session)) =
+        if let (RakClientState::HandshakeCompleted { .. }, Some(session)) =
             (&self.state, self.session.as_mut())
         {
             session.handle(RakSessionInput::Update(now))?;
@@ -335,8 +352,8 @@ impl RakClient {
                     RakSessionOutput::Packet(_) => {}
                 }
             }
-        } else if let RakClientState::Handshake1(peer) | RakClientState::Handshake2(peer) =
-            self.state
+        } else if let RakClientState::Handshake1 { remote: peer, .. }
+        | RakClientState::Handshake2 { remote: peer, .. } = self.state
         {
             let id = MtuProbeId(self.next_probe_id);
             if let Some(mtu) = self.probes.as_mut().and_then(|probes| probes.take(now, id)) {
@@ -392,13 +409,14 @@ impl RakClient {
     fn handle_open_connection_reply_1(
         &mut self,
         peer: SocketAddr,
+        local: SocketAddr,
         buf: &mut Cursor<&[u8]>,
         now: SystemTime,
     ) -> Result<(), RakClientError> {
         let reply = OpenConnectionReply1::deserialize(buf)?;
         let minimum = self.config.min_mtu_size.max(constants::MIN_MTU_SIZE);
         if reply.guid == 0 || reply.mtu < minimum || reply.mtu > 1500 {
-            if matches!(self.state, RakClientState::Handshake1(_)) {
+            if matches!(self.state, RakClientState::Handshake1 { .. }) {
                 self.send_open_connection_request_2(peer, reply.mtu, reply.cookie)?;
             }
             return Ok(());
@@ -409,7 +427,10 @@ impl RakClient {
         self.clear_request_two_outputs();
         self.mtu = reply.mtu;
         self.cookie = reply.cookie;
-        self.state = RakClientState::Handshake2(peer);
+        self.state = RakClientState::Handshake2 {
+            remote: peer,
+            local,
+        };
         self.send_open_connection_request_2(peer, self.mtu, self.cookie)?;
         self.request_two_at = Some(deadline(now, self.config.conn_attempt_interval)?);
         self.drive(now)
@@ -436,6 +457,7 @@ impl RakClient {
     fn handle_open_connection_reply_2(
         &mut self,
         addr: SocketAddr,
+        local: SocketAddr,
         buf: &mut Cursor<&[u8]>,
         now: SystemTime,
     ) -> Result<(), RakClientError> {
@@ -451,7 +473,10 @@ impl RakClient {
         self.probes = None;
         self.request_two_at = None;
         self.clear_offline_outputs();
-        self.state = RakClientState::HandshakeCompleted(addr);
+        self.state = RakClientState::HandshakeCompleted {
+            remote: addr,
+            local,
+        };
 
         debug!(
             "establishing connection to {} with mtu size of {}",
@@ -502,7 +527,7 @@ impl RakClient {
         let addr = session.addr;
 
         self.mtu = session.mtu;
-        self.state = RakClientState::HandshakeCompleted(addr);
+        self.state = RakClientState::Connected(canonical_socket_addr(addr));
 
         debug!("adopting a session with {} at mtu {}", addr, self.mtu);
 
@@ -515,6 +540,7 @@ impl RakClient {
     fn handle_connection_request_accepted(
         session: &mut RakSession,
         addr: SocketAddr,
+        local: SocketAddr,
         buf: &mut Cursor<&[u8]>,
         now: SystemTime,
     ) -> Result<(), RakClientError> {
@@ -522,12 +548,12 @@ impl RakClient {
 
         session.state = RakSessionState::Connected;
 
+        let mut internal_addresses =
+            vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); constants::SYSTEM_ADDRESS_COUNT];
+        internal_addresses[0] = canonical_socket_addr(local);
         let incoming = NewIncomingConnection {
             server_address: addr,
-            internal_addresses: vec![
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-                10
-            ],
+            internal_addresses,
             incoming_timestamp: acc.timestamp,
             server_timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
         };
@@ -548,3 +574,6 @@ mod tests;
 
 #[cfg(test)]
 mod negotiation_tests;
+
+#[cfg(test)]
+mod endpoint_tests;

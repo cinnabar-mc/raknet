@@ -5,7 +5,11 @@ use crate::util::flags;
 fn request_1_len(addr: SocketAddr) -> u16 {
     let mut client = RakClient::new(RakClientConfig::default());
     client
-        .handle(RakClientInput::Connect(addr, domain_time()))
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: domain_time(),
+        })
         .unwrap();
     match client.poll().unwrap() {
         RakClientOutput::MtuProbe { datagram, .. } => u16::try_from(datagram.len()).unwrap(),
@@ -39,7 +43,13 @@ fn overall_connect_timeout_fails_regardless_of_attempts() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, start)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: start,
+        })
+        .unwrap();
 
     let result = client.handle(RakClientInput::Update(start + Duration::from_millis(200)));
 
@@ -62,9 +72,15 @@ fn connected_client_schedules_a_wait_instead_of_spinning() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, start)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: start,
+        })
+        .unwrap();
     last_wait(&mut client);
-    client.state = RakClientState::HandshakeCompleted(addr);
+    client.state = RakClientState::Connected(addr);
 
     for elapsed in [Duration::from_secs(2), Duration::from_secs(20)] {
         let result = client.handle(RakClientInput::Update(start + elapsed));
@@ -87,7 +103,13 @@ fn failed_connect_schedules_a_wait_instead_of_spinning() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, start)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: start,
+        })
+        .unwrap();
     last_wait(&mut client);
 
     let failed_at = start + client.config.conn_attempt_timeout;
@@ -106,22 +128,27 @@ fn disconnect_input_allows_reconnect() {
     let mut client = RakClient::new(RakClientConfig::default());
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
 
-    client.state = RakClientState::HandshakeCompleted(addr);
+    client.state = RakClientState::Connected(addr);
 
-    let result = client.handle(RakClientInput::Connect(addr, domain_time()));
+    let result = client.handle(RakClientInput::Connect {
+        remote: addr,
+        local: SocketAddr::new(addr.ip(), 54321),
+        now: domain_time(),
+    });
     assert!(matches!(result, Err(RakClientError::AlreadyConnected)));
-    assert!(matches!(
-        client.state,
-        RakClientState::HandshakeCompleted(_)
-    ));
+    assert!(matches!(client.state, RakClientState::Connected(_)));
 
     client.handle(RakClientInput::Disconnect).unwrap();
     assert!(matches!(client.state, RakClientState::Unconnected));
 
     client
-        .handle(RakClientInput::Connect(addr, domain_time()))
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: domain_time(),
+        })
         .unwrap();
-    assert!(matches!(client.state, RakClientState::Handshake1(_)));
+    assert!(matches!(client.state, RakClientState::Handshake1 { .. }));
 }
 
 fn encoded(packet: impl RakCodec) -> Box<[u8]> {
@@ -145,7 +172,13 @@ fn reply_2_above_the_maximum_mtu_is_clamped() {
     let mut client = RakClient::new(RakClientConfig::default());
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
-    client.handle(RakClientInput::Connect(addr, now)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now,
+        })
+        .unwrap();
     client
         .handle(RakClientInput::Datagram(reply_1(1200), addr, now))
         .unwrap();
@@ -172,7 +205,13 @@ fn handshake_session_resends_connection_request() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let t0 = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, t0)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: t0,
+        })
+        .unwrap();
     client
         .handle(RakClientInput::Datagram(reply_1(1200), addr, t0))
         .unwrap();
@@ -204,7 +243,13 @@ fn failed_connect_resets_and_schedules_a_wait() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let start = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, start)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now: start,
+        })
+        .unwrap();
     last_wait(&mut client);
 
     let result = client.handle(RakClientInput::Update(start + Duration::from_millis(200)));
@@ -223,7 +268,13 @@ fn incompatible_protocol_resets_state() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, now)).unwrap();
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now,
+        })
+        .unwrap();
     last_wait(&mut client);
 
     let result = client.handle(RakClientInput::Datagram(
@@ -243,8 +294,18 @@ fn connect_while_connecting_is_rejected() {
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = domain_time();
 
-    client.handle(RakClientInput::Connect(addr, now)).unwrap();
-    let result = client.handle(RakClientInput::Connect(addr, now));
+    client
+        .handle(RakClientInput::Connect {
+            remote: addr,
+            local: SocketAddr::new(addr.ip(), 54321),
+            now,
+        })
+        .unwrap();
+    let result = client.handle(RakClientInput::Connect {
+        remote: addr,
+        local: SocketAddr::new(addr.ip(), 54321),
+        now,
+    });
 
     assert!(
         matches!(result, Err(RakClientError::AlreadyConnected)),

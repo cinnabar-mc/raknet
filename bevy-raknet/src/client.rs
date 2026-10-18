@@ -67,7 +67,7 @@ impl RakClient {
         config
             .validate()
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.local_port))?;
         socket.set_nonblocking(true)?;
 
         Ok(Self {
@@ -82,9 +82,20 @@ impl RakClient {
     }
 
     pub fn connect(&mut self, addr: SocketAddr) {
-        let _ = self
-            .intl
-            .handle(RakClientInput::Connect(addr, SystemTime::now()));
+        let local = match self.socket.local_addr() {
+            Ok(local) => local,
+            Err(error) => {
+                debug!("client socket address is unavailable: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.intl.handle(RakClientInput::Connect {
+            remote: addr,
+            local,
+            now: SystemTime::now(),
+        }) {
+            debug!("client failed to start connection: {error}");
+        }
     }
 
     pub fn ping(&mut self, addr: SocketAddr) {
