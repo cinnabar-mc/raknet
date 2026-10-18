@@ -115,12 +115,18 @@ pub(super) fn negotiated_pair(
                 }
             }
         }
-        if !moved && local_session.is_some() && remote_session.is_some() {
-            let local_session = local_session.unwrap();
-            let remote_session = remote_session.unwrap();
-            assert_eq!(local_session.outbound_bytes(), 0);
-            assert_eq!(remote_session.outbound_bytes(), 0);
-            return (local_session, remote_session);
+        if !moved {
+            match (local_session, remote_session) {
+                (Some(local), Some(remote)) => {
+                    assert_eq!(local.outbound_bytes(), 0);
+                    assert_eq!(remote.outbound_bytes(), 0);
+                    return (local, remote);
+                }
+                (local, remote) => {
+                    local_session = local;
+                    remote_session = remote;
+                }
+            }
         }
     }
     panic!("public negotiation did not complete within the controlled work bound");
