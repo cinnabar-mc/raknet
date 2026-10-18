@@ -1,14 +1,18 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
-pub mod msg;
-pub mod state;
+mod driver;
+mod msg;
+mod phases;
+pub use phases::{ConfiguredClient, RunningClient};
 
 use crate::client::msg::RakClientMsg;
-use crate::client::state::RakClientState;
 use crate::prelude::{RakServerError, RakSession};
+use crate::session::{RestoredSession, SessionEvent, spawn_closing, spawn_established};
+use driver::Driver;
 use raknet::prelude::{
-    ClientGuid, RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput,
-    RakClientOutput, RakClock, RakSession as RakSessionIntl, RakSessionId, RakSessionInput,
-    RakSessionSnapshot, Sans, canonical_socket_addr, constants, is_mtu_probe_size_error,
+    ClientGuid, Established, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
+    RakClock, RakSessionId, RakSessionInput, RakSessionSnapshot,
+    RestoredSession as CoreRestoredSession, canonical_socket_addr, constants,
+    is_mtu_probe_size_error,
 };
 use std::collections::HashMap;
 use std::mem::take;
@@ -88,14 +92,14 @@ struct PendingPing {
 /// Builds ping input and reply metadata, or reports generation failure to the caller.
 fn prepare_ping(
     guid: std::io::Result<ClientGuid>,
-    remote: SocketAddr,
+    _remote: SocketAddr,
     now: std::time::Instant,
     clock: RakClock,
     sender: oneshot::Sender<PingResult>,
-) -> Option<(RakClientInput, PendingPing)> {
+) -> Option<(ClientGuid, PendingPing)> {
     match guid {
         Ok(guid) => Some((
-            RakClientInput::Ping { remote, guid, now },
+            guid,
             PendingPing {
                 sent_ms: clock.timestamp(now),
                 sender,
@@ -109,8 +113,8 @@ fn prepare_ping(
 }
 
 fn fail_pending_connect(
-    client: &RakClientIntl,
-    connect: &mut Option<oneshot::Sender<Result<RakSession, RakClientError>>>,
+    client: &mut Driver,
+    connect: &mut Option<oneshot::Sender<Result<RakSession<Established>, RakClientError>>>,
     result: Result<(), RakClientError>,
 ) {
     let Err(e) = result else {
@@ -123,14 +127,23 @@ fn fail_pending_connect(
         && let Some(sender) = connect.take()
     {
         let _ = sender.send(Err(e));
+        client.reset();
     }
 }
 
-pub struct RakClient {
-    state: RakClientState,
+/// A configuration or started socket owner with phase-specific operations.
+///
+/// ```compile_fail
+/// use raknet_tokio::prelude::*;
+/// fn before_start(client: RakClient<ConfiguredClient>, peer: std::net::SocketAddr) {
+///     client.ping(peer);
+/// }
+/// ```
+pub struct RakClient<S> {
+    state: S,
 }
 
-impl RakClient {
+impl RakClient<ConfiguredClient> {
     pub fn new<T>(conf: T) -> Self
     where
         T: FnOnce(&mut RakClientConfig),
@@ -139,36 +152,50 @@ impl RakClient {
         conf(&mut config);
 
         Self {
-            state: RakClientState::Initialized { config },
+            state: ConfiguredClient { config },
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), RakServerError> {
-        let RakClientState::Initialized { config } = &self.state else {
-            return Ok(());
+    /// Opens the socket owner and consumes the configuration capability.
+    pub async fn start(self) -> Result<RakClient<RunningClient>, ClientStartError> {
+        if let Err(error) = self.state.config.validate() {
+            let cause = std::io::Error::new(std::io::ErrorKind::InvalidInput, error).into();
+            return Err(ClientStartError {
+                client: Box::new(self),
+                cause,
+            });
+        }
+        let sockets = match ClientSockets::bind(self.state.config.local_port).await {
+            Ok(sockets) => sockets,
+            Err(error) => {
+                return Err(ClientStartError {
+                    client: Box::new(self),
+                    cause: error.into(),
+                });
+            }
         };
-
-        config
-            .validate()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let config = self.state.config;
         let (msg_tx, msg_rx) = unbounded_channel();
 
-        let sockets = ClientSockets::bind(config.local_port).await?;
-
         let handle = tokio::spawn({
-            let config = config.clone();
+            let config = config;
             let sockets = sockets;
             let mut msg_rx = msg_rx;
 
             async move {
-                let mut session_tx: Option<Sender<RakSessionInput>> = None;
+                let mut session_tx: Option<Sender<SessionEvent>> = None;
                 let mut pings: HashMap<SocketAddr, Vec<PendingPing>> = HashMap::new();
-                let mut connect: Option<oneshot::Sender<Result<RakSession, RakClientError>>> = None;
+                let mut connect: Option<
+                    oneshot::Sender<Result<RakSession<Established>, RakClientError>>,
+                > = None;
 
                 let mut buf4 = vec![0u8; config.max_mtu_size as usize];
                 let mut buf6 = vec![0u8; config.max_mtu_size as usize];
                 let clock = RakClock::new(Instant::now().into_std());
-                let mut client = RakClientIntl::new(config, clock);
+                let mut client =
+                    Driver::new(config, clock).expect("configuration was validated before binding");
+                let mut adopting: Option<oneshot::Sender<Result<RestoredSession, RakClientError>>> =
+                    None;
 
                 let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
@@ -184,22 +211,22 @@ impl RakClient {
                             let now = Instant::now().into_std();
 
                             let result = client.handle(RakClientInput::Datagram(datagram, addr, now));
-                            fail_pending_connect(&client, &mut connect, result);
+                            fail_pending_connect(&mut client, &mut connect, result);
                         }
                         Some((buf, addr)) = dgram_rx.recv() => {
                             let _ = sockets.send_to(buf.as_ref(), addr).await;
                         }
                         Some(_) = disconnect_rx.recv() => {
                             session_tx = None;
-                            let _ = client.handle(RakClientInput::Disconnect);
+                            client.reset();
                         }
                         Some(msg) = msg_rx.recv() => {
                             let now = Instant::now().into_std();
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
-                                    if let Some((input, ping)) = prepare_ping(ClientGuid::generate(), addr, now, clock, sender) {
-                                        let _ = client.handle(input);
+                                    if let Some((guid, ping)) = prepare_ping(ClientGuid::generate(), addr, now, clock, sender) {
+                                        let _ = client.ping(addr, guid, now);
                                         let queue = pings.entry(addr).or_default();
                                         queue.retain(|ping| !ping.sender.is_closed());
                                         queue.push(ping);
@@ -211,7 +238,7 @@ impl RakClient {
                                         .map_err(|_| RakClientError::InvalidConfig("client socket address is unavailable"))
                                         .and_then(|local| {
                                             let guid = ClientGuid::generate().map_err(RakClientError::IdentityGeneration)?;
-                                            client.handle(RakClientInput::Connect { remote: addr, local, guid, now })
+                                            client.connect(addr, local, guid, now)
                                         });
                                     match result {
                                         Ok(()) => connect = Some(sender),
@@ -221,16 +248,22 @@ impl RakClient {
                                     }
                                 }
                                 RakClientMsg::Adopt(session, reply) => {
-                                    match client.adopt(*session) {
-                                        Ok(()) => connect = Some(reply),
-                                        Err(e) => {
-                                            let _ = reply.send(Err(e));
+                                    let result = match session {
+                                        CoreRestoredSession::Established(session) => client.adopt(session),
+                                        CoreRestoredSession::Closing(session) => client.adopt(session),
+                                        CoreRestoredSession::Closed(terminal) => {
+                                            let _ = reply.send(Ok(RestoredSession::Closed(terminal)));
+                                            continue;
                                         }
+                                    };
+                                    match result {
+                                        Ok(()) => adopting = Some(reply),
+                                        Err(error) => { let _ = reply.send(Err(error)); }
                                     }
                                 }
                                 RakClientMsg::Stop => {
                                     if let Some(session) = &session_tx {
-                                        let _ = session.try_send(RakSessionInput::Disconnect(now));
+                                        let _ = session.try_send(SessionEvent::Close(now));
                                     }
 
                                     stop_deadline = Some(
@@ -241,7 +274,7 @@ impl RakClient {
                         }
                         _ = &mut timer => {
                             let result = client.handle(RakClientInput::Update(Instant::now().into_std()));
-                            fail_pending_connect(&client, &mut connect, result);
+                            fail_pending_connect(&mut client, &mut connect, result);
                         }
                         _ = async {
                             match stop_deadline {
@@ -264,7 +297,7 @@ impl RakClient {
                                     too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
                                 };
                                 let result = client.handle(input);
-                                fail_pending_connect(&client, &mut connect, result);
+                                fail_pending_connect(&mut client, &mut connect, result);
                             }
                             RakClientOutput::SocketDatagram(buf, addr) => {
                                 let _ = sockets.send_to(&buf, addr).await;
@@ -274,7 +307,9 @@ impl RakClient {
                                     let now = Instant::now().into_std();
 
                                     let input = RakSessionInput::Datagram(buf, now);
-                                    if let Err(TrySendError::Full(_)) = session.try_send(input) {
+                                    if let Err(TrySendError::Full(_)) =
+                                        session.try_send(SessionEvent::Io(input))
+                                    {
                                         debug!("closing the session, its input queue is full");
                                         session_tx = None;
                                     }
@@ -285,24 +320,33 @@ impl RakClient {
                             RakClientOutput::SessionConnected(session) => {
                                 debug!("session connected");
 
-                                let (session, tx) = RakSession::spawn(
-                                    *session,
+                                let (session, tx) = spawn_established(
+                                    session,
                                     dgram_tx.clone(),
                                     disconnect_tx.clone(),
                                 );
 
                                 if stop_deadline.is_some() {
-                                    let _ = tx.try_send(RakSessionInput::Disconnect(
-                                        Instant::now().into_std(),
-                                    ));
+                                    let _ =
+                                        tx.try_send(SessionEvent::Close(Instant::now().into_std()));
                                     session_tx = Some(tx);
                                     continue;
                                 }
 
                                 session_tx = Some(tx);
 
-                                if let Some(sender) = take(&mut connect) {
+                                if let Some(reply) = adopting.take() {
+                                    let _ = reply.send(Ok(RestoredSession::Established(session)));
+                                } else if let Some(sender) = take(&mut connect) {
                                     let _ = sender.send(Ok(session));
+                                }
+                            }
+                            RakClientOutput::SessionClosing(session) => {
+                                let (session, tx) =
+                                    spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
+                                session_tx = Some(tx);
+                                if let Some(reply) = adopting.take() {
+                                    let _ = reply.send(Ok(RestoredSession::Closing(session)));
                                 }
                             }
                             RakClientOutput::Wait(duration) => {
@@ -342,29 +386,26 @@ impl RakClient {
             }
         });
 
-        self.state = RakClientState::Running { handle, msg_tx };
-        Ok(())
+        Ok(RakClient {
+            state: RunningClient {
+                handle: Some(handle),
+                msg_tx,
+            },
+        })
     }
+}
 
-    pub async fn stop(&mut self) {
-        if !matches!(self.state, RakClientState::Running { .. }) {
-            return;
+impl RakClient<RunningClient> {
+    /// Requests graceful stop and consumes the running capability.
+    pub async fn stop(mut self) {
+        let _ = self.state.msg_tx.send(RakClientMsg::Stop);
+        if let Some(handle) = self.state.handle.take() {
+            let _ = handle.await;
         }
-
-        let RakClientState::Running { handle, msg_tx } =
-            std::mem::replace(&mut self.state, RakClientState::Shutdown)
-        else {
-            unreachable!()
-        };
-
-        let _ = msg_tx.send(RakClientMsg::Stop);
-        let _ = handle.await;
     }
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(Box<[u8]>, Duration), RakClientError> {
-        let RakClientState::Running { msg_tx, .. } = &self.state else {
-            return Err(RakClientError::Closed);
-        };
+        let msg_tx = &self.state.msg_tx;
 
         let (tx, rx) = oneshot::channel();
 
@@ -384,25 +425,24 @@ impl RakClient {
         &self,
         snapshot: RakSessionSnapshot,
         elapsed: Duration,
-    ) -> Result<RakSession, RakClientError> {
-        let RakClientState::Running { msg_tx, .. } = &self.state else {
-            return Err(RakClientError::Closed);
-        };
+    ) -> Result<RestoredSession, RakClientError> {
+        let msg_tx = &self.state.msg_tx;
 
-        let session = RakSessionIntl::restore(snapshot, Instant::now().into_std(), elapsed)?;
+        let session = snapshot.restore(Instant::now().into_std(), elapsed)?;
         let (tx, rx) = oneshot::channel();
 
         msg_tx
-            .send(RakClientMsg::Adopt(Box::new(session), tx))
+            .send(RakClientMsg::Adopt(session, tx))
             .map_err(|_| RakClientError::Closed)?;
 
         rx.await.map_err(|_| RakClientError::Closed)?
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> Result<RakSession, RakClientError> {
-        let RakClientState::Running { msg_tx, .. } = &self.state else {
-            return Err(RakClientError::Closed);
-        };
+    pub async fn connect(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<RakSession<Established>, RakClientError> {
+        let msg_tx = &self.state.msg_tx;
 
         let (tx, rx) = oneshot::channel();
 
@@ -411,209 +451,29 @@ impl RakClient {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A failed socket start retains the original configured client.
+#[derive(thiserror::Error)]
+#[error("client start failed: {cause}")]
+pub struct ClientStartError {
+    client: Box<RakClient<ConfiguredClient>>,
+    #[source]
+    cause: RakServerError,
+}
 
-    #[tokio::test(start_paused = true)]
-    async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
-        let now = Instant::now().into_std();
-        let original = RakSessionIntl::new(
-            RakSessionId(1),
-            "127.0.0.1:19132".parse().unwrap(),
-            7,
-            1492,
-            now,
-            RakClock::new(now - Duration::from_secs(5)),
-            Default::default(),
-        );
-        let snapshot = original.snapshot(now);
-        let (msg_tx, mut msg_rx) = unbounded_channel();
-        let client = RakClient {
-            state: RakClientState::Running {
-                handle: tokio::spawn(async {}),
-                msg_tx,
-            },
-        };
-        let adopting =
-            tokio::spawn(async move { client.adopt(snapshot, Duration::from_millis(100)).await });
-        let message = msg_rx.recv().await.unwrap();
-        tokio::time::advance(Duration::from_secs(3)).await;
-        let RakClientMsg::Adopt(session, reply) = message else {
-            panic!("adoption must deliver a session to the actor");
-        };
-        assert_eq!(
-            session
-                .snapshot(Instant::now().into_std())
-                .captured_uptime_ms,
-            8100
-        );
-        let _ = reply.send(Err(RakClientError::Closed));
-        assert!(matches!(
-            adopting.await.unwrap(),
-            Err(RakClientError::Closed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn failed_ping_identity_reaches_the_reply_without_blocking_the_next_ping() {
-        let origin = Instant::now().into_std();
-        let clock = RakClock::new(origin);
-        let mut core = RakClientIntl::new(RakClientConfig::default(), clock);
-        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, 19132));
-        let now = origin + Duration::from_secs(1);
-        let (sender, reply) = oneshot::channel();
-        assert!(
-            prepare_ping(
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "entropy unavailable"
-                )),
-                remote,
-                now,
-                clock,
-                sender,
-            )
-            .is_none()
-        );
-        let Err(RakClientError::IdentityGeneration(error)) = reply.await.unwrap() else {
-            panic!("the entropy error must reach the ping caller");
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), "entropy unavailable");
-        assert!(
-            core.poll().is_none(),
-            "failed identity must not send anything"
-        );
-
-        let (sender, reply) = oneshot::channel();
-        let (input, ping) =
-            prepare_ping(Ok(ClientGuid::from_raw(7)), remote, now, clock, sender).unwrap();
-        core.handle(input).unwrap();
-        assert!(
-            matches!(core.poll(), Some(RakClientOutput::SocketDatagram(_, peer)) if peer == remote)
-        );
-        ping.sender
-            .send(Ok((Box::from(*b"ok"), Duration::ZERO)))
-            .unwrap();
-        assert_eq!(reply.await.unwrap().unwrap().0.as_ref(), b"ok");
-    }
-
-    async fn fake_server(reply_after: Option<Duration>) -> SocketAddr {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = socket.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 64];
-            loop {
-                let Ok((len, from)) = socket.recv_from(&mut buf).await else {
-                    return;
-                };
-                let Some(delay) = reply_after else {
-                    continue;
-                };
-                if len < 9 {
-                    continue;
-                }
-
-                let mut pong = vec![0x1C];
-                pong.extend_from_slice(&buf[1..9]);
-                pong.extend_from_slice(&[0u8; 8]);
-                pong.extend_from_slice(&constants::MAGIC);
-                pong.extend_from_slice(&2u16.to_be_bytes());
-                pong.extend_from_slice(b"hi");
-
-                sleep(delay).await;
-                let _ = socket.send_to(&pong, from).await;
-            }
-        });
-
-        addr
-    }
-
-    #[tokio::test]
-    async fn ping_latency_is_the_round_trip_time() {
-        let server = fake_server(Some(Duration::from_millis(50))).await;
-        let mut client = RakClient::new(|_| {});
-        client.start().await.unwrap();
-
-        let (message, latency) = client.ping(server).await.unwrap();
-
-        assert_eq!(message.as_ref(), b"hi");
-        assert!(
-            latency >= Duration::from_millis(40) && latency < Duration::from_millis(500),
-            "latency was {latency:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ping_to_a_silent_server_times_out() {
-        let server = fake_server(None).await;
-        let mut client = RakClient::new(|_| {});
-        client.start().await.unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(60), client.ping(server))
-            .await
-            .expect("ping never gave up");
-
-        assert!(
-            matches!(result, Err(RakClientError::Timeout)),
-            "got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn ping() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_line_number(true)
-            .with_test_writer()
-            .compact()
-            .try_init();
-
-        let mut client = RakClient::new(|_| {});
-
-        let _ = client.start().await;
-
-        loop {
-            let pong = client
-                .ping("127.0.0.1:19132".parse().unwrap())
-                .await
-                .unwrap();
-            debug!(
-                "ponged in {}ms with message: {:?}",
-                pong.1.as_millis(),
-                String::from_utf8_lossy(&pong.0)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn connect_over_ipv6_sends_open_connection_request_1() {
-        let Ok(listener) = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await else {
-            return;
-        };
-        let addr = listener.local_addr().unwrap();
-
-        let mut client = RakClient::new(|_| {});
-        client.start().await.unwrap();
-
-        let connect = client.connect(addr);
-        tokio::pin!(connect);
-        let mut buf = [0u8; 2048];
-
-        tokio::select! {
-            _ = &mut connect => panic!("connect resolved without a server"),
-            received = timeout(Duration::from_secs(2), listener.recv_from(&mut buf)) => {
-                let (len, _) = received
-                    .expect("no datagram reached the IPv6 listener")
-                    .unwrap();
-                assert!(len > 0);
-                assert_eq!(buf[0], 0x05);
-            }
-        }
+impl std::fmt::Debug for ClientStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientStartError")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
     }
 }
+
+impl ClientStartError {
+    /// Recovers the configuration and original bind/validation failure.
+    pub fn into_parts(self) -> (RakClient<ConfiguredClient>, RakServerError) {
+        (*self.client, self.cause)
+    }
+}
+
+#[cfg(test)]
+mod tests;

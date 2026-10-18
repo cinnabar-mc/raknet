@@ -1,6 +1,8 @@
 //! Advertise and echo one connected RakNet peer; this is not a Minecraft server.
 
-use raknet_tokio::prelude::{RakPriority, RakReliability, RakServer, RakSessionError};
+use raknet_tokio::prelude::{
+    RakPriority, RakReliability, RakServer, RakSessionError, RunningServer,
+};
 use std::error::Error;
 use std::net::SocketAddr;
 
@@ -13,8 +15,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut server = RakServer::new(address, |config| {
         config.max_connections = 1;
         config.message = b"RakNet echo example".to_vec().into_boxed_slice();
-    });
-    server.start().await?;
+    })
+    .start()
+    .await?;
     println!("Listening on {address}; press Ctrl-C to stop.");
 
     let result = tokio::select! {
@@ -26,7 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Echoes complete messages from the next peer until it closes or a send fails.
-async fn echo_next_peer(server: &mut RakServer) -> Result<(), Box<dyn Error>> {
+async fn echo_next_peer(server: &mut RakServer<RunningServer>) -> Result<(), Box<dyn Error>> {
     let mut session = server.accept().await?;
     loop {
         let packet = match session.recv::<Box<[u8]>>().await {

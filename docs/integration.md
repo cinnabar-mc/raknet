@@ -6,7 +6,8 @@ choose their own socket, task and queue policies.
 
 ## Ownership and time
 
-Import `Sans` to call `handle` and `poll`. An input consumes its owned byte
+Import `Sans` to call `handle` on a started driver or established/closing session.
+Client setup and local close are consuming ownership transitions. An input consumes its owned byte
 buffer. Outputs transfer owned buffers back to the caller; retain them until
 the socket or application consumer accepts them.
 
@@ -29,20 +30,23 @@ until the replacement `Wait` or terminal output has been drained.
 
 ## Client negotiation
 
-1. Build `RakClientConfig` and call `validate()` before opening a socket.
-2. Bind a socket for the intended address family. Construct
-   `RakClient::new(config, clock)`.
-3. Generate a fresh `ClientGuid` for the attempt at the I/O boundary. Feed
-   `RakClientInput::Connect { remote, local, guid, now }`. Supply the actual bound
-   local endpoint; use a route-selected local address when available.
+1. Build `RakClientConfig`, including its local `session` limits. Construct
+   `RakClient::<Configured>::new(config, clock)`; invalid configuration returns
+   an error before any I/O.
+2. Bind a socket for the intended address family and determine its local endpoint.
+3. Generate a fresh `ClientGuid`. Consume the configured owner with
+   `client.connect(remote, local, guid, now)` to obtain `RakClient<Active>`. Supply
+   the route-selected local address when available. A start error returns the
+   configured owner and cause through `into_parts()`.
 4. Drain outputs, receive complete UDP datagrams, and feed
    `RakClientInput::Datagram(bytes, source, now)`. Feed `Update(now)` when the
    scheduled deadline becomes due.
-5. On `SessionConnected(session)`, take ownership of the session and drain its
-   existing outputs immediately. It can already contain application packets or
-   a terminal notification from the handshake's final datagram.
+5. On `SessionConnected(session)`, take ownership of the genuine
+   `RakSession<Established>` and drain its existing outputs immediately. It can
+   already contain application packets or a terminal notification from the
+   handshake's final datagram.
 
-`Connect` canonicalizes IPv4-mapped IPv6 endpoints and rejects mismatched local
+`connect` canonicalizes IPv4-mapped IPv6 endpoints and rejects mismatched local
 and remote address families. `ClientGuid::generate()` can fail if OS entropy is
 unavailable; propagate that failure instead of reusing a previous attempt's
 identity. The core retains one attempt's identity across its own retries.
@@ -51,7 +55,8 @@ identity. The core retains one attempt's identity across its own retries.
 | --- | --- |
 | `MtuProbe { id, datagram, peer }` | Perform one probe write and report its completion as described below. |
 | `SocketDatagram(bytes, peer)` | Send a complete UDP datagram to that endpoint. |
-| `SessionConnected(session)` | Store the owned session and service its pending outputs. |
+| `SessionConnected(session)` | Store the owned Established session and service its pending outputs. |
+| `SessionClosing(session)` | Store a restored Closing session without reopening application sends. |
 | `SessionDatagram(bytes)` | Feed the handed-off session with `RakSessionInput::Datagram(bytes, now)`. |
 | `Wait(duration)` | Replace the attempt's deadline using the generating input time. |
 | `Pong { addr, message, echoed_timestamp, latency }` | Deliver the advertisement and measured latency to the ping owner. |
@@ -59,8 +64,9 @@ identity. The core retains one attempt's identity across its own retries.
 After handoff, you can route datagrams directly to the session. If inbound
 traffic still passes through the `RakClient`, forward its `SessionDatagram`
 outputs to that session. When retiring a session managed through that client,
-drain the session's terminal output and feed `RakClientInput::Disconnect` to
-release the client's route. That input cancels/resets the attempt owner; it does
+drain the session's terminal output and consume the active driver with `reset()`
+to release its route and recover the configured endpoint. Reset preserves the
+probe-ID counter; it does
 not replace closing the handed-off session. Reconnect requires a fresh attempt,
 not just a replacement session in the routing table.
 
@@ -87,7 +93,8 @@ a blanket recovery policy for connected sessions or other socket operations.
 
 ## Server negotiation and routing
 
-Construct `RakServer::new(config, bound_address, clock, now)`. Feed received
+Construct `RakServer::new(config, bound_address, clock, now)?`; its configuration
+includes the local `session` limits. Feed received
 datagrams to `RakServerInput::Datagram(bytes, source, now)` and service periodic
 `Update(now)` inputs for pending handshakes and endpoint housekeeping. The server
 does not emit `Wait`; its integration chooses that update cadence.
@@ -95,7 +102,8 @@ does not emit `Wait`; its integration chooses that update cadence.
 | `RakServerOutput` | Caller action |
 | --- | --- |
 | `SocketDatagram(bytes, peer)` | Send the endpoint's handshake or discovery reply. |
-| `SessionConnected(session)` | Store the session by its server-assigned `RakSessionId`, then drain it. |
+| `SessionConnected(session)` | Store the Established session by its server-assigned `RakSessionId`, then drain it. |
+| `SessionClosing(session)` | Store a trusted restored Closing owner and service its remaining output. |
 | `SessionDatagram(bytes, id)` | Feed the matching session with `Datagram(bytes, now)`. |
 
 After a session's preceding outputs and `Disconnected` have been processed, feed
@@ -104,17 +112,28 @@ releases the server's connection accounting as well as your owned session.
 
 ## Established sessions
 
-Use sessions obtained from negotiation or explicit snapshot adoption. Calling
-`RakSession::new` constructs connected protocol state; it does not perform a
-handshake or validate an arbitrary peer's identity.
+Only negotiation or explicit trusted restoration produces a public session.
+There is no public raw session constructor, mutable identity/state field, phase
+cast or live-owner Clone implementation. `Established` records completed
+establishment/adoption and unconsumed local send permission. It does not guarantee
+that a peer remains reachable between calls.
 
-| `RakSessionInput` | Meaning |
+| Common `RakSessionInput` | Meaning |
 | --- | --- |
 | `Datagram(bytes, now)` | One complete datagram already routed to this peer. |
-| `Send(bytes, reliability, priority, now)` | Submit one complete application message. |
 | `Update(now)` | Advance ACKs, retransmission, liveness and close processing. |
-| `Disconnect(now)` | Start graceful close; refuse new sends and drain retained outbound data within the close deadline. |
-| `DisconnectNow(now)` | Request immediate retirement and emit its final transport outputs. |
+
+| Owned method | Capability and result |
+| --- | --- |
+| `session.send(bytes, reliability, priority, now)` | Available only on Established; submits one complete application message. |
+| `session.close(now)` | Consumes Established and returns Closing, refusing new application sends. |
+| `session.abort(now)` | Consumes either live phase and returns Closing with immediate-retirement output. |
+| `session.tick(now)` | Explicitly flushes existing work when the caller owns the flush cadence. |
+| `session.finish()` | Consumes a terminal, fully drained owner into opaque terminal metadata; otherwise returns the owner unchanged. |
+
+A close error returns the Closing owner and cause through `into_parts()`. It
+never drops pending packet/terminal output or restores send permission. Continue
+servicing the returned owner even when the protocol close operation failed.
 
 | `RakSessionOutput` | Caller action |
 | --- | --- |
@@ -150,16 +169,18 @@ keep timers and unrelated peers serviceable under your scheduler's I/O budget.
 
 ### Shutdown
 
-To close gracefully, feed `Disconnect(now)` and continue servicing socket input,
+To close gracefully, consume Established with `close(now)` and continue servicing socket input,
 outputs and updates until `Disconnected`. Closing may finish after retained data
 is acknowledged or the configured close timeout expires; it is not a guarantee
 that the peer application processed that data. Send any preceding terminal
 datagram before removing the route. Dropping a pure-core session performs no I/O.
 
-The Tokio session's `close().await` acknowledges its close request, not completion
-of the entire wire shutdown. Keep the socket owner running; finish its lifetime
-with `RakClient::stop().await` or `RakServer::stop().await`. Bevy users must keep
-updating until the corresponding disconnected event arrives.
+Tokio `session.close()` consumes Established synchronously and returns Closing
+before any cancellable wait. Drain `recv` through its terminal result, then take
+terminal metadata with `finish()`. A close request is not completion of the wire
+shutdown. Keep the running client/server owner alive; `stop().await` consumes it
+and awaits its stop. Bevy users close an exclusive established capability
+and keep updating until the disconnected event arrives.
 
 ## Many sessions on shared sockets
 
@@ -196,21 +217,27 @@ fixture does not establish concurrent negotiation or large-scale performance.
 
 ## Snapshots and adoption
 
-`session.snapshot(now)` captures serializable protocol state, including retained
-messages and congestion state. Drain pending outputs before capture: those
-outputs are not included. Snapshots are application state, not a stable wire
-format; use matching library revisions at both ends.
+`session.snapshot(now)` returns a checked capture of trusted application state,
+including retained messages and congestion state. It rejects a nonempty output
+queue without consuming the owner, because produced output is not serialized.
+Drain that output before retrying. Tokio capture also rejects a nonempty
+already-delivered application-message channel. Coordinate external pending socket
+writes and the old owner's lifetime separately; capture does not migrate I/O.
 
-Restore with `RakSession::restore(snapshot, destination_now, elapsed)`, where
-`elapsed` is the time since capture supplied by the transfer owner. Saved times
-are portable millisecond offsets; restore rebases them into the destination's
-monotonic clock domain. Invalid addresses and unrepresentable times return
-`RakSessionRestoreError`. Restoring a closing session gives it a fresh close
-timeout.
+Snapshots are application state, not a stable wire format or peer authentication
+proof. Use matching library revisions at both ends. Restore with
+`snapshot.restore(destination_now, elapsed)`, where `elapsed` is the time since
+capture supplied by the transfer owner. Saved times remain millisecond offsets
+rebased into the destination's monotonic clock domain. Invalid addresses,
+unrepresentable times and incomplete handshakes return `RakSessionRestoreError`.
 
-Core `RakClient::adopt` and `RakServer::adopt` take an owned session and emit it
-through the normal `SessionConnected` path. Tokio `adopt` methods take a snapshot
-and transfer elapsed duration. Server adoption assigns a fresh local session ID.
-Adoption neither re-handshakes the peer nor moves its network route. Stop the
-old owner and arrange socket/peer routing so only the new owner advances the
-session; taking a snapshot alone leaves the old owner running.
+The result is `RestoredSession::Established`, `Closing` or `Closed`; a restored
+Closing owner has no send method. Restoring a closing session retains the existing
+fresh close timeout policy. The snapshot fields are opaque and read-only.
+
+Core adoption consumes an already typed Established or Closing session. Tokio
+adoption takes the checked captured value and returns the corresponding typed
+handle or terminal metadata. Server adoption assigns a fresh local ID. Adoption
+neither re-handshakes the peer nor moves its network route. Stop the old owner and
+arrange socket/peer routing so only the new owner advances the session; capture
+alone leaves the old owner running.

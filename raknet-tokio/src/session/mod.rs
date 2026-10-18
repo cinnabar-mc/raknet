@@ -1,10 +1,14 @@
-// Modified by Cinnabar contributors for caller-driven connection negotiation.
-pub mod command;
+//! Typed application handles backed by one private session actor.
 
-use crate::session::command::RakSessionMsg;
-use raknet::prelude::{RakSession as RakSessionIntl, *};
+mod command;
+mod driver;
+
+use command::RakSessionMsg;
+use driver::Driver;
+use raknet::prelude::*;
+use std::fmt;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::sync::oneshot;
@@ -13,129 +17,220 @@ use tracing::debug;
 
 const SESSION_QUEUE_CAPACITY: usize = constants::MAX_RECEIVE_MESSAGES;
 
-pub struct RakSession {
-    pub(crate) msg_tx: UnboundedSender<RakSessionMsg>,
-    pub(crate) buf_rx: Receiver<Box<[u8]>>,
-    pub(crate) addr: SocketAddr,
-    pub(crate) max_message_len: usize,
+pub(crate) enum SessionEvent {
+    Io(RakSessionInput),
+    Close(std::time::Instant),
 }
 
-impl RakSession {
-    pub(crate) fn spawn(
-        session: RakSessionIntl,
-        datagram_tx: UnboundedSender<(Box<[u8]>, SocketAddr)>,
-        disconnect_tx: UnboundedSender<RakSessionId>,
-    ) -> (Self, Sender<RakSessionInput>) {
-        let (msg_tx, msg_rx) = unbounded_channel();
-        let (buf_tx, buf_rx) = channel(SESSION_QUEUE_CAPACITY);
-        let (tx, rx) = channel(SESSION_QUEUE_CAPACITY);
+/// An established or locally closing application handle, never clonable.
+///
+/// ```compile_fail
+/// use raknet_tokio::prelude::*;
+/// fn closed_handle(session: RakSession<Closing>) {
+///     session.send(Box::from([1_u8]), RakReliability::ReliableOrdered, RakPriority::Normal);
+/// }
+/// ```
+pub struct RakSession<S: SessionPhase> {
+    msg_tx: UnboundedSender<RakSessionMsg>,
+    buf_rx: Receiver<Box<[u8]>>,
+    terminal_rx: oneshot::Receiver<ClosedSession>,
+    close_ack: Option<oneshot::Receiver<Result<(), RakSessionError>>>,
+    addr: SocketAddr,
+    max_message_len: usize,
+    phase: PhantomData<S>,
+}
 
-        let addr = session.addr;
-        let id = session.id;
-        let max_message_len = session.max_message_len();
+impl<S: SessionPhase> fmt::Debug for RakSession<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RakSession")
+            .field("peer", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
 
-        tokio::spawn(async move {
-            let mut msg_rx = msg_rx;
-            let mut rx = rx;
-            let mut session = session;
+/// Spawns the established actor only from the core's genuine owned handoff.
+pub(crate) fn spawn_established(
+    session: raknet::prelude::RakSession<Established>,
+    datagrams: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    disconnected: UnboundedSender<RakSessionId>,
+) -> (RakSession<Established>, Sender<SessionEvent>) {
+    let addr = session.addr();
+    let id = session.id();
+    let limit = session.max_message_len();
+    spawn(
+        Driver::established(session),
+        addr,
+        id,
+        limit,
+        datagrams,
+        disconnected,
+    )
+}
 
-            let timer = sleep(Duration::ZERO);
-            tokio::pin!(timer);
+/// Spawns a restored closing actor while withholding all application-send methods.
+pub(crate) fn spawn_closing(
+    session: raknet::prelude::RakSession<Closing>,
+    datagrams: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    disconnected: UnboundedSender<RakSessionId>,
+) -> (RakSession<Closing>, Sender<SessionEvent>) {
+    let addr = session.addr();
+    let id = session.id();
+    let limit = session.max_message_len();
+    spawn(
+        Driver::closing(session),
+        addr,
+        id,
+        limit,
+        datagrams,
+        disconnected,
+    )
+}
 
-            loop {
-                tokio::select! {
-                    Some(msg) = msg_rx.recv() => {
-                        match msg {
-                            RakSessionMsg::Send(buf, reliability, priority, sender) => {
-                                let now = Instant::now().into_std();
-
-                                let res = session.handle(RakSessionInput::Send(buf, reliability, priority, now));
-                                let _ = sender.send(res);
-                            }
-                            RakSessionMsg::Close(sender) => {
-                                let now = Instant::now().into_std();
-
-                                let res = session.handle(RakSessionInput::Disconnect(now));
-                                let _ = sender.send(res);
-                            }
-                            RakSessionMsg::IsClosed(sender) => {
-                                let closed = !matches!(session.get_state(), RakSessionState::Connected);
-                                let _ = sender.send(closed);
-                            },
-                            RakSessionMsg::Snapshot(sender) => {
-                                let _ = sender.send(session.snapshot(Instant::now().into_std()));
-                            },
+/// Keeps all protocol state inside the actor and its typed local phase slot.
+fn spawn<S: SessionPhase>(
+    mut driver: Driver,
+    addr: SocketAddr,
+    id: RakSessionId,
+    max_message_len: usize,
+    datagram_tx: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    disconnect_tx: UnboundedSender<RakSessionId>,
+) -> (RakSession<S>, Sender<SessionEvent>) {
+    let (msg_tx, mut msg_rx) = unbounded_channel();
+    let (buf_tx, buf_rx) = channel(SESSION_QUEUE_CAPACITY);
+    let (tx, mut rx) = channel(SESSION_QUEUE_CAPACITY);
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let timer = sleep(std::time::Duration::ZERO);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                Some(message) = msg_rx.recv() => match message {
+                    RakSessionMsg::Send(bytes, reliability, priority, reply) => {
+                        let _ = reply.send(driver.send(bytes, reliability, priority, Instant::now().into_std()));
+                    }
+                    RakSessionMsg::Close(reply) => {
+                        let _ = reply.send(driver.close(Instant::now().into_std(), false));
+                    }
+                    RakSessionMsg::IsClosed(reply) => {
+                        let _ = reply.send(driver.state() != RakSessionState::Connected);
+                    }
+                    RakSessionMsg::Snapshot(reply) => {
+                        let result = if buf_tx.capacity() != buf_tx.max_capacity() {
+                            Err(RakSessionCaptureError::PendingOutput)
+                        } else {
+                            driver.snapshot(Instant::now().into_std())
+                        };
+                        let _ = reply.send(result);
+                    }
+                },
+                event = rx.recv() => match event {
+                    Some(SessionEvent::Io(input)) => { let _ = driver.handle(input); }
+                    Some(SessionEvent::Close(now)) => { let _ = driver.close(now, false); }
+                    None => { let _ = driver.close(Instant::now().into_std(), true); }
+                },
+                _ = buf_tx.closed() => { let _ = driver.close(Instant::now().into_std(), true); }
+                _ = &mut timer => { let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std())); }
+            }
+            while let Some(output) = driver.poll() {
+                match output {
+                    RakSessionOutput::Wait(after) => timer.as_mut().reset(Instant::now() + after),
+                    RakSessionOutput::Datagram(bytes, peer) => {
+                        let _ = datagram_tx.send((bytes, peer));
+                    }
+                    RakSessionOutput::Packet(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if let Err(TrySendError::Full(_)) = buf_tx.try_send(bytes) {
+                            debug!("closing session with {addr}, its packets are not being read");
+                            let _ = driver.close(Instant::now().into_std(), true);
                         }
                     }
-                    recv = rx.recv() => match recv {
-                        Some(recv) => {
-                            let _ = session.handle(recv);
+                    RakSessionOutput::Disconnected(..) => {
+                        let _ = disconnect_tx.send(id);
+                        if let Some(terminal) = driver.finish() {
+                            let _ = terminal_tx.send(terminal);
                         }
-                        None => {
-                            let _ = session.handle(RakSessionInput::DisconnectNow(Instant::now().into_std()));
-                        }
-                    },
-                    _ = &mut timer => {
-                        let now = Instant::now().into_std();
-
-                        let _ = session.handle(RakSessionInput::Update(now));
-                    }
-                }
-
-                while let Some(out) = session.poll() {
-                    match out {
-                        RakSessionOutput::Wait(when) => timer.as_mut().reset(Instant::now() + when),
-                        RakSessionOutput::Datagram(buf, addr) => {
-                            let _ = datagram_tx.send((buf, addr));
-                        }
-                        RakSessionOutput::Packet(buf) => {
-                            if buf.is_empty() {
-                                continue;
-                            }
-
-                            if let Err(TrySendError::Full(_)) = buf_tx.try_send(buf) {
-                                debug!(
-                                    "closing session with {addr}, its packets are not being read"
-                                );
-                                let _ = session.handle(RakSessionInput::DisconnectNow(
-                                    Instant::now().into_std(),
-                                ));
-                            }
-                        }
-                        RakSessionOutput::Disconnected(..) => {
-                            let _ = disconnect_tx.send(id);
-                            return;
-                        }
+                        return;
                     }
                 }
             }
-        });
+        }
+    });
+    (
+        RakSession {
+            msg_tx,
+            buf_rx,
+            terminal_rx,
+            close_ack: None,
+            addr,
+            max_message_len,
+            phase: PhantomData,
+        },
+        tx,
+    )
+}
 
-        (
-            Self {
-                msg_tx,
-                buf_rx,
-                addr,
-                max_message_len,
-            },
-            tx,
-        )
-    }
-
+impl<S: SessionPhase> RakSession<S> {
+    /// Receives complete messages, retaining the prefix before terminal failure.
     pub async fn recv<T>(&mut self) -> Result<T, RakSessionError>
     where
         Box<[u8]>: Into<T>,
     {
-        self.buf_rx
-            .recv()
-            .await
-            .map(Into::into)
-            .ok_or(RakSessionError::Closed)
+        if let Some(bytes) = self.buf_rx.recv().await {
+            return Ok(bytes.into());
+        }
+        if let Some(ack) = &mut self.close_ack {
+            let result = ack.await.map_err(|_| RakSessionError::Closed)?;
+            self.close_ack = None;
+            result?;
+        }
+        Err(RakSessionError::Closed)
     }
+    /// Observes the actor's current network state.
+    pub async fn is_closed(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.msg_tx.send(RakSessionMsg::IsClosed(tx));
+        rx.await.unwrap_or(true)
+    }
+    /// Returns the negotiated peer address.
+    pub fn get_addr(&self) -> SocketAddr {
+        self.addr
+    }
+    /// Returns the send limit captured from the negotiated core state.
+    pub fn max_message_len(&self) -> usize {
+        self.max_message_len
+    }
+    /// Captures trusted state without stopping its current owner.
+    pub async fn snapshot(&self) -> Result<RakSessionSnapshot, SnapshotError> {
+        if !self.buf_rx.is_empty() {
+            return Err(RakSessionCaptureError::PendingOutput.into());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .send(RakSessionMsg::Snapshot(tx))
+            .map_err(|_| SnapshotError::Session(RakSessionError::Closed))?;
+        Ok(rx
+            .await
+            .map_err(|_| SnapshotError::Session(RakSessionError::Closed))??)
+    }
+    /// Takes terminal metadata once the received-message prefix has been consumed.
+    pub fn finish(mut self) -> Result<ClosedSession, Self> {
+        if !self.buf_rx.is_closed() || !self.buf_rx.is_empty() {
+            return Err(self);
+        }
+        match self.terminal_rx.try_recv() {
+            Ok(terminal) => Ok(terminal),
+            Err(_) => Err(self),
+        }
+    }
+}
 
+impl RakSession<Established> {
+    /// Admits one message; cancellation after admission does not undo the send.
     pub async fn send<T>(
         &self,
-        buf: T,
+        bytes: T,
         reliability: RakReliability,
         priority: RakPriority,
     ) -> Result<(), RakSessionError>
@@ -143,124 +238,65 @@ impl RakSession {
         T: Into<Box<[u8]>>,
     {
         let (tx, rx) = oneshot::channel();
-
         self.msg_tx
-            .send(RakSessionMsg::Send(buf.into(), reliability, priority, tx))
+            .send(RakSessionMsg::Send(bytes.into(), reliability, priority, tx))
             .map_err(|_| RakSessionError::Closed)?;
         rx.await.map_err(|_| RakSessionError::Closed)?
     }
-
-    pub async fn close(&self) -> Result<(), RakSessionError> {
+    /// Synchronously consumes send permission before any cancellable close wait.
+    pub fn close(self) -> Result<RakSession<Closing>, SessionCloseError> {
         let (tx, rx) = oneshot::channel();
-
-        self.msg_tx
-            .send(RakSessionMsg::Close(tx))
-            .map_err(|_| RakSessionError::Closed)?;
-        rx.await.map_err(|_| RakSessionError::Closed)?
+        let closing = RakSession {
+            msg_tx: self.msg_tx,
+            buf_rx: self.buf_rx,
+            terminal_rx: self.terminal_rx,
+            close_ack: Some(rx),
+            addr: self.addr,
+            max_message_len: self.max_message_len,
+            phase: PhantomData,
+        };
+        match closing.msg_tx.send(RakSessionMsg::Close(tx)) {
+            Ok(()) => Ok(closing),
+            Err(_) => Err(SessionCloseError {
+                session: closing,
+                cause: RakSessionError::Closed,
+            }),
+        }
     }
+}
 
-    pub async fn is_closed(&self) -> bool {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.msg_tx.send(RakSessionMsg::IsClosed(tx));
-        rx.await.unwrap_or(true)
-    }
+/// A rejected close command retains the locally closing handle and receive FIFO.
+#[derive(Debug, thiserror::Error)]
+#[error("session close failed: {cause}")]
+pub struct SessionCloseError {
+    session: RakSession<Closing>,
+    #[source]
+    cause: RakSessionError,
+}
 
-    pub fn get_addr(&self) -> SocketAddr {
-        self.addr
+impl SessionCloseError {
+    /// Recovers the closing owner and original command error.
+    pub fn into_parts(self) -> (RakSession<Closing>, RakSessionError) {
+        (self.session, self.cause)
     }
+}
 
-    pub fn max_message_len(&self) -> usize {
-        self.max_message_len
-    }
+/// A capture failure leaves both the live task and already-produced messages owned.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    #[error(transparent)]
+    Session(#[from] RakSessionError),
+    #[error(transparent)]
+    Capture(#[from] RakSessionCaptureError),
+}
 
-    /// Captures this session's protocol state for [`crate::server::RakServer::adopt`].
-    ///
-    /// The live task keeps running - shutting it down once the target has taken over is
-    /// the caller's job, or the two copies diverge.
-    pub async fn snapshot(&self) -> Result<RakSessionSnapshot, RakSessionError> {
-        let (tx, rx) = oneshot::channel();
-        self.msg_tx
-            .send(RakSessionMsg::Snapshot(tx))
-            .map_err(|_| RakSessionError::Closed)?;
-        rx.await.map_err(|_| RakSessionError::Closed)
-    }
+/// Restored application handles retain the snapshot's saved local phase.
+#[derive(Debug)]
+pub enum RestoredSession {
+    Established(RakSession<Established>),
+    Closing(RakSession<Closing>),
+    Closed(ClosedSession),
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn max_message_len_comes_from_the_session_config() {
-        let now = Instant::now().into_std();
-        let session = RakSessionIntl::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            1492,
-            now,
-            RakClock::new(now),
-            RakSessionConfig {
-                max_queued_bytes: 1 << 20,
-                ..Default::default()
-            },
-        );
-        let (datagram_tx, _datagram_rx) = unbounded_channel();
-        let (disconnect_tx, _disconnect_rx) = unbounded_channel();
-        let expected = session.max_message_len();
-
-        let (session, _input_tx) = RakSession::spawn(session, datagram_tx, disconnect_tx);
-
-        assert_eq!(session.max_message_len(), expected);
-    }
-
-    #[tokio::test]
-    async fn a_session_whose_packets_are_never_read_is_closed() {
-        let now = Instant::now().into_std();
-        let local = RakSessionIntl::new(
-            RakSessionId(7),
-            "127.0.0.1:1".parse().unwrap(),
-            0,
-            1492,
-            now,
-            RakClock::new(now),
-            Default::default(),
-        );
-        let mut peer = RakSessionIntl::new(
-            RakSessionId(8),
-            "127.0.0.1:2".parse().unwrap(),
-            1,
-            1492,
-            now,
-            RakClock::new(now),
-            Default::default(),
-        );
-        let (datagram_tx, _datagram_rx) = unbounded_channel();
-        let (disconnect_tx, mut disconnect_rx) = unbounded_channel();
-        let (_session, input_tx) = RakSession::spawn(local, datagram_tx, disconnect_tx);
-
-        let now = Instant::now().into_std();
-        for _ in 0..SESSION_QUEUE_CAPACITY + 64 {
-            peer.handle(RakSessionInput::Send(
-                Box::new([0xFE, 1]),
-                RakReliability::Unreliable,
-                RakPriority::Immediate,
-                now,
-            ))
-            .unwrap();
-            while let Some(out) = peer.poll() {
-                if let RakSessionOutput::Datagram(buf, _) = out
-                    && input_tx
-                        .send(RakSessionInput::Datagram(buf, now))
-                        .await
-                        .is_err()
-                {
-                    break;
-                }
-            }
-        }
-
-        let closed = tokio::time::timeout(Duration::from_secs(5), disconnect_rx.recv()).await;
-        assert!(matches!(closed, Ok(Some(RakSessionId(7)))));
-    }
-}
+mod tests;

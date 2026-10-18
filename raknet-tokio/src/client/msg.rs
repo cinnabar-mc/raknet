@@ -1,17 +1,17 @@
 use crate::session::RakSession;
-use raknet::prelude::{RakClientError, RakSession as RakSessionIntl};
+use raknet::prelude::{Established, RakClientError, RestoredSession};
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
 
 pub enum RakClientMsg {
     Connect(
         SocketAddr,
-        oneshot::Sender<Result<RakSession, RakClientError>>,
+        oneshot::Sender<Result<RakSession<Established>, RakClientError>>,
     ),
     Ping(SocketAddr, oneshot::Sender<super::PingResult>),
     Adopt(
-        Box<RakSessionIntl>,
-        oneshot::Sender<Result<RakSession, RakClientError>>,
+        RestoredSession,
+        oneshot::Sender<Result<crate::session::RestoredSession, RakClientError>>,
     ),
     Stop,
 }

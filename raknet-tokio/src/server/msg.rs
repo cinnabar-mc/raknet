@@ -1,5 +1,5 @@
-use crate::session::RakSession;
-use raknet::prelude::RakSession as RakSessionIntl;
+use crate::session::RestoredSession;
+use raknet::prelude::RestoredSession as CoreRestoredSession;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -10,5 +10,8 @@ pub enum RakServerMsg {
     Block(IpAddr, Duration),
     Unblock(IpAddr),
     Stop,
-    Adopt(Box<RakSessionIntl>, oneshot::Sender<RakSession>),
+    Adopt(
+        CoreRestoredSession,
+        oneshot::Sender<Result<RestoredSession, super::error::RakServerError>>,
+    ),
 }

@@ -66,7 +66,11 @@ fn capture_preserves_consumed_permission_before_peer_state_changes() {
     let now = crate::clock::test_now();
     // A fallible immediate-retirement operation can retain Connected peer state.
     let closing = RakSession::<Closing>::from_engine(Box::new(engine(now, 1)));
-    let restored = closing.snapshot(now).unwrap().restore(now, Duration::ZERO).unwrap();
+    let restored = closing
+        .snapshot(now)
+        .unwrap()
+        .restore(now, Duration::ZERO)
+        .unwrap();
     assert!(matches!(restored, RestoredSession::Closing(_)));
 }
 

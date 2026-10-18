@@ -10,8 +10,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:19132".to_owned())
         .parse()?;
-    let mut client = RakClient::new(|_| {});
-    client.start().await?;
+    let client = RakClient::new(|_| {}).start().await?;
 
     let reply = client.ping(address).await;
     client.stop().await;

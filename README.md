@@ -72,24 +72,27 @@ cargo run --locked -p raknet-tokio --example ping -- 127.0.0.1:19132
   See the [integration guide](docs/integration.md#many-sessions-on-shared-sockets)
   for its routing and ownership constraints.
 
-For a connected Tokio client, the sequence is `RakClient::new`, `start().await`,
-`connect(remote).await`, then the returned session's `send` and `recv`. Keep the
+For a connected Tokio client, `RakClient::new(...).start().await` consumes the
+configuration and returns `RakClient<RunningClient>`. Call `connect(remote).await`
+on that owner, then use the returned `RakSession<Established>`'s `send` and `recv`. Keep the
 client owner running while using its session. `recv::<Box<[u8]>>()` returns one
 complete application message. A successful `send` is not a remote delivery
-receipt. Request graceful session shutdown with `close().await` and finish the
-socket owner's lifetime with `client.stop().await` or `server.stop().await`.
+receipt. `session.close()` synchronously consumes send permission and returns a
+`RakSession<Closing>` that can drain the received prefix. Keep the socket owner
+running until terminal completion; `client.stop().await` or `server.stop().await`
+consumes that running owner and awaits its shutdown.
 
 ## Drive the core yourself
 
-All three core engines implement `Sans`: feed typed input with `handle`, then
-drain typed output with `poll`. None opens a socket or reads the clock to advance
-the protocol.
+Started core drivers implement `Sans`: feed typed I/O with `handle`, then drain
+output with `poll`. Setup, start and close use consuming methods. None opens a
+socket or reads the clock to advance the protocol.
 
 | Engine | Feed | Handle its output |
 | --- | --- | --- |
-| `RakClient` | Ping/connect requests, datagrams with their source address, timer updates and MTU write completions. | Send probes/datagrams, schedule a wake, receive a pong or take ownership of a negotiated session. |
+| `RakClient<Active>` | Datagrams with their source address, timer updates and MTU write completions. | Send probes/datagrams, schedule a wake or take ownership of a negotiated session. |
 | `RakServer` | Received datagrams, periodic updates and endpoint configuration. | Send replies, route connected datagrams by session ID or take ownership of a new session. |
-| `RakSession` | Routed datagrams, application sends, timer updates and close requests. | Send datagrams, deliver complete application packets, schedule a wake or retire a disconnected session. |
+| `RakSession<Established>` / `RakSession<Closing>` | Routed datagrams and timer updates. Only Established has `send`; consuming `close` returns Closing. | Send datagrams, deliver complete application packets, schedule a wake or retire a disconnected session. |
 
 Create one `RakClock` from your endpoint's start time, and supply monotonic
 `Instant` values from that clock domain to subsequent inputs. A `Wait` is a
@@ -103,14 +106,21 @@ These details are essential when building a frame-driven or shared-socket
 adapter. The [integration guide](docs/integration.md) covers negotiation,
 demultiplexing, deadlines, shutdown and snapshots.
 
+The core starts with `RakClient<Configured>`. Its consuming `connect(...)` returns
+`RakClient<Active>`; only a genuine `SessionConnected` handoff grants an
+established session. Live owners cannot be cloned or built from raw session
+metadata. Peer disconnection remains a runtime result. See the
+[integration guide](docs/integration.md) for the complete lifecycle.
+
 ## Delivery and capacity
 
 Use `ReliableOrdered` for ordered reliable application traffic. Prefer queued
 priorities (`High`, `Normal`, `Low`) for sustained sends: `Immediate` bypasses
 congestion and receive-window scheduling.
 
-The core exposes `RakSessionConfig`, `max_message_len()` and `outbound_bytes()`
-for configuring and observing its bounds. Oversized messages return
+Set local limits through the client or server configuration's `session` field.
+`RakSessionConfig`, `max_message_len()` and `outbound_bytes()` configure and
+observe those bounds. Oversized messages return
 `RakSessionError::MessageSizeExceeded`; exceeding the outbound byte budget
 disconnects the session with `OutboundBytesExceeded`. Always inspect terminal
 outputs as well as the return value of `handle`.
@@ -129,8 +139,14 @@ constructors bind nonblocking sockets and return `std::io::Result`.
 
 The plugins update their resources in `PreUpdate` and emit `RakClientEvent` or
 `RakServerEvent` messages. Order same-schedule consumers after `RakClientSet` or
-`RakServerSet`; drain packets through the resource's `recv` method. A disconnect
-request needs continued updates until the disconnected event arrives.
+`RakServerSet`; drain packets through the resource's `recv` method.
+
+Start a client attempt through `client.idle()`'s consuming `connect(peer)`
+capability. Application sends require an exclusive established capability from
+`client.connected()` or `server.connected(id)`. Calling its consuming `close()`
+returns a closing capability without `send`; continue plugin updates until the
+disconnected event arrives. Neither resource exposes unrestricted application
+sends or mutable protocol state.
 
 The current Bevy client resource owns one IPv4 socket and one connection. For
 many clients, explicit IPv6 policy or stricter I/O backpressure, use the core
