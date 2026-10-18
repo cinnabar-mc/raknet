@@ -187,7 +187,6 @@ impl RakClient<ConfiguredClient> {
         let (msg_tx, msg_rx) = unbounded_channel();
 
         let handle = tokio::spawn({
-            let config = config;
             let sockets = sockets;
             let mut msg_rx = msg_rx;
 
