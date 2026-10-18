@@ -144,7 +144,11 @@ fn reply_2(addr: SocketAddr, mtu: u16) -> Box<[u8]> {
 fn reply_2_above_the_maximum_mtu_is_clamped() {
     let mut client = RakClient::new(RakClientConfig::default());
     let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    client.state = RakClientState::Handshake2(addr);
+    let now = domain_time();
+    client.handle(RakClientInput::Connect(addr, now)).unwrap();
+    client
+        .handle(RakClientInput::Datagram(reply_1(1200), addr, now))
+        .unwrap();
 
     client
         .handle(RakClientInput::Datagram(

@@ -296,6 +296,18 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
     client
         .handle(RakClientInput::MtuProbeResult {
             id: old,
+            now: first,
+            elapsed: Duration::ZERO,
+            too_large: false,
+        })
+        .unwrap();
+    assert!(
+        client.poll().is_none(),
+        "stale completion emitted a new timer"
+    );
+    client
+        .handle(RakClientInput::MtuProbeResult {
+            id: old,
             now: start,
             elapsed: Duration::from_millis(101),
             too_large: true,
@@ -351,6 +363,52 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
                 bytes[0] != packet_id::OPEN_CONNECTION_REQUEST_2,
             _ => true,
         })
+    );
+}
+
+#[test]
+fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake() {
+    let (mut client, start) = begin(constants::MAX_MTU_SIZE);
+    for tick in 1..=12 {
+        let now = start + Duration::from_millis(tick * 500);
+        client.handle(RakClientInput::Update(now)).unwrap();
+        collect(&mut client, now);
+    }
+    let late = start + Duration::from_millis(6100);
+    client
+        .handle(RakClientInput::Datagram(
+            OpenConnectionReply1 {
+                guid: 1,
+                cookie: None,
+                mtu: 1200,
+            }
+            .serialized()
+            .unwrap(),
+            PEER,
+            late,
+        ))
+        .unwrap();
+    let outputs: Vec<_> = std::iter::from_fn(|| client.poll()).collect();
+    assert!(
+        outputs.iter().any(|output| matches!(output,
+            RakClientOutput::Wait(wait) if *wait <= Duration::from_millis(500)
+        )),
+        "a late grant left its Request 2 retry asleep"
+    );
+    client
+        .handle(RakClientInput::Datagram(
+            OpenConnectionReply2::new(1, PEER, 1200, false)
+                .serialized()
+                .unwrap(),
+            PEER,
+            late,
+        ))
+        .unwrap();
+    assert!(
+        std::iter::from_fn(|| client.poll()).any(|output| matches!(output,
+            RakClientOutput::Wait(wait) if wait < Duration::from_secs(1)
+        )),
+        "the connected handshake needs its own timer wake"
     );
 }
 

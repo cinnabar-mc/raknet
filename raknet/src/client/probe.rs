@@ -71,16 +71,16 @@ impl MtuProbes {
         Some(self.sizes[rung])
     }
 
-    /// Uses measured write time for rung transitions and pre-preparation time for normal pacing.
+    /// Applies a matching write result; returns false without changing state for stale IDs.
     pub(super) fn completed(
         &mut self,
         id: MtuProbeId,
         now: SystemTime,
         elapsed: Duration,
         too_large: bool,
-    ) -> Result<(), RakClientError> {
+    ) -> Result<bool, RakClientError> {
         if self.pending.as_ref().is_none_or(|pending| pending.id != id) {
-            return Ok(());
+            return Ok(false);
         }
         let pending = self.pending.take().expect("the completion token matched");
         let urgent = if too_large {
@@ -105,7 +105,7 @@ impl MtuProbes {
                 deadline(pending.started, self.interval)?.max(yield_at)
             });
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the next retry deadline, excluding a write already owned by the adapter.

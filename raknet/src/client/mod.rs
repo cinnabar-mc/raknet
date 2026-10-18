@@ -69,10 +69,11 @@ impl Sans for RakClient {
                 too_large,
             } => {
                 if let Some(probes) = self.probes.as_mut() {
-                    if let Err(error) = probes.completed(id, now, elapsed, too_large) {
-                        return Err(self.abort(error));
+                    match probes.completed(id, now, elapsed, too_large) {
+                        Ok(false) => return Ok(()),
+                        Ok(true) => self.handle_timeout(now)?,
+                        Err(error) => return Err(self.abort(error)),
                     }
-                    self.handle_timeout(now)?;
                 }
             }
             RakClientInput::Ping(addr, now) => {
@@ -411,7 +412,7 @@ impl RakClient {
         self.state = RakClientState::Handshake2(peer);
         self.send_open_connection_request_2(peer, self.mtu, self.cookie)?;
         self.request_two_at = Some(deadline(now, self.config.conn_attempt_interval)?);
-        Ok(())
+        self.drive(now)
     }
 
     /// Encodes the advertised grant or protection challenge without using it as a payload capacity.
@@ -488,7 +489,7 @@ impl RakClient {
 
         self.session = Some(session);
 
-        Ok(())
+        self.drive(now)
     }
 
     /// Takes over a session from another client, continuing its protocol state rather
