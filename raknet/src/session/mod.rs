@@ -267,7 +267,10 @@ impl SessionEngine {
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        if now >= self.last_recv + SESSION_TIMEOUT {
+        if now
+            .checked_duration_since(self.last_recv)
+            .is_some_and(|elapsed| elapsed >= SESSION_TIMEOUT)
+        {
             debug!(
                 "detected stale connection from {}, disconnecting...",
                 self.addr
@@ -285,27 +288,36 @@ impl SessionEngine {
             return self.update_closing(now);
         }
 
-        if self.config.autoflush && now >= self.last_tick + self.config.autoflush_interval_ms {
+        if self.config.autoflush
+            && now
+                .checked_duration_since(self.last_tick)
+                .is_some_and(|elapsed| elapsed >= self.config.autoflush_interval_ms)
+        {
             self.tick(now)?;
 
             self.last_tick = now;
         }
 
-        if now >= self.last_ping + Duration::from_millis(2000) {
+        let ping_interval = Duration::from_millis(2000);
+        if now
+            .checked_duration_since(self.last_ping)
+            .is_some_and(|elapsed| elapsed >= ping_interval)
+        {
             self.send_connected_ping(now, RakReliability::Unreliable)?;
 
             self.last_ping = now;
         }
 
-        let mut next = min(
-            self.last_ping + Duration::from_millis(2000),
-            self.last_recv + SESSION_TIMEOUT,
+        let mut duration = min(
+            remaining(self.last_ping, ping_interval, now),
+            remaining(self.last_recv, SESSION_TIMEOUT, now),
         );
         if self.config.autoflush {
-            next = min(next, self.last_tick + self.config.autoflush_interval_ms);
+            duration = min(
+                duration,
+                remaining(self.last_tick, self.config.autoflush_interval_ms, now),
+            );
         }
-
-        let duration = next.saturating_duration_since(now);
 
         self.output.push_back(RakSessionOutput::Wait(duration));
         Ok(())
@@ -326,7 +338,7 @@ impl SessionEngine {
         }
 
         self.output
-            .push_back(RakSessionOutput::Wait(self.config.autoflush_interval_ms));
+            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
         Ok(())
     }
 
@@ -337,23 +349,37 @@ impl SessionEngine {
     }
 
     fn update_closing(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        let deadline = self.closing_since.unwrap_or(now) + self.config.close_timeout;
+        let since = self.closing_since.unwrap_or(now);
 
         self.tick(now)?;
         self.last_tick = now;
 
-        if self.nothing_left_to_send() || now >= deadline {
+        if self.nothing_left_to_send()
+            || now
+                .checked_duration_since(since)
+                .is_some_and(|elapsed| elapsed >= self.config.close_timeout)
+        {
             return self.disconnect(true, RakDisconnectReason::Requested, now);
         }
 
-        let next = min(
-            min(deadline, self.last_recv + SESSION_TIMEOUT),
-            now + self.config.autoflush_interval_ms,
-        );
-        let duration = next.saturating_duration_since(now);
-
-        self.output.push_back(RakSessionOutput::Wait(duration));
+        self.output
+            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
         Ok(())
+    }
+
+    /// Bounds both the first close wait and later updates by the original session policy.
+    fn closing_wait(&self, now: Instant) -> Duration {
+        min(
+            min(
+                remaining(
+                    self.closing_since.unwrap_or(now),
+                    self.config.close_timeout,
+                    now,
+                ),
+                remaining(self.last_recv, SESSION_TIMEOUT, now),
+            ),
+            self.config.autoflush_interval_ms,
+        )
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<(), RakSessionError> {
@@ -892,6 +918,14 @@ impl SessionEngine {
             .push_back(RakSessionOutput::Disconnected(self.id, reason));
 
         Ok(())
+    }
+}
+
+/// Computes a relative wait without making a future caller timestamp prematurely due.
+fn remaining(since: Instant, interval: Duration, now: Instant) -> Duration {
+    match now.checked_duration_since(since) {
+        Some(elapsed) => interval.saturating_sub(elapsed),
+        None => interval.saturating_add(since.duration_since(now)),
     }
 }
 
