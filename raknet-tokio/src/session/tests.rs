@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn max_message_len_comes_from_the_session_config() {
