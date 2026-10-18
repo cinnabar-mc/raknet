@@ -284,18 +284,7 @@ impl RakSession {
         }
 
         if now >= self.last_ping + Duration::from_millis(2000) {
-            let ping = ConnectedPing {
-                timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
-            };
-
-            let reliability = RakReliability::Unreliable;
-            let priority = RakPriority::Immediate;
-            self.handle(RakSessionInput::Send(
-                ping.serialized()?,
-                reliability,
-                priority,
-                now,
-            ))?;
+            self.send_connected_ping(now, RakReliability::Unreliable)?;
 
             self.last_ping = now;
         }
@@ -728,18 +717,72 @@ impl RakSession {
     }
 
     fn handle_packet(&mut self, buf: Box<[u8]>, now: SystemTime) -> Result<(), RakSessionError> {
-        let Some(&b) = buf.first() else {
+        if buf.is_empty() {
             return Ok(());
-        };
+        }
+        if self.state != RakSessionState::Connecting && self.try_handle_control(&buf, now)? {
+            return Ok(());
+        }
+        self.output.push_back(RakSessionOutput::Packet(buf));
+        Ok(())
+    }
 
-        let mut cursor = Cursor::new(buf.as_ref());
-        match b {
+    /// Handles common connection controls, returning false for an application or role-specific packet.
+    ///
+    /// The connecting client calls this in output order so acceptance and peer close
+    /// remain ordered with application packets from the same datagram.
+    pub(crate) fn try_handle_control(
+        &mut self,
+        buf: &[u8],
+        now: SystemTime,
+    ) -> Result<bool, RakSessionError> {
+        let Some(&id) = buf.first() else {
+            return Ok(false);
+        };
+        let mut cursor = Cursor::new(buf);
+        match id {
             packet_id::CONNECTED_PING => self.handle_connected_ping(&mut cursor, now)?,
             packet_id::CONNECTED_PONG => self.handle_connected_pong(&mut cursor, now)?,
+            packet_id::DETECT_LOST_CONNECTIONS if self.state == RakSessionState::Closing => {}
+            packet_id::DETECT_LOST_CONNECTIONS => {
+                self.send_connected_ping(now, RakReliability::ReliableOrdered)?
+            }
             packet_id::DISCONNECT => self.handle_disconnect(&mut cursor, now)?,
-            _ => self.output.push_back(RakSessionOutput::Packet(buf)),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Emits a liveness ping using the caller's time and selected control reliability.
+    fn send_connected_ping(
+        &mut self,
+        now: SystemTime,
+        reliability: RakReliability,
+    ) -> Result<(), RakSessionError> {
+        let ping = ConnectedPing {
+            timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
         };
-        Ok(())
+        self.handle(RakSessionInput::Send(
+            ping.serialized()?,
+            reliability,
+            RakPriority::Immediate,
+            now,
+        ))
+    }
+
+    /// Restores the completed handshake prefix before an optional terminal notification.
+    pub(crate) fn restore_handshake_outputs(
+        &mut self,
+        packets: VecDeque<Box<[u8]>>,
+        terminal: Option<(RakSessionId, RakDisconnectReason)>,
+    ) {
+        for packet in packets {
+            self.output.push_back(RakSessionOutput::Packet(packet));
+        }
+        if let Some((id, reason)) = terminal {
+            self.output
+                .push_back(RakSessionOutput::Disconnected(id, reason));
+        }
     }
 
     fn handle_connected_ping(

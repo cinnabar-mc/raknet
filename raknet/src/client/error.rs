@@ -16,6 +16,9 @@ pub enum RakClientError {
     SystemTimeError(#[from] SystemTimeError),
     #[error("Security Unsupported")]
     SecurityUnsupported,
+    /// Complete early application packets exceeded the configured handshake FIFO.
+    #[error("Handshake receive buffer exceeded")]
+    HandshakeReceiveBufferExceeded,
     #[error("Connection Failed")]
     ConnectionFailed,
     #[error("Connection Attempt Failed")]

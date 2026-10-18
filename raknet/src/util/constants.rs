@@ -32,6 +32,9 @@ pub const AUTOFLUSH_INTERVAL_MS: i32 = 10;
 pub const CC_MAX_THRESHOLD: i32 = 2000;
 pub const CC_ADDITIONAL_VARIANCE: i32 = 30;
 
+/// Default complete-message capacity for a packet consumer.
+pub const MAX_RECEIVE_MESSAGES: usize = 4096;
+
 pub const MAX_QUEUED_BYTES: i32 = 67_108_864;
 
 pub const MAGIC: [u8; 16] = [

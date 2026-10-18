@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep};
 use tracing::debug;
 
-const SESSION_QUEUE_CAPACITY: usize = 4096;
+const SESSION_QUEUE_CAPACITY: usize = constants::MAX_RECEIVE_MESSAGES;
 
 pub struct RakSession {
     pub(crate) msg_tx: UnboundedSender<RakSessionMsg>,

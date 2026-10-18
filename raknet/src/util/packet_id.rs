@@ -1,6 +1,8 @@
+// Modified by Cinnabar contributors for connected liveness controls.
 pub const CONNECTED_PING: u8 = 0x00;
 pub const UNCONNECTED_PING: u8 = 0x01;
 pub const CONNECTED_PONG: u8 = 0x03;
+pub const DETECT_LOST_CONNECTIONS: u8 = 0x04;
 pub const OPEN_CONNECTION_REQUEST_1: u8 = 0x05;
 pub const OPEN_CONNECTION_REPLY_1: u8 = 0x06;
 pub const OPEN_CONNECTION_REQUEST_2: u8 = 0x07;

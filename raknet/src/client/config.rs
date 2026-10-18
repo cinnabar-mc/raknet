@@ -11,6 +11,10 @@ pub struct RakClientConfig {
     pub protocol: u8,
     pub min_mtu_size: u16,
     pub max_mtu_size: u16,
+    /// Maximum complete application bytes retained before session handoff.
+    pub max_handshake_bytes: usize,
+    /// Maximum complete application messages retained before session handoff.
+    pub max_handshake_messages: usize,
     pub conn_attempt_timeout: Duration,
     pub conn_attempt_interval: Duration,
     /// Maximum ordinary Request 1 probes; Request 2 retries are bounded by the overall timeout.
@@ -24,6 +28,11 @@ impl RakClientConfig {
             || self.max_mtu_size > constants::MAX_MTU_SIZE
         {
             return Err(RakClientError::InvalidMtu(self.max_mtu_size));
+        }
+        if self.max_handshake_bytes == 0 || self.max_handshake_messages == 0 {
+            return Err(RakClientError::InvalidConfig(
+                "handshake receive bounds must be positive",
+            ));
         }
         if self.conn_attempt_interval.is_zero() || self.conn_attempt_max == 0 {
             return Err(RakClientError::InvalidConfig(
@@ -42,6 +51,9 @@ impl Default for RakClientConfig {
             max_mtu_size: constants::MAX_MTU_SIZE,
             protocol: constants::PROTOCOL,
             guid: random::<u64>() | (1 << 63),
+            max_handshake_bytes: usize::try_from(constants::MAX_QUEUED_BYTES)
+                .expect("default queued byte bound is positive"),
+            max_handshake_messages: constants::MAX_RECEIVE_MESSAGES,
             conn_attempt_timeout: constants::CONNECTION_ATTEMPT_TIMEOUT,
             conn_attempt_interval: constants::CONNECTION_ATTEMPT_INTERVAL,
             conn_attempt_max: constants::CONNECTION_ATTEMPT_MAX,

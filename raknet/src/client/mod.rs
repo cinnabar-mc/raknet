@@ -3,9 +3,11 @@ pub mod config;
 pub mod error;
 pub mod input;
 pub mod output;
+mod pending;
 mod probe;
 pub mod state;
 
+use pending::PendingPackets;
 pub use probe::MtuProbeId;
 use probe::{MtuProbes, deadline};
 
@@ -49,6 +51,7 @@ pub struct RakClient {
     mtu: u16,
     cookie: Option<i32>,
     session: Option<RakSession>,
+    pending_packets: PendingPackets,
 
     connect_deadline: Option<SystemTime>,
 
@@ -119,10 +122,17 @@ impl Sans for RakClient {
                     }
 
                     let mut success: Option<bool> = None;
-                    let mut session_closed = false;
+                    let mut terminal = None;
+                    let mut terminal_seen = false;
                     match self.session.as_mut() {
                         Some(session) => {
-                            session.handle(RakSessionInput::Datagram(buf, now))?;
+                            if let Err(error) = session.handle(RakSessionInput::Datagram(buf, now))
+                            {
+                                return Err(self.abort(error.into()));
+                            }
+                            if session.get_state() == RakSessionState::Disconnected {
+                                return Err(self.abort(RakClientError::ConnectionFailed));
+                            }
 
                             while let Some(msg) = session.poll() {
                                 match msg {
@@ -130,17 +140,37 @@ impl Sans for RakClient {
                                         .output
                                         .push_back(RakClientOutput::SocketDatagram(buf, addr)),
                                     RakSessionOutput::Packet(buf) => {
+                                        if terminal_seen {
+                                            continue;
+                                        }
+                                        match session.try_handle_control(&buf, now) {
+                                            Ok(true) => {
+                                                terminal_seen = session.get_state()
+                                                    == RakSessionState::Disconnected;
+                                                continue;
+                                            }
+                                            Ok(false) => {}
+                                            Err(error) => return Err(self.abort(error.into())),
+                                        }
                                         if let Some(&b) = buf.first() {
                                             let mut cursor = Cursor::new(buf.as_ref());
                                             match b {
-                                                packet_id::CONNECTION_REQUEST_ACCEPTED => {
-                                                    Self::handle_connection_request_accepted(
-                                                        session,
-                                                        remote,
-                                                        local,
-                                                        &mut cursor,
-                                                        now,
-                                                    )?;
+                                                packet_id::CONNECTION_REQUEST
+                                                | packet_id::NEW_INCOMING_CONNECTION => {}
+                                                packet_id::CONNECTION_REQUEST_ACCEPTED
+                                                    if success.is_none() =>
+                                                {
+                                                    if let Err(error) =
+                                                        Self::handle_connection_request_accepted(
+                                                            session,
+                                                            remote,
+                                                            local,
+                                                            &mut cursor,
+                                                            now,
+                                                        )
+                                                    {
+                                                        return Err(self.abort(error));
+                                                    }
                                                     success = Some(true);
                                                 }
                                                 packet_id::CONNECTION_ATTEMPT_FAILED => {
@@ -148,17 +178,23 @@ impl Sans for RakClient {
                                                         RakSessionInput::DisconnectNow(now),
                                                     )?;
                                                     success = Some(false);
+                                                    terminal_seen = true;
                                                 }
+                                                packet_id::CONNECTION_REQUEST_ACCEPTED => {}
                                                 _ => {
-                                                    debug!(
-                                                        "unexpected packet {:02X} received from {} during connection phase",
-                                                        b, addr
-                                                    );
+                                                    if let Err(error) =
+                                                        self.pending_packets.push(buf, &self.config)
+                                                    {
+                                                        return Err(self.abort(error));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                    RakSessionOutput::Disconnected(..) => session_closed = true,
+                                    RakSessionOutput::Disconnected(id, reason) => {
+                                        terminal = Some((id, reason));
+                                        terminal_seen = true;
+                                    }
                                     RakSessionOutput::Wait(_) => {}
                                 }
                             }
@@ -166,15 +202,19 @@ impl Sans for RakClient {
                         None => return Err(self.abort(RakClientError::ConnectionFailed)),
                     }
 
-                    if session_closed && success.is_none() {
+                    if terminal.is_some() && success.is_none() {
                         return Err(self.abort(RakClientError::ConnectionFailed));
                     }
 
                     if let Some(succeeded) = success
-                        && let Some(session) = self.session.take()
+                        && let Some(mut session) = self.session.take()
                     {
                         match succeeded {
                             true => {
+                                session.restore_handshake_outputs(
+                                    self.pending_packets.take(),
+                                    terminal,
+                                );
                                 self.state = RakClientState::Connected(remote);
                                 self.output
                                     .push_back(RakClientOutput::SessionConnected(Box::new(
@@ -263,6 +303,7 @@ impl Sans for RakClient {
             RakClientInput::Disconnect => {
                 self.state = RakClientState::Unconnected;
                 self.session = None;
+                self.pending_packets.clear();
                 self.probes = None;
                 self.request_two_at = None;
                 self.connect_deadline = None;
@@ -288,6 +329,7 @@ impl RakClient {
             mtu: 0,
             cookie: None,
             session: None,
+            pending_packets: PendingPackets::default(),
             connect_deadline: None,
             output: VecDeque::new(),
         }
@@ -296,6 +338,7 @@ impl RakClient {
     fn abort(&mut self, error: RakClientError) -> RakClientError {
         self.state = RakClientState::Unconnected;
         self.session = None;
+        self.pending_packets.clear();
         self.probes = None;
         self.request_two_at = None;
         self.connect_deadline = None;
@@ -360,7 +403,9 @@ impl RakClient {
                     RakSessionOutput::Disconnected(..) => {
                         return Err(RakClientError::ConnectionFailed);
                     }
-                    RakSessionOutput::Packet(_) => {}
+                    RakSessionOutput::Packet(packet) => {
+                        self.pending_packets.push(packet, &self.config)?
+                    }
                 }
             }
         } else if let RakClientState::Handshake1 { remote: peer, .. }
@@ -503,6 +548,7 @@ impl RakClient {
             |_| {},
         );
 
+        session.state = RakSessionState::Connecting;
         let req = ConnectionRequest {
             security: false,
             client_timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
@@ -535,6 +581,11 @@ impl RakClient {
             return Err(RakClientError::AlreadyConnected);
         }
 
+        if session.get_state() == RakSessionState::Connecting {
+            return Err(RakClientError::InvalidConfig(
+                "an incomplete client handshake cannot be adopted",
+            ));
+        }
         let addr = session.addr;
 
         self.mtu = session.mtu;
@@ -588,3 +639,6 @@ mod negotiation_tests;
 
 #[cfg(test)]
 mod endpoint_tests;
+
+#[cfg(test)]
+mod handoff_tests;
