@@ -1397,6 +1397,115 @@ fn acks_of_resent_datagrams_do_not_sample_the_rtt() {
     assert_eq!(a.rtt(), Duration::ZERO);
 }
 
+#[test]
+fn congestion_reference_avoidance_grows_once_per_ack_independent_of_datagram_size() {
+    let now = domain_time();
+    let clock = RakClock::new(now);
+    for size in [100, 1200] {
+        let mut snapshot = RakCongestionController::new(1200).snapshot(clock);
+        snapshot.congestion_window = 3000.0;
+        snapshot.slow_start_threshold = 2400.0;
+        let mut controller = RakCongestionController::restore(snapshot, clock).unwrap();
+        controller.sent(1, size, now);
+        controller.acked(now + Duration::from_millis(10), 1, size, true);
+        assert_eq!(
+            controller.snapshot(clock).congestion_window,
+            3480.0,
+            "one admitted ACK must advance avoidance by the same amount for either size"
+        );
+        controller.acked(now + Duration::from_millis(20), 1, size, true);
+        assert_eq!(controller.snapshot(clock).congestion_window, 3480.0);
+        controller.sent(2, size, now + Duration::from_millis(20));
+        controller.acked(now + Duration::from_millis(30), 2, size, false);
+        assert_eq!(
+            controller.snapshot(clock).congestion_window,
+            3480.0,
+            "an idle sender must not grow its congestion window"
+        );
+    }
+}
+
+#[test]
+fn congestion_reference_nack_recovery_does_not_back_off_again_for_same_block_timeout() {
+    let now = domain_time();
+    for first_sequence in [0, u24::MASK - 1] {
+        let mut sender = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            7,
+            1228,
+            now,
+            RakClock::new(crate::clock::test_now()),
+            Default::default(),
+        );
+        assert_eq!(sender.mtu, 1200);
+        let mut snapshot = sender.congestion_controller.snapshot(sender.clock);
+        snapshot.congestion_window = 4800.0;
+        sender.congestion_controller =
+            RakCongestionController::restore(snapshot, sender.clock).unwrap();
+        sender.outbound_seq = first_sequence;
+        for _ in 0..12 {
+            send(&mut sender, 1000, now).unwrap();
+        }
+        sender.tick(now).unwrap();
+        let initial_outputs = drain_outputs(&mut sender);
+        let initial = datagrams_of(&initial_outputs);
+        let initial_frames = frames_of(&initial);
+        let initial_sequences = sequences_of(&initial_outputs);
+        assert_eq!(initial_sequences.len(), 4);
+        assert!(sender.bandwidth_limited);
+        let before = sender.congestion_controller.snapshot(sender.clock);
+        let nack_at = now + Duration::from_millis(10);
+        sender
+            .handle(RakSessionInput::Datagram(
+                Ack::new(vec![initial_sequences[0]], true)
+                    .serialized()
+                    .unwrap(),
+                nack_at,
+            ))
+            .unwrap();
+        let nack_outputs = drain_outputs(&mut sender);
+        let nack_sequences = sequences_of(&nack_outputs);
+        assert_eq!(nack_sequences.len(), 1);
+        assert_eq!(nack_sequences[0], u24::add(first_sequence, 4));
+        assert_eq!(
+            frames_of(&datagrams_of(&nack_outputs)),
+            initial_frames[..1],
+            "NACK recovery keeps the original reliable and ordered frame identity"
+        );
+        let after_nack = sender.congestion_controller.snapshot(sender.clock);
+        assert_eq!(after_nack.congestion_window, 4800.0);
+        assert_eq!(after_nack.slow_start_threshold, 2400.0);
+        assert_eq!(
+            after_nack.bytes_not_acknowledged,
+            before.bytes_not_acknowledged
+        );
+
+        // The other original datagrams expire before the NACK retransmission does.
+        sender.tick(now + Duration::from_secs(2)).unwrap();
+        let timeout_outputs = drain_outputs(&mut sender);
+        let timeout_sequences = sequences_of(&timeout_outputs);
+        assert_eq!(timeout_sequences.len(), 3);
+        assert!(
+            timeout_sequences
+                .iter()
+                .all(|seq| !initial_sequences.contains(seq))
+        );
+        let mut recovered = frames_of(&datagrams_of(&timeout_outputs));
+        recovered.sort_by_key(|frame| frame.order_index);
+        assert_eq!(recovered, initial_frames[1..]);
+        let after_timeout = sender.congestion_controller.snapshot(sender.clock);
+        assert_eq!(
+            after_timeout.bytes_not_acknowledged, before.bytes_not_acknowledged,
+            "resending retained datagrams must neither duplicate nor release in-flight bytes"
+        );
+        assert_eq!(
+            after_timeout.congestion_window, 4800.0,
+            "a NACK recovery block must not also collapse the window for a due retransmission"
+        );
+    }
+}
+
 fn frames_of(datagrams: &[Box<[u8]>]) -> Vec<Frame> {
     datagrams
         .iter()
