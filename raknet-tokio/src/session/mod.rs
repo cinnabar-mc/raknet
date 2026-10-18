@@ -181,9 +181,9 @@ impl<S: SessionPhase> RakSession<S> {
             return Ok(bytes.into());
         }
         if let Some(ack) = &mut self.close_ack {
-            let result = ack.await.map_err(|_| RakSessionError::Closed)?;
+            let result = ack.await;
             self.close_ack = None;
-            result?;
+            result.map_err(|_| RakSessionError::Closed)??;
         }
         Err(RakSessionError::Closed)
     }
