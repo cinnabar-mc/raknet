@@ -40,3 +40,6 @@ pub mod prelude {
     pub use crate::util::io_error::{is_mtu_probe_size_error, is_transient_udp_read_error};
     pub use crate::util::socket_addr::canonical_socket_addr;
 }
+
+#[cfg(test)]
+mod manual_handshake_tests;
