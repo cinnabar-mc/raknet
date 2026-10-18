@@ -161,9 +161,15 @@ fn negotiate_after_loss(autoflush: bool, lost_control: u8) -> Option<Pair> {
                 }
             }
             if !moved {
-                if local_session.is_some() && remote_session.is_some() {
-                    assert!(dropped, "the actual selected reliable control must be lost");
-                    return Some((local_session.unwrap(), remote_session.unwrap(), now));
+                match (local_session, remote_session) {
+                    (Some(local), Some(remote)) => {
+                        assert!(dropped, "the actual selected reliable control must be lost");
+                        return Some((local, remote, now));
+                    }
+                    (local, remote) => {
+                        local_session = local;
+                        remote_session = remote;
+                    }
                 }
                 break;
             }
