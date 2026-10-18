@@ -89,9 +89,17 @@ impl RakClient {
                 return;
             }
         };
+        let guid = match ClientGuid::generate() {
+            Ok(guid) => guid,
+            Err(error) => {
+                debug!("client identity generation failed: {error}");
+                return;
+            }
+        };
         if let Err(error) = self.intl.handle(RakClientInput::Connect {
             remote: addr,
             local,
+            guid,
             now: SystemTime::now(),
         }) {
             debug!("client failed to start connection: {error}");
@@ -99,9 +107,18 @@ impl RakClient {
     }
 
     pub fn ping(&mut self, addr: SocketAddr) {
-        let _ = self
-            .intl
-            .handle(RakClientInput::Ping(addr, SystemTime::now()));
+        let guid = match ClientGuid::generate() {
+            Ok(guid) => guid,
+            Err(error) => {
+                debug!("client ping identity generation failed: {error}");
+                return;
+            }
+        };
+        let _ = self.intl.handle(RakClientInput::Ping {
+            remote: addr,
+            guid,
+            now: SystemTime::now(),
+        });
     }
 
     pub fn is_connected(&self) -> bool {

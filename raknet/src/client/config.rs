@@ -1,13 +1,11 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
 use super::RakClientError;
 use crate::util::constants;
-use rand::random;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct RakClientConfig {
     pub local_port: u16,
-    pub guid: u64,
     pub protocol: u8,
     pub min_mtu_size: u16,
     pub max_mtu_size: u16,
@@ -50,26 +48,12 @@ impl Default for RakClientConfig {
             min_mtu_size: constants::MIN_MTU_SIZE,
             max_mtu_size: constants::MAX_MTU_SIZE,
             protocol: constants::PROTOCOL,
-            guid: random::<u64>() | (1 << 63),
             max_handshake_bytes: usize::try_from(constants::MAX_QUEUED_BYTES)
                 .expect("default queued byte bound is positive"),
             max_handshake_messages: constants::MAX_RECEIVE_MESSAGES,
             conn_attempt_timeout: constants::CONNECTION_ATTEMPT_TIMEOUT,
             conn_attempt_interval: constants::CONNECTION_ATTEMPT_INTERVAL,
             conn_attempt_max: constants::CONNECTION_ATTEMPT_MAX,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_guid_is_negative_as_i64() {
-        for _ in 0..256 {
-            let guid = RakClientConfig::default().guid;
-            assert!((guid as i64) < 0, "guid {guid:#x} has the sign bit clear");
         }
     }
 }

@@ -6,6 +6,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RakClientError {
+    /// The socket adapter could not generate a client identity for an operation.
+    #[error("client identity generation failed: {0}")]
+    IdentityGeneration(#[source] std::io::Error),
     #[error("Invalid client configuration: {0}")]
     InvalidConfig(&'static str),
     #[error("RakCodecError: {0}")]

@@ -17,3 +17,7 @@ The original RakNet project's Apache-2.0 license and notices remain in effect.
 Early application-packet retention and connected liveness controls follow the
 same public behavior reference, with explicit Rust-owned handshake bounds and
 ordered transfer of pending packets and terminal notifications.
+
+Default client GUID generation uses fresh OS entropy for each ping/connection,
+with the reference's little-endian payload mapping and client type bits. Identity
+is supplied explicitly to the Rust engine and retained in attempt metadata.

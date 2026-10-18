@@ -47,6 +47,7 @@ fn begin(cap: u16) -> (RakClient, SystemTime) {
     let now = UNIX_EPOCH + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
             now,
@@ -107,7 +108,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
     let sent = deliver(&mut client, challenge, start);
     let request = OpenConnectionRequest2::deserialize(&mut Cursor::new(&sent[0])).unwrap();
     assert_eq!((request.mtu, request.cookie), (24, Some(17)));
-    assert!(matches!(client.state, RakClientState::Handshake1 { .. }));
+    assert!(matches!(client.state, RakClientState::Handshake1(_)));
     assert!(
         deliver(
             &mut client,
@@ -219,6 +220,7 @@ fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
     assert!(
         client
             .handle(RakClientInput::Connect {
+                guid: crate::client::TEST_CLIENT_GUID,
                 remote: PEER,
                 local: SocketAddr::new(PEER.ip(), 54321),
                 now
@@ -260,6 +262,7 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         let start = UNIX_EPOCH + Duration::from_secs(1000);
         client
             .handle(RakClientInput::Connect {
+                guid: crate::client::TEST_CLIENT_GUID,
                 remote: PEER,
                 local: SocketAddr::new(PEER.ip(), 54321),
                 now: start,
@@ -288,6 +291,7 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
     let mut now = UNIX_EPOCH + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
             now,
@@ -319,6 +323,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
     let first = UNIX_EPOCH + Duration::from_secs(1000);
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
             now: first,
@@ -329,6 +334,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
     let start = first + Duration::from_secs(1);
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
             now: start,
@@ -473,5 +479,103 @@ fn cancellation_drops_unclaimed_session_handoffs() {
     assert!(
         client.poll().is_none(),
         "a cancelled session must not be handed to its consumer"
+    );
+}
+
+#[test]
+fn identity_stays_with_each_attempt_through_challenges_retries_session_and_reconnect() {
+    let mut client = RakClient::new(RakClientConfig::default());
+    let first = TEST_CLIENT_GUID;
+    let second = ClientGuid::from_raw(first.as_u64() ^ 1);
+    let origin = UNIX_EPOCH + Duration::from_secs(1000);
+    for (attempt, guid) in [first, second].into_iter().enumerate() {
+        let now = origin + Duration::from_secs(attempt as u64);
+        client
+            .handle(RakClientInput::Connect {
+                remote: PEER,
+                local: SocketAddr::new(PEER.ip(), 54321),
+                guid,
+                now,
+            })
+            .unwrap();
+        collect(&mut client, now);
+        for (server_guid, grant, cookie) in [(0, 20, 7), (1, 1200, 8), (1, 900, 9)] {
+            let sent = deliver(
+                &mut client,
+                OpenConnectionReply1 {
+                    guid: server_guid,
+                    cookie: Some(cookie),
+                    mtu: grant,
+                },
+                now,
+            );
+            let request = sent
+                .iter()
+                .find(|bytes| bytes[0] == packet_id::OPEN_CONNECTION_REQUEST_2)
+                .unwrap();
+            let request =
+                OpenConnectionRequest2::deserialize(&mut Cursor::new(request.as_ref())).unwrap();
+            assert_eq!(request.client, guid.as_u64());
+            assert_eq!(request.cookie, Some(cookie));
+        }
+        let later = now + Duration::from_millis(500);
+        client.handle(RakClientInput::Update(later)).unwrap();
+        let sent = collect(&mut client, later);
+        let retry = sent
+            .iter()
+            .find(|bytes| bytes[0] == packet_id::OPEN_CONNECTION_REQUEST_2)
+            .unwrap();
+        assert_eq!(
+            OpenConnectionRequest2::deserialize(&mut Cursor::new(retry.as_ref()))
+                .unwrap()
+                .client,
+            guid.as_u64()
+        );
+        let connected = deliver(
+            &mut client,
+            OpenConnectionReply2::new(1, PEER, 900, false),
+            later,
+        );
+        let data = connected
+            .iter()
+            .find(|bytes| bytes[0] & 0xe0 == 0x80)
+            .unwrap();
+        let set = crate::protocol::packets::frame_set::FrameSet::deserialize(&mut Cursor::new(
+            data.as_ref(),
+        ))
+        .unwrap();
+        let request = set
+            .frames
+            .iter()
+            .find(|frame| frame.payload[0] == packet_id::CONNECTION_REQUEST)
+            .unwrap();
+        assert_eq!(
+            ConnectionRequest::deserialize(&mut Cursor::new(request.payload.as_ref()))
+                .unwrap()
+                .client_guid,
+            guid.as_u64()
+        );
+        assert_eq!(client.session.as_ref().unwrap().guid, guid.as_u64());
+        client.handle(RakClientInput::Disconnect).unwrap();
+    }
+    // Explicit custom wire identities are kept separate from generated defaults.
+    let ping_guid = ClientGuid::from_raw(1234);
+    client
+        .handle(RakClientInput::Ping {
+            remote: PEER,
+            guid: ping_guid,
+            now: origin + Duration::from_secs(2),
+        })
+        .unwrap();
+    let sent = collect(&mut client, origin + Duration::from_secs(2));
+    let ping = sent
+        .iter()
+        .find(|bytes| bytes[0] == packet_id::UNCONNECTED_PING)
+        .unwrap();
+    assert_eq!(
+        UnconnectedPing::deserialize(&mut Cursor::new(ping.as_ref()))
+            .unwrap()
+            .client,
+        ping_guid.as_u64()
     );
 }

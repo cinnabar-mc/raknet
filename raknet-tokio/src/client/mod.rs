@@ -6,9 +6,9 @@ use crate::client::msg::RakClientMsg;
 use crate::client::state::RakClientState;
 use crate::prelude::{RakServerError, RakSession};
 use raknet::prelude::{
-    RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
-    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
-    canonical_socket_addr, constants, is_mtu_probe_size_error,
+    ClientGuid, RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput,
+    RakClientOutput, RakSession as RakSessionIntl, RakSessionId, RakSessionInput,
+    RakSessionSnapshot, Sans, canonical_socket_addr, constants, is_mtu_probe_size_error,
 };
 use std::collections::HashMap;
 use std::mem::take;
@@ -180,18 +180,25 @@ impl RakClient {
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
-                                    let _ = client.handle(RakClientInput::Ping(addr, now));
-
-                                    let sent_ms = millis_since_epoch(now);
-                                    let queue = pings.entry(addr).or_default();
-                                    queue.retain(|ping| !ping.sender.is_closed());
-                                    queue.push(PendingPing { sent_ms, sent: now, sender });
+                                    match ClientGuid::generate() {
+                                        Ok(guid) => {
+                                            let _ = client.handle(RakClientInput::Ping { remote: addr, guid, now });
+                                            let sent_ms = millis_since_epoch(now);
+                                            let queue = pings.entry(addr).or_default();
+                                            queue.retain(|ping| !ping.sender.is_closed());
+                                            queue.push(PendingPing { sent_ms, sent: now, sender });
+                                        }
+                                        Err(error) => debug!("client ping identity generation failed: {error}"),
+                                    }
                                 }
                                 RakClientMsg::Connect(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
                                     let result = sockets.local_addr(addr)
                                         .map_err(|_| RakClientError::InvalidConfig("client socket address is unavailable"))
-                                        .and_then(|local| client.handle(RakClientInput::Connect { remote: addr, local, now }));
+                                        .and_then(|local| {
+                                            let guid = ClientGuid::generate().map_err(RakClientError::IdentityGeneration)?;
+                                            client.handle(RakClientInput::Connect { remote: addr, local, guid, now })
+                                        });
                                     match result {
                                         Ok(()) => connect = Some(sender),
                                         Err(e) => {

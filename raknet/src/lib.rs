@@ -9,7 +9,7 @@ mod util;
 
 pub mod prelude {
     pub use crate::client::{
-        MtuProbeId, RakClient, config::RakClientConfig, error::RakClientError,
+        ClientGuid, MtuProbeId, RakClient, config::RakClientConfig, error::RakClientError,
         input::RakClientInput, output::RakClientOutput,
     };
     pub use crate::sans::Sans;

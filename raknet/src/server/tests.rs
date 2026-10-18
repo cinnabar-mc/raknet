@@ -83,6 +83,7 @@ fn connect_all(
             let mut client = RakClient::new(RakClientConfig::default());
             client
                 .handle(RakClientInput::Connect {
+                    guid: crate::client::TEST_CLIENT_GUID,
                     remote: server_addr,
                     local: SocketAddr::new(server_addr.ip(), 54321),
                     now,
@@ -754,6 +755,7 @@ fn pending_session_acks_and_resends_connection_request_accepted() {
     let mut client = RakClient::new(RakClientConfig::default());
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: server_addr,
             local: SocketAddr::new(server_addr.ip(), 54321),
             now,

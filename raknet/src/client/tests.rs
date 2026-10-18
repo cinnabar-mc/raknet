@@ -6,6 +6,7 @@ fn request_1_len(addr: SocketAddr) -> u16 {
     let mut client = RakClient::new(RakClientConfig::default());
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: domain_time(),
@@ -45,6 +46,7 @@ fn overall_connect_timeout_fails_regardless_of_attempts() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: start,
@@ -74,6 +76,7 @@ fn connected_client_schedules_a_wait_instead_of_spinning() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: start,
@@ -105,6 +108,7 @@ fn failed_connect_schedules_a_wait_instead_of_spinning() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: start,
@@ -131,6 +135,7 @@ fn disconnect_input_allows_reconnect() {
     client.state = RakClientState::Connected(addr);
 
     let result = client.handle(RakClientInput::Connect {
+        guid: crate::client::TEST_CLIENT_GUID,
         remote: addr,
         local: SocketAddr::new(addr.ip(), 54321),
         now: domain_time(),
@@ -143,12 +148,13 @@ fn disconnect_input_allows_reconnect() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: domain_time(),
         })
         .unwrap();
-    assert!(matches!(client.state, RakClientState::Handshake1 { .. }));
+    assert!(matches!(client.state, RakClientState::Handshake1(_)));
 }
 
 fn encoded(packet: impl RakCodec) -> Box<[u8]> {
@@ -174,6 +180,7 @@ fn reply_2_above_the_maximum_mtu_is_clamped() {
     let now = domain_time();
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now,
@@ -207,6 +214,7 @@ fn handshake_session_resends_connection_request() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: t0,
@@ -245,6 +253,7 @@ fn failed_connect_resets_and_schedules_a_wait() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now: start,
@@ -270,6 +279,7 @@ fn incompatible_protocol_resets_state() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now,
@@ -296,12 +306,14 @@ fn connect_while_connecting_is_rejected() {
 
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: addr,
             local: SocketAddr::new(addr.ip(), 54321),
             now,
         })
         .unwrap();
     let result = client.handle(RakClientInput::Connect {
+        guid: crate::client::TEST_CLIENT_GUID,
         remote: addr,
         local: SocketAddr::new(addr.ip(), 54321),
         now,

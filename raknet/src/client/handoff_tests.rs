@@ -9,6 +9,7 @@ const LOCAL: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHO
 fn start_reliable_handshake(client: &mut RakClient, now: SystemTime) {
     client
         .handle(RakClientInput::Connect {
+            guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: LOCAL,
             now,
