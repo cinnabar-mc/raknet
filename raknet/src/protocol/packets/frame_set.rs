@@ -15,6 +15,11 @@ pub struct FrameSet {
 }
 
 impl FrameSet {
+    /// Counts encapsulated bytes for congestion, excluding the datagram header.
+    pub(crate) fn encapsulated_size(&self) -> usize {
+        self.frames.iter().map(Frame::size_hint).sum()
+    }
+
     pub fn new(
         sequence: u32,
         frames: Vec<Frame>,
@@ -91,11 +96,6 @@ impl RakCodec for FrameSet {
     }
 
     fn size_hint(&self) -> usize {
-        size_of::<u8>()
-            + 3
-            + self
-                .frames
-                .iter()
-                .fold(0, |acc, frame| acc + Frame::size_hint(frame))
+        crate::util::constants::DGRAM_HEADER_SIZE as usize + self.encapsulated_size()
     }
 }

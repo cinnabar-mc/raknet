@@ -1,3 +1,4 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod msg;
 pub mod state;
 
@@ -5,14 +6,14 @@ use crate::client::msg::RakClientMsg;
 use crate::client::state::RakClientState;
 use crate::prelude::{RakServerError, RakSession};
 use raknet::prelude::{
-    RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
-    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
-    constants,
+    ClientGuid, RakClient as RakClientIntl, RakClientConfig, RakClientError, RakClientInput,
+    RakClientOutput, RakClock, RakSession as RakSessionIntl, RakSessionId, RakSessionInput,
+    RakSessionSnapshot, Sans, canonical_socket_addr, constants, is_mtu_probe_size_error,
 };
 use std::collections::HashMap;
 use std::mem::take;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Sender, unbounded_channel};
@@ -51,26 +52,60 @@ impl ClientSockets {
         }
     }
 
-    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
-        match &self.v6 {
-            Some(socket) if addr.is_ipv6() => socket.send_to(buf, addr).await,
-            _ => self.v4.send_to(buf, addr).await,
+    /// Selects the socket matching the canonical endpoint family.
+    fn socket(&self, addr: SocketAddr) -> std::io::Result<&UdpSocket> {
+        if canonical_socket_addr(addr).is_ipv6() {
+            self.v6.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "IPv6 client socket is unavailable",
+                )
+            })
+        } else {
+            Ok(&self.v4)
         }
+    }
+
+    /// Returns the selected unconnected socket's actual bound endpoint.
+    fn local_addr(&self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        self.socket(addr)?.local_addr().map(canonical_socket_addr)
+    }
+
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+        let addr = canonical_socket_addr(addr);
+        self.socket(addr)?.send_to(buf, addr).await
     }
 }
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+type PingResult = Result<(Box<[u8]>, Duration), RakClientError>;
 
 struct PendingPing {
     sent_ms: u64,
-    sent: SystemTime,
-    sender: oneshot::Sender<(Box<[u8]>, Duration)>,
+    sender: oneshot::Sender<PingResult>,
 }
 
-fn millis_since_epoch(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+/// Builds ping input and reply metadata, or reports generation failure to the caller.
+fn prepare_ping(
+    guid: std::io::Result<ClientGuid>,
+    remote: SocketAddr,
+    now: std::time::Instant,
+    clock: RakClock,
+    sender: oneshot::Sender<PingResult>,
+) -> Option<(RakClientInput, PendingPing)> {
+    match guid {
+        Ok(guid) => Some((
+            RakClientInput::Ping { remote, guid, now },
+            PendingPing {
+                sent_ms: clock.timestamp(now),
+                sender,
+            },
+        )),
+        Err(error) => {
+            let _ = sender.send(Err(RakClientError::IdentityGeneration(error)));
+            None
+        }
+    }
 }
 
 fn fail_pending_connect(
@@ -113,6 +148,9 @@ impl RakClient {
             return Ok(());
         };
 
+        config
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let (msg_tx, msg_rx) = unbounded_channel();
 
         let sockets = ClientSockets::bind(config.local_port).await?;
@@ -129,7 +167,8 @@ impl RakClient {
 
                 let mut buf4 = vec![0u8; config.max_mtu_size as usize];
                 let mut buf6 = vec![0u8; config.max_mtu_size as usize];
-                let mut client = RakClientIntl::new(config);
+                let clock = RakClock::new(Instant::now().into_std());
+                let mut client = RakClientIntl::new(config, clock);
 
                 let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
@@ -142,7 +181,7 @@ impl RakClient {
                 loop {
                     tokio::select! {
                         Ok((datagram, addr)) = sockets.recv(&mut buf4, &mut buf6) => {
-                            let now = SystemTime::now();
+                            let now = Instant::now().into_std();
 
                             let result = client.handle(RakClientInput::Datagram(datagram, addr, now));
                             fail_pending_connect(&client, &mut connect, result);
@@ -155,33 +194,38 @@ impl RakClient {
                             let _ = client.handle(RakClientInput::Disconnect);
                         }
                         Some(msg) = msg_rx.recv() => {
-                            let now = SystemTime::now();
+                            let now = Instant::now().into_std();
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
-                                    let _ = client.handle(RakClientInput::Ping(addr, now));
-
-                                    let sent_ms = millis_since_epoch(now);
-                                    let queue = pings.entry(addr).or_default();
-                                    queue.retain(|ping| !ping.sender.is_closed());
-                                    queue.push(PendingPing { sent_ms, sent: now, sender });
+                                    let addr = canonical_socket_addr(addr);
+                                    if let Some((input, ping)) = prepare_ping(ClientGuid::generate(), addr, now, clock, sender) {
+                                        let _ = client.handle(input);
+                                        let queue = pings.entry(addr).or_default();
+                                        queue.retain(|ping| !ping.sender.is_closed());
+                                        queue.push(ping);
+                                    }
                                 }
                                 RakClientMsg::Connect(addr, sender) => {
-                                    match client.handle(RakClientInput::Connect(addr, now)) {
+                                    let addr = canonical_socket_addr(addr);
+                                    let result = sockets.local_addr(addr)
+                                        .map_err(|_| RakClientError::InvalidConfig("client socket address is unavailable"))
+                                        .and_then(|local| {
+                                            let guid = ClientGuid::generate().map_err(RakClientError::IdentityGeneration)?;
+                                            client.handle(RakClientInput::Connect { remote: addr, local, guid, now })
+                                        });
+                                    match result {
                                         Ok(()) => connect = Some(sender),
                                         Err(e) => {
                                             let _ = sender.send(Err(e));
                                         }
                                     }
                                 }
-                                RakClientMsg::Adopt(snapshot, reply) => {
-                                    match RakSessionIntl::restore(*snapshot) {
-                                        Ok(session) => match client.adopt(session) {
-                                            Ok(()) => connect = Some(reply),
-                                            Err(e) => {
-                                                let _ = reply.send(Err(e));
-                                            }
-                                        },
-                                        Err(e) => debug!("cannot adopt a session: {e}"),
+                                RakClientMsg::Adopt(session, reply) => {
+                                    match client.adopt(*session) {
+                                        Ok(()) => connect = Some(reply),
+                                        Err(e) => {
+                                            let _ = reply.send(Err(e));
+                                        }
                                     }
                                 }
                                 RakClientMsg::Stop => {
@@ -196,7 +240,7 @@ impl RakClient {
                             }
                         }
                         _ = &mut timer => {
-                            let result = client.handle(RakClientInput::Update(SystemTime::now()));
+                            let result = client.handle(RakClientInput::Update(Instant::now().into_std()));
                             fail_pending_connect(&client, &mut connect, result);
                         }
                         _ = async {
@@ -209,12 +253,25 @@ impl RakClient {
 
                     while let Some(msg) = client.poll() {
                         match msg {
+                            RakClientOutput::MtuProbe { id, datagram, peer } => {
+                                let started = Instant::now();
+                                let result = sockets.send_to(&datagram, peer).await;
+                                let elapsed = started.elapsed();
+                                let input = RakClientInput::MtuProbeResult {
+                                    id,
+                                    now: Instant::now().into_std(),
+                                    elapsed,
+                                    too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
+                                };
+                                let result = client.handle(input);
+                                fail_pending_connect(&client, &mut connect, result);
+                            }
                             RakClientOutput::SocketDatagram(buf, addr) => {
                                 let _ = sockets.send_to(&buf, addr).await;
                             }
                             RakClientOutput::SessionDatagram(buf) => {
                                 if let Some(session) = &session_tx {
-                                    let now = SystemTime::now();
+                                    let now = Instant::now().into_std();
 
                                     let input = RakSessionInput::Datagram(buf, now);
                                     if let Err(TrySendError::Full(_)) = session.try_send(input) {
@@ -235,8 +292,9 @@ impl RakClient {
                                 );
 
                                 if stop_deadline.is_some() {
-                                    let _ =
-                                        tx.try_send(RakSessionInput::Disconnect(SystemTime::now()));
+                                    let _ = tx.try_send(RakSessionInput::Disconnect(
+                                        Instant::now().into_std(),
+                                    ));
                                     session_tx = Some(tx);
                                     continue;
                                 }
@@ -250,19 +308,21 @@ impl RakClient {
                             RakClientOutput::Wait(duration) => {
                                 timer.as_mut().reset(Instant::now() + duration);
                             }
-                            RakClientOutput::Pong(addr, msg, time) => {
+                            RakClientOutput::Pong {
+                                addr,
+                                message,
+                                echoed_timestamp,
+                                latency,
+                            } => {
                                 if let Some(queue) = pings.get_mut(&addr) {
                                     queue.retain(|ping| !ping.sender.is_closed());
 
-                                    let echoed_ms = millis_since_epoch(time);
-                                    if let Some(index) =
-                                        queue.iter().position(|ping| ping.sent_ms == echoed_ms)
+                                    if let Some(index) = queue
+                                        .iter()
+                                        .position(|ping| ping.sent_ms == echoed_timestamp)
                                     {
                                         let ping = queue.remove(index);
-                                        let latency = SystemTime::now()
-                                            .duration_since(ping.sent)
-                                            .unwrap_or_default();
-                                        let _ = ping.sender.send((msg, latency));
+                                        let _ = ping.sender.send(Ok((message, latency)));
                                     }
                                 }
                             }
@@ -312,23 +372,28 @@ impl RakClient {
         timeout(PING_TIMEOUT, rx)
             .await
             .map_err(|_| RakClientError::Timeout)?
-            .map_err(|_| RakClientError::Closed)
+            .map_err(|_| RakClientError::Closed)?
     }
 
     /// Resumes a session captured with [`RakSession::snapshot`] on another client.
     ///
     /// Fails with [`RakClientError::AlreadyConnected`] if this client already has a
     /// session or is connecting. The peer is not contacted, so the caller is responsible
-    /// for pointing it at this client's socket.
-    pub async fn adopt(&self, snapshot: RakSessionSnapshot) -> Result<RakSession, RakClientError> {
+    /// for pointing it at this client's socket. `elapsed` is the time since capture.
+    pub async fn adopt(
+        &self,
+        snapshot: RakSessionSnapshot,
+        elapsed: Duration,
+    ) -> Result<RakSession, RakClientError> {
         let RakClientState::Running { msg_tx, .. } = &self.state else {
             return Err(RakClientError::Closed);
         };
 
+        let session = RakSessionIntl::restore(snapshot, Instant::now().into_std(), elapsed)?;
         let (tx, rx) = oneshot::channel();
 
         msg_tx
-            .send(RakClientMsg::Adopt(Box::new(snapshot), tx))
+            .send(RakClientMsg::Adopt(Box::new(session), tx))
             .map_err(|_| RakClientError::Closed)?;
 
         rx.await.map_err(|_| RakClientError::Closed)?
@@ -349,6 +414,90 @@ impl RakClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
+        let now = Instant::now().into_std();
+        let original = RakSessionIntl::new(
+            RakSessionId(1),
+            "127.0.0.1:19132".parse().unwrap(),
+            7,
+            1492,
+            now,
+            RakClock::new(now - Duration::from_secs(5)),
+            Default::default(),
+        );
+        let snapshot = original.snapshot(now);
+        let (msg_tx, mut msg_rx) = unbounded_channel();
+        let client = RakClient {
+            state: RakClientState::Running {
+                handle: tokio::spawn(async {}),
+                msg_tx,
+            },
+        };
+        let adopting =
+            tokio::spawn(async move { client.adopt(snapshot, Duration::from_millis(100)).await });
+        let message = msg_rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let RakClientMsg::Adopt(session, reply) = message else {
+            panic!("adoption must deliver a session to the actor");
+        };
+        assert_eq!(
+            session
+                .snapshot(Instant::now().into_std())
+                .captured_uptime_ms,
+            8100
+        );
+        let _ = reply.send(Err(RakClientError::Closed));
+        assert!(matches!(
+            adopting.await.unwrap(),
+            Err(RakClientError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_ping_identity_reaches_the_reply_without_blocking_the_next_ping() {
+        let origin = Instant::now().into_std();
+        let clock = RakClock::new(origin);
+        let mut core = RakClientIntl::new(RakClientConfig::default(), clock);
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, 19132));
+        let now = origin + Duration::from_secs(1);
+        let (sender, reply) = oneshot::channel();
+        assert!(
+            prepare_ping(
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "entropy unavailable"
+                )),
+                remote,
+                now,
+                clock,
+                sender,
+            )
+            .is_none()
+        );
+        let Err(RakClientError::IdentityGeneration(error)) = reply.await.unwrap() else {
+            panic!("the entropy error must reach the ping caller");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "entropy unavailable");
+        assert!(
+            core.poll().is_none(),
+            "failed identity must not send anything"
+        );
+
+        let (sender, reply) = oneshot::channel();
+        let (input, ping) =
+            prepare_ping(Ok(ClientGuid::from_raw(7)), remote, now, clock, sender).unwrap();
+        core.handle(input).unwrap();
+        assert!(
+            matches!(core.poll(), Some(RakClientOutput::SocketDatagram(_, peer)) if peer == remote)
+        );
+        ping.sender
+            .send(Ok((Box::from(*b"ok"), Duration::ZERO)))
+            .unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().0.as_ref(), b"ok");
+    }
 
     async fn fake_server(reply_after: Option<Duration>) -> SocketAddr {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();

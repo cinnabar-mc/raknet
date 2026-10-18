@@ -1,9 +1,13 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 use std::time::Duration;
 
 pub const PROTOCOL: u8 = 11;
+/// Maximum system-address entries in connected handshake messages.
+pub const SYSTEM_ADDRESS_COUNT: usize = 20;
 
 pub const UDP_HEADER_SIZE: u16 = 8;
 pub const MIN_MTU_SIZE: u16 = 400;
+pub const MIN_PROBE_MTU_SIZE: u16 = 576;
 pub const MAX_MTU_SIZE: u16 = 1492;
 pub const DGRAM_HEADER_SIZE: u16 = 4;
 pub const DGRAM_MTU_OVERHEAD: u16 = 36;
@@ -16,8 +20,9 @@ pub const ONLINE_RATE_LIMIT_WINDOW: Duration = Duration::from_millis(10);
 pub const BLOCK_DURATION: Duration = Duration::from_secs(10);
 
 pub const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(10_000);
-pub const CONNECTION_ATTEMPT_INTERVAL: Duration = Duration::from_millis(1_000);
-pub const CONNECTION_ATTEMPT_MAX: usize = 10;
+pub const CONNECTION_ATTEMPT_INTERVAL: Duration = Duration::from_millis(500);
+pub const MTU_PROBE_ATTEMPTS_PER_SIZE: usize = 4;
+pub const CONNECTION_ATTEMPT_MAX: usize = MTU_PROBE_ATTEMPTS_PER_SIZE * MTU_SIZES.len() + 1;
 
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,6 +31,9 @@ pub const AUTOFLUSH_INTERVAL_MS: i32 = 10;
 
 pub const CC_MAX_THRESHOLD: i32 = 2000;
 pub const CC_ADDITIONAL_VARIANCE: i32 = 30;
+
+/// Default complete-message capacity for a packet consumer.
+pub const MAX_RECEIVE_MESSAGES: usize = 4096;
 
 pub const MAX_QUEUED_BYTES: i32 = 67_108_864;
 

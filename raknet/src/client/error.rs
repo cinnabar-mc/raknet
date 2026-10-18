@@ -1,18 +1,26 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 use crate::prelude::RakSessionError;
 use crate::protocol::error::RakCodecError;
-use std::time::SystemTimeError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RakClientError {
+    #[error(transparent)]
+    InvalidSnapshot(#[from] crate::session::snapshot::RakSessionRestoreError),
+    /// The socket adapter could not generate a client identity for an operation.
+    #[error("client identity generation failed: {0}")]
+    IdentityGeneration(#[source] std::io::Error),
+    #[error("Invalid client configuration: {0}")]
+    InvalidConfig(&'static str),
     #[error("RakCodecError: {0}")]
     RakCodecError(#[from] RakCodecError),
     #[error("RakSessionError: {0}")]
     RakSessionError(#[from] RakSessionError),
-    #[error("SystemTimeError: {0}")]
-    SystemTimeError(#[from] SystemTimeError),
     #[error("Security Unsupported")]
     SecurityUnsupported,
+    /// Complete early application packets exceeded the configured handshake FIFO.
+    #[error("Handshake receive buffer exceeded")]
+    HandshakeReceiveBufferExceeded,
     #[error("Connection Failed")]
     ConnectionFailed,
     #[error("Connection Attempt Failed")]

@@ -1,10 +1,15 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 pub mod config;
 pub mod congestion_controller;
 pub mod error;
 pub mod input;
 pub mod output;
+mod ranges;
+mod receive;
+pub(crate) mod snapshot;
 pub mod state;
 
+use crate::clock::RakClock;
 use crate::protocol::codec::{RakCodec, RakCodecHelper};
 use crate::protocol::packets::ack::Ack;
 use crate::protocol::packets::connected_ping::ConnectedPing;
@@ -13,7 +18,7 @@ use crate::protocol::packets::disconnect::Disconnect;
 use crate::protocol::packets::frame_set::FrameSet;
 use crate::protocol::types::frame::Frame;
 use crate::sans::Sans;
-use crate::session::congestion_controller::{RakCongestionController, RakCongestionSnapshot};
+use crate::session::congestion_controller::RakCongestionController;
 use crate::session::error::RakSessionError;
 use crate::session::input::RakSessionInput;
 use crate::session::output::{RakDisconnectReason, RakSessionOutput};
@@ -28,8 +33,8 @@ use std::cmp::{Reverse, min};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::mem::take;
-use std::net::{AddrParseError, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 #[derive(Default, Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -43,7 +48,6 @@ impl RakSessionId {
     }
 }
 
-const RELIABLE_WINDOW: usize = 8192;
 const DATAGRAM_WINDOW: usize = 2048;
 const ORDER_WINDOW: usize = 2048;
 const MAX_SPLIT_COUNT: u32 = 8192;
@@ -61,15 +65,17 @@ pub struct RakSession {
     pub guid: u64,
     pub mtu: u16,
     config: RakSessionConfig,
+    pub(crate) clock: RakClock,
 
-    last_tick: SystemTime,
-    last_ping: SystemTime,
-    last_recv: SystemTime,
-    last_pong: SystemTime,
-    closing_since: Option<SystemTime>,
+    last_tick: Instant,
+    last_ping: Instant,
+    last_recv: Instant,
+    last_pong: Instant,
+    closing_since: Option<Instant>,
 
     congestion_controller: RakCongestionController,
     bandwidth_limited: bool,
+    wire_continuous: bool,
 
     queue: VecDeque<(Box<[u8]>, SocketAddr)>,
 
@@ -82,243 +88,25 @@ pub struct RakSession {
     outbound_queue: [VecDeque<Frame>; 4],
     outbound_cache: HashMap<u32, FrameSet>,
     outbound_bytes: usize,
-    outbound_resend: BinaryHeap<(Reverse<SystemTime>, u32)>,
+    outbound_resend: BinaryHeap<(Reverse<Instant>, u32)>,
     outbound_ord_idx: [u32; 32],
     outbound_seq_idx: [u32; 32],
 
     inbound_seq: u32,
-    inbound_rel_seen: HashSet<u32>,
-    inbound_rel_order: VecDeque<u32>,
+    inbound_rel_base: u32,
+    inbound_rel_ahead: Vec<ranges::Range>,
     inbound_spl_queue: HashMap<u16, HashMap<u32, Frame>>,
     inbound_spl_bytes: usize,
-    inbound_spl_last: HashMap<u16, SystemTime>,
+    inbound_spl_last: HashMap<u16, Instant>,
     inbound_ord_queue: HashMap<u8, HashMap<u32, Frame>>,
     inbound_ord_bytes: usize,
     inbound_ord_idx: [u32; 32],
     inbound_seq_idx: [u32; 32],
+    inbound_progress: u64,
+    inbound_deferred: bool,
+    inbound_stall: Option<(Instant, u64)>,
 
     output: VecDeque<RakSessionOutput>,
-}
-
-/// [`RakSession`] in a serializable form, so a session can be moved to another process
-/// and resumed there.
-///
-/// Times are milliseconds from [`RakSessionSnapshot::epoch_ms`], and the queues are
-/// `Vec`s, since `SystemTime`, `VecDeque` and `BinaryHeap` have no `Facet` impl. Pending
-/// output is not carried - drain it with `poll()` before taking a snapshot.
-#[derive(Clone, Debug, facet::Facet)]
-pub struct RakSessionSnapshot {
-    pub id: u64,
-    /// Text form: facet-json cannot construct a `SocketAddr` on the way back in.
-    pub addr: String,
-    pub state: RakSessionState,
-    pub guid: u64,
-    pub mtu: u16,
-    pub config: RakSessionConfig,
-
-    /// Wall clock the offsets below are measured from.
-    pub epoch_ms: u64,
-    pub last_tick_ms: u64,
-    pub last_ping_ms: u64,
-    pub last_recv_ms: u64,
-    pub last_pong_ms: u64,
-
-    pub congestion_controller: RakCongestionSnapshot,
-
-    pub queue: Vec<(Box<[u8]>, String)>,
-
-    pub sequences_recv: HashSet<u32>,
-    pub sequences_lost: HashSet<u32>,
-
-    pub outbound_seq: u32,
-    pub outbound_spl: u16,
-    pub outbound_rel: u32,
-    pub outbound_queue: Vec<Vec<Frame>>,
-    pub outbound_cache: Vec<(u32, FrameSet)>,
-    pub outbound_resend: Vec<(u64, u32)>,
-    pub outbound_ord_idx: [u32; 32],
-    pub outbound_seq_idx: [u32; 32],
-
-    pub inbound_seq: u32,
-    pub inbound_rel_seen: HashSet<u32>,
-    pub inbound_rel_order: Vec<u32>,
-    pub inbound_spl_queue: Vec<(u16, Vec<(u32, Frame)>)>,
-    pub inbound_ord_queue: Vec<(u8, Vec<(u32, Frame)>)>,
-    pub inbound_ord_idx: [u32; 32],
-    pub inbound_seq_idx: [u32; 32],
-}
-
-impl RakSession {
-    /// Captures this session's protocol state.
-    pub fn snapshot(&self) -> RakSessionSnapshot {
-        let epoch = UNIX_EPOCH;
-        RakSessionSnapshot {
-            id: self.id.0,
-            addr: self.addr.to_string(),
-            state: self.state,
-            guid: self.guid,
-            mtu: self.mtu,
-            config: self.config.clone(),
-
-            epoch_ms: 0,
-            last_tick_ms: millis_since(epoch, self.last_tick),
-            last_ping_ms: millis_since(epoch, self.last_ping),
-            last_recv_ms: millis_since(epoch, self.last_recv),
-            last_pong_ms: millis_since(epoch, self.last_pong),
-
-            congestion_controller: self.congestion_controller.snapshot(epoch),
-
-            queue: self
-                .queue
-                .iter()
-                .map(|(bytes, addr)| (bytes.clone(), addr.to_string()))
-                .collect(),
-
-            sequences_recv: self.sequences_recv.clone(),
-            sequences_lost: self.sequences_lost.clone(),
-
-            outbound_seq: self.outbound_seq,
-            outbound_spl: self.outbound_spl,
-            outbound_rel: self.outbound_rel,
-            outbound_queue: self
-                .outbound_queue
-                .iter()
-                .map(|q| q.iter().cloned().collect())
-                .collect(),
-            outbound_cache: self.outbound_cache.clone().into_iter().collect(),
-            outbound_resend: self
-                .outbound_resend
-                .iter()
-                .map(|(at, seq)| (millis_since(epoch, at.0), *seq))
-                .collect(),
-            outbound_ord_idx: self.outbound_ord_idx,
-            outbound_seq_idx: self.outbound_seq_idx,
-
-            inbound_seq: self.inbound_seq,
-            inbound_rel_seen: self.inbound_rel_seen.clone(),
-            inbound_rel_order: self.inbound_rel_order.iter().copied().collect(),
-            inbound_spl_queue: flatten_nested(&self.inbound_spl_queue),
-            inbound_ord_queue: flatten_nested(&self.inbound_ord_queue),
-            inbound_ord_idx: self.inbound_ord_idx,
-            inbound_seq_idx: self.inbound_seq_idx,
-        }
-    }
-
-    /// Rebuilds a session from [`RakSession::snapshot`].
-    pub fn restore(snapshot: RakSessionSnapshot) -> Result<Self, AddrParseError> {
-        let epoch = UNIX_EPOCH + Duration::from_millis(snapshot.epoch_ms);
-        let at = |offset: u64| epoch + Duration::from_millis(offset);
-
-        let mut outbound_queue: [VecDeque<Frame>; 4] = Default::default();
-        for (channel, frames) in snapshot.outbound_queue.into_iter().enumerate().take(4) {
-            outbound_queue[channel] = frames.into();
-        }
-
-        let outbound_cache: HashMap<u32, FrameSet> = snapshot.outbound_cache.into_iter().collect();
-        let outbound_bytes = outbound_queue
-            .iter()
-            .flatten()
-            .map(Frame::size_hint)
-            .chain(outbound_cache.values().map(FrameSet::size_hint))
-            .sum();
-
-        let inbound_spl_queue = rebuild_nested(snapshot.inbound_spl_queue);
-        let inbound_spl_bytes = payload_bytes(&inbound_spl_queue);
-        let inbound_spl_last = inbound_spl_queue
-            .keys()
-            .map(|&split_id| (split_id, at(snapshot.last_recv_ms)))
-            .collect();
-        let inbound_ord_queue = rebuild_nested(snapshot.inbound_ord_queue);
-        let inbound_ord_bytes = payload_bytes(&inbound_ord_queue);
-
-        let queue = snapshot
-            .queue
-            .into_iter()
-            .map(|(bytes, addr)| Ok((bytes, addr.parse()?)))
-            .collect::<Result<VecDeque<_>, AddrParseError>>()?;
-
-        Ok(Self {
-            id: RakSessionId(snapshot.id),
-            addr: snapshot.addr.parse()?,
-            state: snapshot.state,
-            guid: snapshot.guid,
-            mtu: snapshot.mtu,
-            config: snapshot.config,
-
-            last_tick: at(snapshot.last_tick_ms),
-            last_ping: at(snapshot.last_ping_ms),
-            last_recv: at(snapshot.last_recv_ms),
-            last_pong: at(snapshot.last_pong_ms),
-            closing_since: (snapshot.state == RakSessionState::Closing).then(SystemTime::now),
-
-            congestion_controller: RakCongestionController::restore(
-                snapshot.congestion_controller,
-                epoch,
-            ),
-            bandwidth_limited: false,
-
-            queue,
-
-            sequences_recv: snapshot.sequences_recv,
-            sequences_lost: snapshot.sequences_lost,
-
-            outbound_seq: snapshot.outbound_seq,
-            outbound_spl: snapshot.outbound_spl,
-            outbound_rel: snapshot.outbound_rel,
-            outbound_queue,
-            outbound_cache,
-            outbound_bytes,
-            outbound_resend: snapshot
-                .outbound_resend
-                .into_iter()
-                .map(|(offset, seq)| (Reverse(at(offset)), seq))
-                .collect(),
-            outbound_ord_idx: snapshot.outbound_ord_idx,
-            outbound_seq_idx: snapshot.outbound_seq_idx,
-
-            inbound_seq: snapshot.inbound_seq,
-            inbound_rel_seen: snapshot.inbound_rel_seen,
-            inbound_rel_order: snapshot.inbound_rel_order.into(),
-            inbound_spl_queue,
-            inbound_spl_bytes,
-            inbound_spl_last,
-            inbound_ord_queue,
-            inbound_ord_bytes,
-            inbound_ord_idx: snapshot.inbound_ord_idx,
-            inbound_seq_idx: snapshot.inbound_seq_idx,
-
-            output: VecDeque::new(),
-        })
-    }
-}
-
-fn payload_bytes<K>(map: &HashMap<K, HashMap<u32, Frame>>) -> usize {
-    map.values()
-        .flat_map(HashMap::values)
-        .map(|f| f.payload.len())
-        .sum()
-}
-
-fn millis_since(epoch: SystemTime, at: SystemTime) -> u64 {
-    at.duration_since(epoch).unwrap_or_default().as_millis() as u64
-}
-
-/// JSON object keys are strings, so maps keyed by an integer are carried as pairs.
-fn flatten_nested<K: Copy + Eq + std::hash::Hash>(
-    map: &HashMap<K, HashMap<u32, Frame>>,
-) -> Vec<(K, Vec<(u32, Frame)>)> {
-    map.iter()
-        .map(|(key, inner)| (*key, inner.clone().into_iter().collect()))
-        .collect()
-}
-
-fn rebuild_nested<K: Eq + std::hash::Hash>(
-    pairs: Vec<(K, Vec<(u32, Frame)>)>,
-) -> HashMap<K, HashMap<u32, Frame>> {
-    pairs
-        .into_iter()
-        .map(|(key, inner)| (key, inner.into_iter().collect()))
-        .collect()
 }
 
 impl Sans for RakSession {
@@ -386,15 +174,17 @@ impl Sans for RakSession {
 }
 
 impl RakSession {
-    pub fn new<F>(id: RakSessionId, addr: SocketAddr, guid: u64, mtu: u16, conf: F) -> Self
-    where
-        F: FnOnce(&mut RakSessionConfig),
-    {
+    /// Creates session timers in the same domain clock used by its subsequent inputs.
+    pub fn new(
+        id: RakSessionId,
+        addr: SocketAddr,
+        guid: u64,
+        mtu: u16,
+        now: Instant,
+        clock: RakClock,
+        config: RakSessionConfig,
+    ) -> Self {
         let mtu = mtu - UDP_HEADER_SIZE - get_overhead(&addr);
-        let mut config = RakSessionConfig::default();
-        conf(&mut config);
-
-        let now = SystemTime::now();
 
         Self {
             id,
@@ -402,6 +192,7 @@ impl RakSession {
             guid,
             mtu,
             config,
+            clock,
 
             last_tick: now,
             last_ping: now,
@@ -412,6 +203,7 @@ impl RakSession {
             state: RakSessionState::Connected,
             congestion_controller: RakCongestionController::new(mtu as usize),
             bandwidth_limited: false,
+            wire_continuous: false,
 
             sequences_recv: HashSet::new(),
             sequences_lost: HashSet::new(),
@@ -434,8 +226,8 @@ impl RakSession {
             outbound_seq_idx: [0; 32],
 
             inbound_seq: 0,
-            inbound_rel_seen: HashSet::new(),
-            inbound_rel_order: VecDeque::new(),
+            inbound_rel_base: 0,
+            inbound_rel_ahead: Vec::new(),
             inbound_spl_queue: HashMap::new(),
             inbound_spl_bytes: 0,
             inbound_spl_last: HashMap::new(),
@@ -443,6 +235,9 @@ impl RakSession {
             inbound_ord_bytes: 0,
             inbound_ord_idx: [0; 32],
             inbound_seq_idx: [0; 32],
+            inbound_progress: 0,
+            inbound_deferred: false,
+            inbound_stall: None,
 
             output: VecDeque::new(),
         }
@@ -465,14 +260,16 @@ impl RakSession {
     }
 
     pub fn max_message_len(&self) -> usize {
-        let split_limit = MAX_OUTBOUND_SPLIT_COUNT * (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
-        usize::try_from(self.config.max_queued_bytes)
-            .unwrap_or(0)
-            .min(split_limit)
-            .max(self.mtu as usize)
+        let payload_per_fragment = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
+        let storage_per_fragment = payload_per_fragment + size_of::<Frame>();
+        let budget = usize::try_from(self.config.max_queued_bytes).unwrap_or(0);
+        let payload_budget = (budget / storage_per_fragment) * payload_per_fragment
+            + (budget % storage_per_fragment).saturating_sub(size_of::<Frame>());
+        let split_limit = MAX_OUTBOUND_SPLIT_COUNT * payload_per_fragment;
+        payload_budget.min(split_limit).max(self.mtu as usize)
     }
 
-    fn handle_timeout(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
         if now >= self.last_recv + SESSION_TIMEOUT {
             debug!(
                 "detected stale connection from {}, disconnecting...",
@@ -483,7 +280,9 @@ impl RakSession {
             return Ok(());
         }
 
-        self.evict_stale_splits(now);
+        if self.evict_stale_splits(now) || self.inbound_stalled(now) {
+            return self.disconnect(true, RakDisconnectReason::Timeout, now);
+        }
 
         if self.state == RakSessionState::Closing {
             return self.update_closing(now);
@@ -496,18 +295,7 @@ impl RakSession {
         }
 
         if now >= self.last_ping + Duration::from_millis(2000) {
-            let ping = ConnectedPing {
-                timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
-            };
-
-            let reliability = RakReliability::Unreliable;
-            let priority = RakPriority::Immediate;
-            self.handle(RakSessionInput::Send(
-                ping.serialized()?,
-                reliability,
-                priority,
-                now,
-            ))?;
+            self.send_connected_ping(now, RakReliability::Unreliable)?;
 
             self.last_ping = now;
         }
@@ -520,13 +308,13 @@ impl RakSession {
             next = min(next, self.last_tick + self.config.autoflush_interval_ms);
         }
 
-        let duration = next.duration_since(now).unwrap_or(Duration::from_secs(0));
+        let duration = next.saturating_duration_since(now);
 
         self.output.push_back(RakSessionOutput::Wait(duration));
         Ok(())
     }
 
-    fn close(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    fn close(&mut self, now: Instant) -> Result<(), RakSessionError> {
         if self.state == RakSessionState::Closing {
             return Ok(());
         }
@@ -551,7 +339,7 @@ impl RakSession {
             && self.outbound_queue.iter().all(VecDeque::is_empty)
     }
 
-    fn update_closing(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    fn update_closing(&mut self, now: Instant) -> Result<(), RakSessionError> {
         let deadline = self.closing_since.unwrap_or(now) + self.config.close_timeout;
 
         self.tick(now)?;
@@ -565,41 +353,17 @@ impl RakSession {
             min(deadline, self.last_recv + SESSION_TIMEOUT),
             now + self.config.autoflush_interval_ms,
         );
-        let duration = next.duration_since(now).unwrap_or(Duration::ZERO);
+        let duration = next.saturating_duration_since(now);
 
         self.output.push_back(RakSessionOutput::Wait(duration));
         Ok(())
     }
 
-    fn evict_stale_splits(&mut self, now: SystemTime) {
-        let last = &self.inbound_spl_last;
-        let mut freed = 0;
-        self.inbound_spl_queue.retain(|split_id, fragments| {
-            let fresh = last
-                .get(split_id)
-                .is_some_and(|&at| now < at + SESSION_TIMEOUT);
-            if !fresh {
-                freed += fragments.values().map(|f| f.payload.len()).sum::<usize>();
-            }
-            fresh
-        });
-        let queue = &self.inbound_spl_queue;
-        self.inbound_spl_last
-            .retain(|split_id, _| queue.contains_key(split_id));
-        self.inbound_spl_bytes = self.inbound_spl_bytes.saturating_sub(freed);
-
-        if freed > 0 {
-            debug!(
-                "evicted {} bytes of stale partial splits from {}",
-                freed, self.addr
-            );
-        }
-    }
-
-    pub fn tick(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    pub fn tick(&mut self, now: Instant) -> Result<(), RakSessionError> {
         if matches!(self.state, RakSessionState::Disconnected) {
             return Ok(());
         }
+        self.wire_continuous = self.bandwidth_limited;
 
         let received = self.sequences_recv.drain().collect();
         self.queue_acks(received, false)?;
@@ -619,7 +383,7 @@ impl RakSession {
         Ok(())
     }
 
-    fn send_stale(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    fn send_stale(&mut self, now: Instant) -> Result<(), RakSessionError> {
         let mut pending = Vec::new();
 
         let mut bandwidth = self.congestion_controller.retransmission_bandwidth();
@@ -634,7 +398,7 @@ impl RakSession {
                 continue;
             };
 
-            let size = set.size_hint();
+            let size = set.encapsulated_size();
             if size > bandwidth {
                 break;
             }
@@ -659,9 +423,10 @@ impl RakSession {
         Ok(())
     }
 
-    fn send_queue(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
+    fn send_queue(&mut self, now: Instant) -> Result<(), RakSessionError> {
         let mut bandwidth = self.congestion_controller.transmission_bandwidth();
         let oldest_reliable = self.oldest_unacked_reliable();
+        let oldest_ordered = self.oldest_unacked_ordered();
         let mut splits_in_flight = self.splits_in_flight();
 
         let mut frames = Vec::new();
@@ -669,6 +434,7 @@ impl RakSession {
             while let Some(frame) = queue.pop_front_if(|f| {
                 f.size_hint() <= bandwidth
                     && within_reliable_window(f, oldest_reliable)
+                    && within_ordered_window(f, &oldest_ordered)
                     && (!f.is_split()
                         || splits_in_flight.contains(&f.split_id)
                         || splits_in_flight.len() < MAX_SPLITS_IN_FLIGHT)
@@ -704,6 +470,23 @@ impl RakSession {
             .max_by_key(|&index| u24::distance(index, self.outbound_rel))
     }
 
+    /// Finds each channel's oldest outstanding ordered message, including queued fragments.
+    fn oldest_unacked_ordered(&self) -> [Option<u32>; 32] {
+        let mut oldest = [None; 32];
+        let cached = self.outbound_cache.values().flat_map(|set| &set.frames);
+        let queued = self.outbound_queue.iter().flatten();
+        for frame in cached.chain(queued).filter(|f| f.reliability.is_ordered()) {
+            let channel = frame.order_channel as usize;
+            let next = self.outbound_ord_idx[channel];
+            if oldest[channel].is_none_or(|index| {
+                u24::distance(frame.order_index, next) > u24::distance(index, next)
+            }) {
+                oldest[channel] = Some(frame.order_index);
+            }
+        }
+        oldest
+    }
+
     fn splits_in_flight(&self) -> HashSet<u16> {
         self.outbound_cache
             .values()
@@ -713,6 +496,7 @@ impl RakSession {
             .collect()
     }
 
+    /// Packs frames and assigns sequences; emission installs the current feedback flags.
     fn make_sets(&mut self, frames: Vec<Frame>) -> Vec<FrameSet> {
         let mut sets = Vec::new();
 
@@ -733,13 +517,11 @@ impl RakSession {
             }
 
             if size + frame_size > max {
-                let continuous_send = batch.iter().any(Frame::is_split);
-
                 sets.push(FrameSet {
                     sequence: self.outbound_seq,
                     frames: take(&mut batch),
-                    continuous_send,
-                    needs_b_and_as: true,
+                    continuous_send: false,
+                    needs_b_and_as: false,
                     is_pair: false,
                 });
                 self.outbound_seq = u24::add(self.outbound_seq, 1);
@@ -752,13 +534,11 @@ impl RakSession {
         }
 
         if !batch.is_empty() {
-            let continuous_send = batch.iter().any(Frame::is_split);
-
             sets.push(FrameSet {
                 sequence: self.outbound_seq,
                 frames: batch,
-                continuous_send,
-                needs_b_and_as: true,
+                continuous_send: false,
+                needs_b_and_as: false,
                 is_pair: false,
             });
             self.outbound_seq = u24::add(self.outbound_seq, 1);
@@ -767,14 +547,18 @@ impl RakSession {
         sets
     }
 
+    /// Installs live feedback flags and charges retained reliable encapsulations once.
     fn send_frame_set(
         &mut self,
-        frameset: FrameSet,
+        mut frameset: FrameSet,
         immediate: bool,
         first_send: bool,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
+        frameset.continuous_send = self.wire_continuous;
+        frameset.needs_b_and_as = self.congestion_controller.slow_start();
         let buf = frameset.serialized()?;
+        self.wire_continuous = true;
 
         match immediate {
             true => self
@@ -790,8 +574,11 @@ impl RakSession {
             let resend = now + self.congestion_controller.retransmission_timeout();
 
             if first_send {
-                self.congestion_controller
-                    .sent(frameset.sequence, frameset.size_hint(), now);
+                self.congestion_controller.sent(
+                    frameset.sequence,
+                    frameset.encapsulated_size(),
+                    now,
+                );
             }
             self.outbound_resend
                 .push((Reverse(resend), frameset.sequence));
@@ -807,12 +594,28 @@ impl RakSession {
         }
     }
 
+    /// Schedules application traffic while keeping Immediate sends inside flow limits.
     fn send_frame(
         &mut self,
         frame: Frame,
         priority: RakPriority,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
+        let frames = self.prepare_frames(frame);
+        if priority == RakPriority::Immediate {
+            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
+            self.outbound_queue[priority as usize].extend(frames);
+            self.wire_continuous = self.bandwidth_limited;
+            self.send_queue(now)?;
+            self.flush();
+        } else {
+            self.queue_frames(frames, priority, now)?;
+        }
+        Ok(())
+    }
+
+    /// Assigns wire counters and fragments one payload independently from scheduling.
+    fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
         let max_size = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
 
         let order_channel = frame.order_channel;
@@ -865,7 +668,7 @@ impl RakSession {
         }
 
         let split_size = payloads.len();
-        let frames = payloads
+        payloads
             .into_iter()
             .enumerate()
             .map(|(i, payload)| Frame {
@@ -886,17 +689,20 @@ impl RakSession {
                 split_id,
                 split_index: i as u32,
             })
-            .collect();
+            .collect()
+    }
 
-        self.queue_frames(frames, priority, now)?;
-        Ok(())
+    /// Emits unreliable or terminal control without waiting for application congestion.
+    fn send_control(&mut self, frame: Frame, now: Instant) -> Result<(), RakSessionError> {
+        let frames = self.prepare_frames(frame);
+        self.queue_frames(frames, RakPriority::Immediate, now)
     }
 
     fn queue_frames(
         &mut self,
         frames: Vec<Frame>,
         priority: RakPriority,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         match priority {
             RakPriority::Immediate => {
@@ -913,11 +719,7 @@ impl RakSession {
         Ok(())
     }
 
-    fn handle_ack(
-        &mut self,
-        buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
-    ) -> Result<(), RakSessionError> {
+    fn handle_ack(&mut self, buf: &mut Cursor<&[u8]>, now: Instant) -> Result<(), RakSessionError> {
         let ack = Ack::deserialize(buf)?;
 
         for seq in ack.sequences {
@@ -928,15 +730,16 @@ impl RakSession {
             match ack.is_nack {
                 true => {
                     self.congestion_controller
-                        .lost(set.sequence, set.size_hint());
+                        .nacked(self.outbound_seq, self.bandwidth_limited);
+                    self.congestion_controller
+                        .lost(set.sequence, set.encapsulated_size());
                     self.queue_frames(set.frames, RakPriority::Immediate, now)?;
-                    self.congestion_controller.nacked(self.bandwidth_limited);
                 }
                 false => {
                     self.congestion_controller.acked(
                         now,
                         set.sequence,
-                        set.size_hint(),
+                        set.encapsulated_size(),
                         self.bandwidth_limited,
                     );
                 }
@@ -945,331 +748,110 @@ impl RakSession {
         Ok(())
     }
 
-    fn handle_frame_set(
+    fn handle_packet(&mut self, buf: Box<[u8]>, now: Instant) -> Result<(), RakSessionError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.state != RakSessionState::Connecting && self.try_handle_control(&buf, now)? {
+            return Ok(());
+        }
+        self.output.push_back(RakSessionOutput::Packet(buf));
+        Ok(())
+    }
+
+    /// Handles common connection controls, returning false for an application or role-specific packet.
+    ///
+    /// The connecting client calls this in output order so acceptance and peer close
+    /// remain ordered with application packets from the same datagram.
+    pub(crate) fn try_handle_control(
         &mut self,
-        buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
-    ) -> Result<(), RakSessionError> {
-        let set = FrameSet::deserialize(buf)?;
-
-        let ahead = u24::distance(self.inbound_seq, set.sequence);
-        if ahead >= DATAGRAM_WINDOW as i32 {
-            debug!(
-                "dropping FrameSet {} from {}, too far ahead of {}",
-                set.sequence, self.addr, self.inbound_seq
-            );
-            return Ok(());
-        }
-
-        if !self.sequences_recv.insert(set.sequence) {
-            debug!(
-                "received duplicate FrameSet {} from {}",
-                set.sequence, self.addr
-            );
-            return Ok(());
-        }
-
-        self.sequences_lost.remove(&set.sequence);
-
-        if ahead < 0 {
-            debug!(
-                "received out of order FrameSet {} from {}, expected {}",
-                set.sequence, self.addr, self.inbound_seq
-            );
-        } else {
-            let mut missing = self.inbound_seq;
-            while missing != set.sequence && self.sequences_lost.len() < DATAGRAM_WINDOW {
-                self.sequences_lost.insert(missing);
-                missing = u24::add(missing, 1);
-            }
-            self.inbound_seq = u24::add(set.sequence, 1);
-        }
-
-        for frame in set.frames {
-            if matches!(self.state, RakSessionState::Disconnected) {
-                break;
-            }
-            self.handle_frame(frame, now)?;
-        }
-        Ok(())
-    }
-
-    fn handle_frame(&mut self, frame: Frame, now: SystemTime) -> Result<(), RakSessionError> {
-        if frame.reliability.is_reliable() && !self.track_reliable(frame.reliable_index) {
-            debug!(
-                "received duplicate reliable frame {} from {}",
-                frame.reliable_index, self.addr
-            );
-            return Ok(());
-        }
-
-        let max_channels = (self.config.ordering_channels as usize).min(self.inbound_ord_idx.len());
-        if (frame.reliability.is_ordered() || frame.reliability.is_sequenced())
-            && frame.order_channel as usize >= max_channels
-        {
-            debug!(
-                "received frame with out of range order channel {} from {}",
-                frame.order_channel, self.addr
-            );
-            return Ok(());
-        }
-
-        match frame.is_split() {
-            true => self.handle_split_frame(frame, now)?,
-            false => self.handle_full_frame(frame, now)?,
-        }
-        Ok(())
-    }
-
-    fn track_reliable(&mut self, index: u32) -> bool {
-        if !self.inbound_rel_seen.insert(index) {
-            return false;
-        }
-
-        self.inbound_rel_order.push_back(index);
-
-        while self.inbound_rel_order.len() > RELIABLE_WINDOW {
-            if let Some(old) = self.inbound_rel_order.pop_front() {
-                self.inbound_rel_seen.remove(&old);
-            }
-        }
-
-        true
-    }
-
-    fn handle_full_frame(&mut self, frame: Frame, now: SystemTime) -> Result<(), RakSessionError> {
-        let channel = frame.order_channel as usize;
-
-        if frame.reliability.is_sequenced() {
-            if u24::distance(self.inbound_seq_idx[channel], frame.sequence_index) < 0
-                || u24::distance(self.inbound_ord_idx[channel], frame.order_index) < 0
-            {
-                debug!(
-                    "dropped stale sequenced frame on channel {} from {}",
-                    frame.order_channel, self.addr
-                );
-                return Ok(());
-            }
-
-            self.inbound_seq_idx[channel] = u24::add(frame.sequence_index, 1);
-
-            return self.handle_packet(frame.payload, now);
-        }
-
-        if frame.reliability.is_ordered() {
-            let ahead = u24::distance(self.inbound_ord_idx[channel], frame.order_index);
-
-            if ahead == 0 {
-                self.inbound_seq_idx[channel] = 0;
-                self.inbound_ord_idx[channel] = u24::add(frame.order_index, 1);
-
-                self.handle_packet(frame.payload, now)?;
-
-                let mut idx = self.inbound_ord_idx[channel];
-
-                let mut packets = Vec::new();
-                {
-                    let unord_queue = self
-                        .inbound_ord_queue
-                        .entry(frame.order_channel)
-                        .or_default();
-                    while let Some(unord_frame) = unord_queue.remove(&idx) {
-                        self.inbound_ord_bytes = self
-                            .inbound_ord_bytes
-                            .saturating_sub(unord_frame.payload.len());
-                        packets.push(unord_frame.payload);
-
-                        idx = u24::add(idx, 1);
-                    }
-                }
-                self.inbound_ord_idx[channel] = idx;
-
-                for packet in packets {
-                    self.handle_packet(packet, now)?;
-                }
-                return Ok(());
-            }
-
-            if ahead >= ORDER_WINDOW as i32 {
-                debug!(
-                    "closing session with {}, order index {} too far ahead of {}",
-                    self.addr, frame.order_index, self.inbound_ord_idx[channel]
-                );
-                return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
-            }
-
-            if ahead > 0 {
-                if self.exceeds_queued_bytes(frame.payload.len()) {
-                    debug!(
-                        "closing session with {}, buffered ordered bytes would exceed max_queued_bytes",
-                        self.addr
-                    );
-                    return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
-                }
-
-                self.inbound_ord_bytes += frame.payload.len();
-                if let Some(replaced) = self
-                    .inbound_ord_queue
-                    .entry(frame.order_channel)
-                    .or_default()
-                    .insert(frame.order_index, frame)
-                {
-                    self.inbound_ord_bytes = self
-                        .inbound_ord_bytes
-                        .saturating_sub(replaced.payload.len());
-                }
-            }
-            return Ok(());
-        }
-
-        self.handle_packet(frame.payload, now)?;
-        Ok(())
-    }
-
-    fn handle_split_frame(&mut self, frame: Frame, now: SystemTime) -> Result<(), RakSessionError> {
-        if frame.split_index >= frame.split_size {
-            debug!(
-                "received split frame with out of range index {} (size {}) from {}",
-                frame.split_index, frame.split_size, self.addr
-            );
-            return Ok(());
-        }
-
-        if let Some(reason) = self.split_violation(&frame) {
-            debug!("closing session with {}, {}", self.addr, reason);
-            return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
-        }
-
-        if self.split_slots_full(frame.split_id) {
-            debug!(
-                "dropping split frame from {}, {} splits already in reassembly",
-                self.addr, MAX_CONCURRENT_SPLITS
-            );
-            return Ok(());
-        }
-
-        if self.exceeds_queued_bytes(frame.payload.len()) {
-            debug!(
-                "dropping split frame from {}, buffered split bytes would exceed max_queued_bytes",
-                self.addr
-            );
-            return Ok(());
-        }
-
-        let split_id = frame.split_id;
-        let split_size = frame.split_size;
-
-        let fragments = self.inbound_spl_queue.entry(split_id).or_default();
-        if fragments.contains_key(&frame.split_index) {
-            return Ok(());
-        }
-        self.inbound_spl_bytes += frame.payload.len();
-        fragments.insert(frame.split_index, frame);
-        self.inbound_spl_last.insert(split_id, now);
-
-        if fragments.len() as u32 != split_size {
-            return Ok(());
-        }
-
-        self.inbound_spl_last.remove(&split_id);
-        let Some(mut fragments) = self.inbound_spl_queue.remove(&split_id) else {
-            return Ok(());
+        buf: &[u8],
+        now: Instant,
+    ) -> Result<bool, RakSessionError> {
+        let Some(&id) = buf.first() else {
+            return Ok(false);
         };
-        let buffered: usize = fragments.values().map(|f| f.payload.len()).sum();
-        self.inbound_spl_bytes = self.inbound_spl_bytes.saturating_sub(buffered);
-
-        let mut payload = Vec::with_capacity(buffered);
-        let mut whole = None;
-        for i in 0..split_size {
-            let Some(fragment) = fragments.remove(&i) else {
-                return Ok(());
-            };
-            payload.extend_from_slice(&fragment.payload);
-            whole.get_or_insert(fragment);
-        }
-        let Some(mut whole) = whole else {
-            return Ok(());
-        };
-
-        whole.payload = payload.into_boxed_slice();
-        whole.split_size = 0;
-        whole.split_id = 0;
-        whole.split_index = 0;
-
-        self.handle_full_frame(whole, now)
-    }
-
-    fn exceeds_queued_bytes(&self, additional: usize) -> bool {
-        self.inbound_spl_bytes + self.inbound_ord_bytes + additional
-            > self.config.max_queued_bytes as usize
-    }
-
-    fn split_violation(&self, frame: &Frame) -> Option<&'static str> {
-        if frame.payload.is_empty() {
-            return Some("empty split fragment");
-        }
-        if frame.split_size > MAX_SPLIT_COUNT {
-            return Some("split count exceeds the maximum");
-        }
-        self.inbound_spl_queue
-            .get(&frame.split_id)?
-            .values()
-            .next()
-            .is_some_and(|f| f.split_size != frame.split_size)
-            .then_some("split count changed mid-split")
-    }
-
-    fn split_slots_full(&self, split_id: u16) -> bool {
-        self.inbound_spl_queue.len() >= MAX_CONCURRENT_SPLITS
-            && !self.inbound_spl_queue.contains_key(&split_id)
-    }
-
-    fn handle_packet(&mut self, buf: Box<[u8]>, now: SystemTime) -> Result<(), RakSessionError> {
-        let Some(&b) = buf.first() else {
-            return Ok(());
-        };
-
-        let mut cursor = Cursor::new(buf.as_ref());
-        match b {
+        let mut cursor = Cursor::new(buf);
+        match id {
             packet_id::CONNECTED_PING => self.handle_connected_ping(&mut cursor, now)?,
             packet_id::CONNECTED_PONG => self.handle_connected_pong(&mut cursor, now)?,
+            packet_id::DETECT_LOST_CONNECTIONS if self.state == RakSessionState::Closing => {}
+            packet_id::DETECT_LOST_CONNECTIONS => {
+                self.send_connected_ping(now, RakReliability::ReliableOrdered)?
+            }
             packet_id::DISCONNECT => self.handle_disconnect(&mut cursor, now)?,
-            _ => self.output.push_back(RakSessionOutput::Packet(buf)),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Emits a liveness ping using the caller's time and selected control reliability.
+    fn send_connected_ping(
+        &mut self,
+        now: Instant,
+        reliability: RakReliability,
+    ) -> Result<(), RakSessionError> {
+        let ping = ConnectedPing {
+            timestamp: self.clock.timestamp(now),
         };
-        Ok(())
+        let payload = ping.serialized()?;
+        if reliability.is_reliable() {
+            // Reliable liveness needs the same retention and delivery limits as application data.
+            self.handle(RakSessionInput::Send(
+                payload,
+                reliability,
+                RakPriority::Immediate,
+                now,
+            ))
+        } else {
+            self.send_control(Frame::new(reliability, payload), now)
+        }
+    }
+
+    /// Restores the completed handshake prefix before an optional terminal notification.
+    pub(crate) fn restore_handshake_outputs(
+        &mut self,
+        packets: VecDeque<Box<[u8]>>,
+        terminal: Option<(RakSessionId, RakDisconnectReason)>,
+    ) {
+        for packet in packets {
+            self.output.push_back(RakSessionOutput::Packet(packet));
+        }
+        if let Some((id, reason)) = terminal {
+            self.output
+                .push_back(RakSessionOutput::Disconnected(id, reason));
+        }
     }
 
     fn handle_connected_ping(
         &mut self,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         let ping = ConnectedPing::deserialize(buf)?;
 
         let pong = ConnectedPong {
             ping_timestamp: ping.timestamp,
-            timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
+            timestamp: self.clock.timestamp(now),
         };
 
-        let reliability = RakReliability::Unreliable;
-        let priority = RakPriority::Immediate;
-        _ = self.handle(RakSessionInput::Send(
-            pong.serialized()?,
-            reliability,
-            priority,
-            now,
-        ));
+        if self.state != RakSessionState::Closing {
+            self.send_control(
+                Frame::new(RakReliability::Unreliable, pong.serialized()?),
+                now,
+            )?;
+        }
         Ok(())
     }
 
     fn handle_connected_pong(
         &mut self,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         let pong = ConnectedPong::deserialize(buf)?;
 
-        if UNIX_EPOCH + Duration::from_millis(pong.ping_timestamp) >= self.last_ping {
+        if pong.ping_timestamp >= self.clock.timestamp(self.last_ping) {
             self.last_pong = now;
         }
         Ok(())
@@ -1278,7 +860,7 @@ impl RakSession {
     fn handle_disconnect(
         &mut self,
         buf: &mut Cursor<&[u8]>,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         Disconnect::deserialize(buf)?;
 
@@ -1292,7 +874,7 @@ impl RakSession {
         &mut self,
         send: bool,
         reason: RakDisconnectReason,
-        now: SystemTime,
+        now: Instant,
     ) -> Result<(), RakSessionError> {
         if matches!(self.state, RakSessionState::Disconnected) {
             return Err(RakSessionError::Closed);
@@ -1303,7 +885,8 @@ impl RakSession {
 
             let frame = Frame::new(RakReliability::ReliableOrdered, disconnect.serialized()?);
 
-            self.send_frame(frame, RakPriority::Immediate, now)?;
+            // Terminal control must leave before the adapter receives Disconnected.
+            self.send_control(frame, now)?;
         }
 
         self.state = RakSessionState::Disconnected;
@@ -1324,1148 +907,15 @@ fn within_reliable_window(frame: &Frame, oldest: Option<u32>) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::packets::ack::MAX_ACK_ENTRIES;
-
-    #[test]
-    fn a_snapshot_round_trips_through_json_and_resumes_where_it_left_off() {
-        let mut session = RakSession::new(
-            RakSessionId(42),
-            "127.0.0.1:19132".parse().unwrap(),
-            0xDEAD_BEEF,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        let now = SystemTime::now();
-        session
-            .handle(RakSessionInput::Send(
-                Box::from(*b"hello"),
-                RakReliability::ReliableOrdered,
-                RakPriority::Immediate,
-                now,
-            ))
-            .unwrap();
-        while session.poll().is_some() {}
-
-        let before_seq = session.outbound_rel;
-        assert!(
-            before_seq > 0,
-            "sending a reliable frame should advance outbound_rel"
-        );
-
-        let json = facet_json::to_string(&session.snapshot()).expect("snapshot must serialize");
-        let mut resumed =
-            RakSession::restore(facet_json::from_str(&json).expect("snapshot must deserialize"))
-                .expect("a snapshot's own address must parse");
-
-        assert_eq!(resumed.id, session.id);
-        assert_eq!(resumed.addr, session.addr);
-        assert_eq!(resumed.guid, session.guid);
-        assert_eq!(resumed.outbound_rel, before_seq);
-
-        resumed
-            .handle(RakSessionInput::Send(
-                Box::from(*b"world"),
-                RakReliability::ReliableOrdered,
-                RakPriority::Immediate,
-                now,
-            ))
-            .unwrap();
-        assert_eq!(resumed.outbound_rel, before_seq + 1);
-    }
-
-    /// JSON has no infinity, and an unmeasured RTT is infinite - it must not come back
-    /// as zero.
-    #[test]
-    fn an_unmeasured_rtt_survives_a_json_round_trip() {
-        let session = RakSession::new(
-            RakSessionId(1),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        let json = facet_json::to_string(&session.snapshot()).unwrap();
-        let resumed = RakSession::restore(facet_json::from_str(&json).unwrap()).unwrap();
-
-        assert_eq!(
-            resumed.congestion_controller.retransmission_timeout(),
-            session.congestion_controller.retransmission_timeout()
-        );
-    }
-
-    #[test]
-    fn out_of_range_order_channel_does_not_panic() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([]));
-        frame.order_channel = u8::MAX;
-
-        session.handle_frame(frame, SystemTime::now()).unwrap();
-    }
-
-    #[test]
-    fn max_message_len_is_the_outbound_split_limit() {
-        let session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        assert_eq!(
-            session.max_message_len(),
-            MAX_OUTBOUND_SPLIT_COUNT * (session.mtu - DGRAM_MTU_OVERHEAD) as usize
-        );
-    }
-
-    #[test]
-    fn max_message_len_is_at_least_one_unsplit_frame() {
-        let session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |conf| conf.max_queued_bytes = 4,
-        );
-
-        assert_eq!(session.max_message_len(), session.mtu as usize);
-    }
-
-    #[test]
-    fn honors_configured_ordering_channels() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |conf| conf.ordering_channels = 4,
-        );
-
-        let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([1]));
-        frame.order_channel = 4;
-
-        session.handle_frame(frame, SystemTime::now()).unwrap();
-
-        assert_eq!(session.inbound_ord_idx[4], 0);
-    }
-
-    #[test]
-    fn priority_routes_to_separate_queues() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        let now = SystemTime::now();
-        session
-            .send_frame(
-                Frame::new(RakReliability::Unreliable, Box::new([1])),
-                RakPriority::Low,
-                now,
-            )
-            .unwrap();
-        session
-            .send_frame(
-                Frame::new(RakReliability::Unreliable, Box::new([2])),
-                RakPriority::High,
-                now,
-            )
-            .unwrap();
-
-        assert_eq!(session.outbound_queue[RakPriority::High as usize].len(), 1);
-        assert_eq!(session.outbound_queue[RakPriority::Low as usize].len(), 1);
-    }
-
-    #[test]
-    fn rejects_out_of_range_split_index() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        let mut frame = Frame::new(RakReliability::Reliable, Box::new([1, 2, 3]));
-        frame.split_size = 2;
-        frame.split_index = 5;
-        frame.split_id = 1;
-
-        session.handle_frame(frame, SystemTime::now()).unwrap();
-
-        assert!(session.inbound_spl_queue.is_empty());
-    }
-
-    #[test]
-    fn drops_split_frame_exceeding_max_queued_bytes() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |conf| conf.max_queued_bytes = 4,
-        );
-
-        let mut frame = Frame::new(RakReliability::Reliable, vec![0u8; 8].into_boxed_slice());
-        frame.split_size = 2;
-        frame.split_index = 0;
-        frame.split_id = 1;
-
-        session.handle_frame(frame, SystemTime::now()).unwrap();
-
-        assert!(session.inbound_spl_queue.is_empty());
-    }
-
-    #[test]
-    fn disconnect_reason_matches_cause() {
-        let mut session = RakSession::new(
-            RakSessionId(0),
-            "127.0.0.1:19132".parse().unwrap(),
-            0,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        );
-
-        session
-            .handle(RakSessionInput::Disconnect(SystemTime::now()))
-            .unwrap();
-
-        let reason = session
-            .output
-            .iter()
-            .find_map(|out| match out {
-                RakSessionOutput::Disconnected(_, reason) => Some(*reason),
-                _ => None,
-            })
-            .unwrap();
-
-        assert_eq!(reason, RakDisconnectReason::Requested);
-    }
-
-    fn session(id: u64, port: u16) -> RakSession {
-        RakSession::new(
-            RakSessionId(id),
-            SocketAddr::from(([127, 0, 0, 1], port)),
-            id,
-            crate::util::constants::MAX_MTU_SIZE,
-            |_| {},
-        )
-    }
-
-    fn deliver(from: &mut RakSession, to: &mut RakSession, now: SystemTime) {
-        let datagrams: Vec<Box<[u8]>> = std::iter::from_fn(|| from.poll())
-            .filter_map(|out| match out {
-                RakSessionOutput::Datagram(buf, _) => Some(buf),
-                _ => None,
-            })
-            .collect();
-        for buf in datagrams {
-            to.handle(RakSessionInput::Datagram(buf, now)).unwrap();
+/// Keeps new ordered messages inside the peer's window while an earlier message is unacknowledged.
+fn within_ordered_window(frame: &Frame, oldest: &[Option<u32>; 32]) -> bool {
+    match oldest[frame.order_channel as usize] {
+        Some(index) if frame.reliability.is_ordered() => {
+            u24::distance(index, frame.order_index) < ORDER_WINDOW as i32
         }
-    }
-
-    fn packets(session: &mut RakSession) -> Vec<Box<[u8]>> {
-        std::iter::from_fn(|| session.poll())
-            .filter_map(|out| match out {
-                RakSessionOutput::Packet(buf) => Some(buf),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn datagram(sequence: u32, frames: Vec<Frame>) -> RakSessionInput {
-        let set = FrameSet::new(sequence, frames, false, true, false);
-
-        RakSessionInput::Datagram(set.serialized().unwrap(), SystemTime::now())
-    }
-
-    fn unreliable(byte: u8) -> Vec<Frame> {
-        vec![Frame::new(
-            RakReliability::Unreliable,
-            Box::new([0xFE, byte]),
-        )]
-    }
-
-    #[test]
-    fn datagram_gap_within_window_is_nacked() {
-        let mut session = session(0, 1);
-
-        session.handle(datagram(0, unreliable(0))).unwrap();
-        session.handle(datagram(3, unreliable(3))).unwrap();
-
-        assert_eq!(session.sequences_lost, HashSet::from([1, 2]));
-        assert_eq!(session.inbound_seq, 4);
-    }
-
-    #[test]
-    fn datagram_beyond_window_is_dropped() {
-        let mut session = session(0, 1);
-
-        session
-            .handle(datagram(DATAGRAM_WINDOW as u32 * 50, unreliable(0)))
-            .unwrap();
-
-        assert!(
-            session.sequences_lost.is_empty(),
-            "a datagram far ahead must not mark {} sequences lost",
-            session.sequences_lost.len()
-        );
-        assert_eq!(session.inbound_seq, 0);
-        assert!(packets(&mut session).is_empty());
-    }
-
-    #[test]
-    fn late_datagram_does_not_move_inbound_seq_backwards() {
-        let mut session = session(0, 1);
-
-        session.handle(datagram(0, unreliable(0))).unwrap();
-        session.handle(datagram(5, unreliable(5))).unwrap();
-        session.handle(datagram(3, unreliable(3))).unwrap();
-
-        assert_eq!(session.inbound_seq, 6);
-        assert_eq!(session.sequences_lost, HashSet::from([1, 2, 4]));
-        assert_eq!(packets(&mut session).len(), 3);
-    }
-
-    #[test]
-    fn lost_sequences_stay_bounded_under_repeated_gaps() {
-        let mut session = session(0, 1);
-
-        let step = DATAGRAM_WINDOW as u32 - 1;
-        for i in 1..=16 {
-            session.handle(datagram(i * step, unreliable(0))).unwrap();
-        }
-
-        assert!(session.sequences_lost.len() <= DATAGRAM_WINDOW);
-    }
-
-    fn ordered(order_index: u32) -> Frame {
-        let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([0xFE]));
-        frame.order_index = order_index;
-        frame
-    }
-
-    fn disconnect_reason(session: &RakSession) -> Option<RakDisconnectReason> {
-        session.output.iter().find_map(|out| match out {
-            RakSessionOutput::Disconnected(_, reason) => Some(*reason),
-            _ => None,
-        })
-    }
-
-    #[test]
-    fn ordered_frame_within_window_is_queued() {
-        let mut session = session(0, 1);
-
-        session
-            .handle_frame(ordered(ORDER_WINDOW as u32 - 1), SystemTime::now())
-            .unwrap();
-
-        assert_eq!(session.inbound_ord_queue[&0].len(), 1);
-        assert_eq!(session.state, RakSessionState::Connected);
-    }
-
-    #[test]
-    fn ordered_frame_beyond_window_closes_the_session() {
-        let mut session = session(0, 1);
-
-        session
-            .handle_frame(ordered(ORDER_WINDOW as u32), SystemTime::now())
-            .unwrap();
-
-        assert!(
-            session.inbound_ord_queue.values().all(HashMap::is_empty),
-            "a frame {ORDER_WINDOW} ahead must not be buffered"
-        );
-        assert_eq!(session.state, RakSessionState::Disconnected);
-        assert_eq!(
-            disconnect_reason(&session),
-            Some(RakDisconnectReason::ProtocolViolation)
-        );
-    }
-
-    fn sequenced(sequence_index: u32, payload: &[u8]) -> Frame {
-        let mut frame = Frame::new(RakReliability::UnreliableSequenced, payload.into());
-        frame.sequence_index = sequence_index;
-        frame
-    }
-
-    #[test]
-    fn stale_sequenced_frame_is_dropped() {
-        let mut session = session(0, 1);
-        let now = SystemTime::now();
-
-        session.handle_frame(sequenced(5, &[0xFE, 1]), now).unwrap();
-        session.handle_frame(sequenced(3, &[0xFE, 2]), now).unwrap();
-        session.handle_frame(sequenced(6, &[0xFE, 3]), now).unwrap();
-
-        let delivered = packets(&mut session);
-        assert_eq!(
-            delivered,
-            vec![Box::<[u8]>::from([0xFE, 1]), Box::<[u8]>::from([0xFE, 3])],
-            "a sequenced frame older than the last delivered one must be dropped"
-        );
-    }
-
-    fn fragment(split_id: u16, split_size: u32, split_index: u32, payload: &[u8]) -> Frame {
-        let mut frame = Frame::new(RakReliability::Unreliable, payload.into());
-        frame.split_id = split_id;
-        frame.split_size = split_size;
-        frame.split_index = split_index;
-        frame
-    }
-
-    fn assert_closed_for_violation(session: &RakSession) {
-        assert_eq!(session.state, RakSessionState::Disconnected);
-        assert_eq!(
-            disconnect_reason(session),
-            Some(RakDisconnectReason::ProtocolViolation)
-        );
-    }
-
-    #[test]
-    fn split_count_above_limit_closes_the_session() {
-        let mut session = session(0, 1);
-
-        session
-            .handle_frame(
-                fragment(1, MAX_SPLIT_COUNT + 1, 0, &[0xFE]),
-                SystemTime::now(),
-            )
-            .unwrap();
-
-        assert!(session.inbound_spl_queue.is_empty());
-        assert_closed_for_violation(&session);
-    }
-
-    #[test]
-    fn concurrent_splits_above_limit_are_dropped() {
-        let mut session = session(0, 1);
-
-        let now = SystemTime::now();
-        for split_id in 0..=MAX_CONCURRENT_SPLITS as u16 {
-            session
-                .handle_frame(fragment(split_id, 2, 0, &[0xFE]), now)
-                .unwrap();
-        }
-
-        assert_eq!(session.inbound_spl_queue.len(), MAX_CONCURRENT_SPLITS);
-        assert!(
-            !session
-                .inbound_spl_queue
-                .contains_key(&(MAX_CONCURRENT_SPLITS as u16))
-        );
-        assert_eq!(session.inbound_spl_bytes, MAX_CONCURRENT_SPLITS);
-        assert_eq!(disconnect_reason(&session), None);
-    }
-
-    #[test]
-    fn a_hundred_interleaved_splits_are_reassembled() {
-        let mut session = session(0, 1);
-
-        let now = SystemTime::now();
-        for split_index in 0..2 {
-            for split_id in 0..100 {
-                session
-                    .handle_frame(fragment(split_id, 2, split_index, &[0xFE]), now)
-                    .unwrap();
-            }
-        }
-
-        assert_eq!(packets(&mut session).len(), 100);
-        assert_eq!(disconnect_reason(&session), None);
-    }
-
-    #[test]
-    fn empty_split_fragment_closes_the_session() {
-        let mut session = session(0, 1);
-
-        session
-            .handle_frame(fragment(1, 2, 0, &[]), SystemTime::now())
-            .unwrap();
-
-        assert!(session.inbound_spl_queue.is_empty());
-        assert_closed_for_violation(&session);
-    }
-
-    #[test]
-    fn split_size_mismatch_closes_the_session() {
-        let mut session = session(0, 1);
-
-        let now = SystemTime::now();
-        session
-            .handle_frame(fragment(1, 3, 0, &[0xFE]), now)
-            .unwrap();
-        session
-            .handle_frame(fragment(1, 2, 1, &[0xFF]), now)
-            .unwrap();
-
-        assert_closed_for_violation(&session);
-    }
-
-    #[test]
-    fn completed_split_is_delivered_and_releases_its_byte_budget() {
-        let mut session = session(0, 1);
-        session.config.max_queued_bytes = 4;
-
-        let now = SystemTime::now();
-        session
-            .handle_frame(fragment(1, 2, 0, &[0xFE, 1]), now)
-            .unwrap();
-        session
-            .handle_frame(fragment(1, 2, 1, &[2, 3]), now)
-            .unwrap();
-        session
-            .handle_frame(fragment(2, 2, 0, &[0xFE, 4, 5, 6]), now)
-            .unwrap();
-
-        assert_eq!(packets(&mut session), vec![Box::from([0xFE, 1, 2, 3])]);
-        assert_eq!(session.inbound_spl_queue[&2].len(), 1);
-    }
-
-    #[test]
-    fn counters_wrap_at_24_bits_in_both_directions() {
-        let near_top = u24::MASK - 1;
-
-        let mut sender = session(1, 1);
-        sender.outbound_seq = near_top;
-        sender.outbound_rel = near_top;
-        sender.outbound_ord_idx[0] = near_top;
-
-        let mut receiver = session(2, 2);
-        receiver.inbound_seq = near_top;
-        receiver.inbound_ord_idx[0] = near_top;
-
-        let now = SystemTime::now();
-        for i in 0..4u8 {
-            sender
-                .handle(RakSessionInput::Send(
-                    Box::new([0xFE, i]),
-                    RakReliability::ReliableOrdered,
-                    RakPriority::Immediate,
-                    now,
-                ))
-                .unwrap();
-            deliver(&mut sender, &mut receiver, now);
-        }
-
-        let received = packets(&mut receiver);
-        let expected: Vec<Box<[u8]>> = (0..4u8).map(|i| Box::from([0xFE, i])).collect();
-        assert_eq!(
-            received, expected,
-            "every packet across the wrap must arrive in order"
-        );
-        assert_eq!(sender.outbound_seq, 2);
-        assert_eq!(sender.outbound_rel, 2);
-        assert_eq!(sender.outbound_ord_idx[0], 2);
-        assert_eq!(receiver.inbound_ord_idx[0], 2);
-    }
-
-    fn outbound_acks(session: &mut RakSession) -> Vec<Box<[u8]>> {
-        std::iter::from_fn(|| session.poll())
-            .filter_map(|out| match out {
-                RakSessionOutput::Datagram(buf, _) if buf[0] & (flags::ACK | flags::NACK) != 0 => {
-                    Some(buf)
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn outbound_acks_fit_the_mtu() {
-        let mut session = session(0, 1);
-
-        let received: Vec<u32> = (0..DATAGRAM_WINDOW as u32).map(|i| i * 2).collect();
-        for &sequence in &received {
-            session.handle(datagram(sequence, unreliable(0))).unwrap();
-        }
-        session.tick(SystemTime::now()).unwrap();
-
-        let mut acked = Vec::new();
-        let mut nacked = Vec::new();
-        for buf in outbound_acks(&mut session) {
-            assert!(
-                buf.len() <= session.mtu as usize,
-                "an ACK of {} bytes exceeds the {} byte MTU",
-                buf.len(),
-                session.mtu
-            );
-            let ack = Ack::deserialize(&mut buf.as_ref()).unwrap();
-            match ack.is_nack {
-                true => nacked.extend(ack.sequences),
-                false => acked.extend(ack.sequences),
-            }
-        }
-        acked.sort_unstable();
-        nacked.sort_unstable();
-
-        assert_eq!(acked, received);
-        assert_eq!(nacked.len(), DATAGRAM_WINDOW - 1);
-    }
-
-    #[test]
-    fn outbound_acks_respect_the_entry_cap() {
-        let mut session = session(0, 1);
-
-        let received = MAX_ACK_ENTRIES as u32 * 2 + 1;
-        for sequence in 0..received {
-            session.handle(datagram(sequence, unreliable(0))).unwrap();
-        }
-        session.tick(SystemTime::now()).unwrap();
-
-        let mut acked = Vec::new();
-        for buf in outbound_acks(&mut session) {
-            let ack = Ack::deserialize(&mut buf.as_ref());
-            assert!(
-                ack.is_ok(),
-                "every outbound ACK must decode under the entry cap, got {ack:?}"
-            );
-            acked.extend(ack.unwrap().sequences);
-        }
-        acked.sort_unstable();
-
-        assert_eq!(acked, (0..received).collect::<Vec<_>>());
-    }
-
-    fn ordered_payload(order_index: u32, payload: &[u8]) -> Frame {
-        let mut frame = Frame::new(RakReliability::ReliableOrdered, payload.into());
-        frame.order_index = order_index;
-        frame.reliable_index = order_index;
-        frame
-    }
-
-    #[test]
-    fn ordered_frames_beyond_max_queued_bytes_close_the_session() {
-        let mut session = session(0, 1);
-        session.config.max_queued_bytes = 4;
-
-        session
-            .handle_frame(ordered_payload(1, &[0xFE, 1, 2, 3, 4]), SystemTime::now())
-            .unwrap();
-
-        assert!(session.inbound_ord_queue.values().all(HashMap::is_empty));
-        assert_closed_for_violation(&session);
-    }
-
-    #[test]
-    fn ordered_queue_shares_the_byte_budget_with_split_reassembly() {
-        let mut session = session(0, 1);
-        session.config.max_queued_bytes = 4;
-
-        let now = SystemTime::now();
-        session
-            .handle_frame(fragment(1, 2, 0, &[0xFE, 1, 2]), now)
-            .unwrap();
-        session
-            .handle_frame(ordered_payload(1, &[0xFE, 1]), now)
-            .unwrap();
-
-        assert_closed_for_violation(&session);
-    }
-
-    #[test]
-    fn delivered_ordered_frames_release_their_byte_budget() {
-        let mut session = session(0, 1);
-        session.config.max_queued_bytes = 4;
-
-        let now = SystemTime::now();
-        session
-            .handle_frame(ordered_payload(1, &[0xFE, 1, 2]), now)
-            .unwrap();
-        session
-            .handle_frame(ordered_payload(0, &[0xFE]), now)
-            .unwrap();
-        session
-            .handle_frame(ordered_payload(3, &[0xFE, 3, 4]), now)
-            .unwrap();
-
-        assert_eq!(session.state, RakSessionState::Connected);
-        assert_eq!(packets(&mut session).len(), 2);
-        assert_eq!(session.inbound_ord_queue[&0].len(), 1);
-    }
-
-    fn datagram_at(sequence: u32, frames: Vec<Frame>, now: SystemTime) -> RakSessionInput {
-        let RakSessionInput::Datagram(buf, _) = datagram(sequence, frames) else {
-            unreachable!()
-        };
-        RakSessionInput::Datagram(buf, now)
-    }
-
-    #[test]
-    fn partial_split_without_a_fragment_for_the_session_timeout_is_evicted() {
-        let mut session = session(0, 1);
-        let start = SystemTime::now();
-
-        session
-            .handle(datagram_at(0, vec![fragment(1, 2, 0, &[0xFE, 1])], start))
-            .unwrap();
-        session
-            .handle(datagram_at(1, unreliable(0), start + SESSION_TIMEOUT / 2))
-            .unwrap();
-        session
-            .handle(RakSessionInput::Update(
-                start + SESSION_TIMEOUT + Duration::from_millis(1),
-            ))
-            .unwrap();
-
-        assert_eq!(session.state, RakSessionState::Connected);
-        assert!(
-            session.inbound_spl_queue.is_empty(),
-            "a split idle for the session timeout must be evicted"
-        );
-        assert_eq!(session.inbound_spl_bytes, 0);
-    }
-
-    #[test]
-    fn partial_split_receiving_fragments_is_kept() {
-        let mut session = session(0, 1);
-        let start = SystemTime::now();
-
-        session
-            .handle(datagram_at(0, vec![fragment(1, 3, 0, &[0xFE])], start))
-            .unwrap();
-        session
-            .handle(datagram_at(
-                1,
-                vec![fragment(1, 3, 1, &[1])],
-                start + SESSION_TIMEOUT / 2,
-            ))
-            .unwrap();
-        session
-            .handle(RakSessionInput::Update(
-                start + SESSION_TIMEOUT + Duration::from_millis(1),
-            ))
-            .unwrap();
-
-        assert_eq!(session.inbound_spl_queue[&1].len(), 2);
-        assert_eq!(session.inbound_spl_bytes, 2);
-    }
-
-    #[test]
-    fn large_sends_split_into_datagrams_within_the_mtu() {
-        let reliabilities = [
-            RakReliability::Unreliable,
-            RakReliability::UnreliableSequenced,
-            RakReliability::Reliable,
-            RakReliability::ReliableOrdered,
-            RakReliability::ReliableSequenced,
-            RakReliability::UnreliableWithAckReceipt,
-            RakReliability::ReliableWithAckReceipt,
-            RakReliability::ReliableOrderedWithAckReceipt,
-        ];
-        let now = SystemTime::now();
-
-        for mtu in crate::util::constants::MTU_SIZES {
-            for reliability in reliabilities {
-                let mut session = RakSession::new(
-                    RakSessionId(0),
-                    "[::1]:19132".parse().unwrap(),
-                    0,
-                    mtu,
-                    |_| {},
-                );
-                for priority in [RakPriority::Immediate, RakPriority::Normal] {
-                    session
-                        .handle(RakSessionInput::Send(
-                            vec![0xFE; 64 * 1024].into_boxed_slice(),
-                            reliability,
-                            priority,
-                            now,
-                        ))
-                        .unwrap();
-                }
-                session.tick(now).unwrap();
-
-                let max = session.mtu as usize;
-                for out in std::iter::from_fn(|| session.poll()) {
-                    if let RakSessionOutput::Datagram(buf, _) = out {
-                        assert!(
-                            buf.len() <= max,
-                            "{reliability:?} at mtu {mtu} sent {} bytes",
-                            buf.len()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn drain_outputs(session: &mut RakSession) -> Vec<RakSessionOutput> {
-        std::iter::from_fn(|| session.poll()).collect()
-    }
-
-    fn datagrams_of(outputs: &[RakSessionOutput]) -> Vec<Box<[u8]>> {
-        outputs
-            .iter()
-            .filter_map(|out| match out {
-                RakSessionOutput::Datagram(buf, _) => Some(buf.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn payloads_of(outputs: &[RakSessionOutput]) -> Vec<Box<[u8]>> {
-        datagrams_of(outputs)
-            .iter()
-            .filter(|buf| buf[0] & flags::VALID != 0 && buf[0] & (flags::ACK | flags::NACK) == 0)
-            .flat_map(|buf| {
-                FrameSet::deserialize(&mut Cursor::new(buf.as_ref()))
-                    .unwrap()
-                    .frames
-            })
-            .map(|frame| frame.payload)
-            .collect()
-    }
-
-    fn disconnect_reason_of(outputs: &[RakSessionOutput]) -> Option<RakDisconnectReason> {
-        outputs.iter().find_map(|out| match out {
-            RakSessionOutput::Disconnected(_, reason) => Some(*reason),
-            _ => None,
-        })
-    }
-
-    #[test]
-    fn close_sends_queued_data_and_waits_for_ack() {
-        let mut a = session(1, 1);
-        let mut b = session(2, 2);
-        let t0 = SystemTime::now();
-        let payload: Box<[u8]> = vec![0xFE, 1, 2, 3].into();
-
-        a.handle(RakSessionInput::Send(
-            payload.clone(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Normal,
-            t0,
-        ))
-        .unwrap();
-        a.handle(RakSessionInput::Disconnect(t0)).unwrap();
-
-        let outputs = drain_outputs(&mut a);
-        assert!(
-            payloads_of(&outputs).contains(&payload),
-            "queued payload was not sent"
-        );
-        assert_eq!(disconnect_reason_of(&outputs), None);
-        assert_eq!(a.state, RakSessionState::Closing);
-
-        for buf in datagrams_of(&outputs) {
-            b.handle(RakSessionInput::Datagram(buf, t0)).unwrap();
-        }
-        b.tick(t0).unwrap();
-        deliver(&mut b, &mut a, t0);
-
-        a.handle(RakSessionInput::Update(t0 + Duration::from_millis(20)))
-            .unwrap();
-        let outputs = drain_outputs(&mut a);
-        assert!(
-            payloads_of(&outputs)
-                .iter()
-                .any(|payload| payload.first() == Some(&0x15)),
-            "disconnect notice was not sent"
-        );
-        assert_eq!(
-            disconnect_reason_of(&outputs),
-            Some(RakDisconnectReason::Requested)
-        );
-    }
-
-    #[test]
-    fn close_gives_up_after_close_timeout() {
-        let mut a = session(1, 1);
-        let t0 = SystemTime::now();
-
-        a.handle(RakSessionInput::Send(
-            vec![0xFE, 1].into(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Normal,
-            t0,
-        ))
-        .unwrap();
-        a.handle(RakSessionInput::Disconnect(t0)).unwrap();
-        drain_outputs(&mut a);
-
-        a.handle(RakSessionInput::Update(t0 + Duration::from_secs(4)))
-            .unwrap();
-        assert_eq!(disconnect_reason_of(&drain_outputs(&mut a)), None);
-
-        a.handle(RakSessionInput::Update(t0 + Duration::from_millis(5001)))
-            .unwrap();
-        assert_eq!(
-            disconnect_reason_of(&drain_outputs(&mut a)),
-            Some(RakDisconnectReason::Requested)
-        );
-    }
-
-    #[test]
-    fn close_resends_unacknowledged_data() {
-        let mut a = session(1, 1);
-        let t0 = SystemTime::now();
-        let payload: Box<[u8]> = vec![0xFE, 9, 9].into();
-
-        a.handle(RakSessionInput::Send(
-            payload.clone(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Immediate,
-            t0,
-        ))
-        .unwrap();
-        a.handle(RakSessionInput::Disconnect(t0)).unwrap();
-        drain_outputs(&mut a);
-
-        let result = a.handle(RakSessionInput::Update(t0 + Duration::from_millis(2100)));
-
-        assert!(result.is_ok(), "update while closing failed: {result:?}");
-        assert!(payloads_of(&drain_outputs(&mut a)).contains(&payload));
-    }
-
-    #[test]
-    fn unacknowledged_sends_beyond_max_outbound_bytes_close_the_session() {
-        let mut session = session(0, 1);
-        session.config.max_outbound_bytes = 64 * 1024;
-        let now = SystemTime::now();
-
-        for _ in 0..100 {
-            let send = RakSessionInput::Send(
-                vec![0xFE; 1024].into_boxed_slice(),
-                RakReliability::ReliableOrdered,
-                RakPriority::Normal,
-                now,
-            );
-            if session.handle(send).is_err() {
-                break;
-            }
-            session.tick(now).unwrap();
-        }
-
-        assert_eq!(session.state, RakSessionState::Disconnected);
-        assert_eq!(
-            disconnect_reason(&session),
-            Some(RakDisconnectReason::OutboundBytesExceeded)
-        );
-    }
-
-    fn send(session: &mut RakSession, len: usize, now: SystemTime) -> Result<(), RakSessionError> {
-        session.handle(RakSessionInput::Send(
-            vec![0xFE; len].into_boxed_slice(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Normal,
-            now,
-        ))
-    }
-
-    #[test]
-    fn a_one_mib_send_reaches_our_own_receiver() {
-        let mut a = session(0, 1);
-        let mut b = session(1, 2);
-        let now = SystemTime::now();
-
-        send(&mut a, 1024 * 1024, now).unwrap();
-
-        let mut received = Vec::new();
-        let mut reason = None;
-        for step in 0..10_000 {
-            let now = now + Duration::from_millis(step * 10);
-            a.tick(now).unwrap();
-            deliver(&mut a, &mut b, now);
-            b.tick(now).unwrap();
-            let outputs = drain_outputs(&mut b);
-            reason = reason.or(disconnect_reason_of(&outputs));
-            for buf in datagrams_of(&outputs) {
-                a.handle(RakSessionInput::Datagram(buf, now)).unwrap();
-            }
-            received.extend(outputs.into_iter().filter_map(|out| match out {
-                RakSessionOutput::Packet(buf) => Some(buf),
-                _ => None,
-            }));
-            if !received.is_empty() || b.state == RakSessionState::Disconnected {
-                break;
-            }
-        }
-
-        assert_eq!(reason, None);
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].len(), 1024 * 1024);
-    }
-
-    #[test]
-    fn sends_over_max_message_len_are_refused() {
-        let mut session = session(0, 1);
-        let now = SystemTime::now();
-        let len = session.max_message_len() + 1;
-
-        assert!(matches!(
-            send(&mut session, len, now),
-            Err(RakSessionError::MessageSizeExceeded(n)) if n == len
-        ));
-        assert_eq!(session.outbound_bytes(), 0);
-        assert_ne!(session.state, RakSessionState::Disconnected);
-        send(&mut session, len - 1, now).unwrap();
-    }
-
-    fn sequences_of(outputs: &[RakSessionOutput]) -> Vec<u32> {
-        datagrams_of(outputs)
-            .iter()
-            .filter(|buf| buf[0] & flags::VALID != 0 && buf[0] & (flags::ACK | flags::NACK) == 0)
-            .map(|buf| {
-                FrameSet::deserialize(&mut Cursor::new(buf.as_ref()))
-                    .unwrap()
-                    .sequence
-            })
-            .collect()
-    }
-
-    #[test]
-    fn resends_use_a_fresh_sequence_number() {
-        let mut a = session(0, 1);
-        let now = SystemTime::now();
-
-        send(&mut a, 16, now).unwrap();
-        a.tick(now).unwrap();
-        let first = sequences_of(&drain_outputs(&mut a));
-        let queued = a.outbound_bytes();
-
-        let later = now + Duration::from_secs(5);
-        a.tick(later).unwrap();
-        let resent = sequences_of(&drain_outputs(&mut a));
-
-        assert_eq!(first.len(), 1);
-        assert_eq!(resent.len(), 1);
-        assert_ne!(resent[0], first[0]);
-        assert_eq!(a.outbound_bytes(), queued);
-    }
-
-    #[test]
-    fn acks_of_resent_datagrams_do_not_sample_the_rtt() {
-        let mut a = session(0, 1);
-        let mut b = session(1, 2);
-        let now = SystemTime::now();
-
-        send(&mut a, 16, now).unwrap();
-        a.tick(now).unwrap();
-        drain_outputs(&mut a);
-
-        let later = now + Duration::from_secs(5);
-        a.tick(later).unwrap();
-        deliver(&mut a, &mut b, later);
-        b.tick(later).unwrap();
-        deliver(&mut b, &mut a, later);
-
-        assert_eq!(a.outbound_bytes(), 0);
-        assert_eq!(a.rtt(), Duration::ZERO);
-    }
-
-    fn frames_of(datagrams: &[Box<[u8]>]) -> Vec<Frame> {
-        datagrams
-            .iter()
-            .filter(|buf| buf[0] & flags::VALID != 0 && buf[0] & (flags::ACK | flags::NACK) == 0)
-            .flat_map(|buf| {
-                FrameSet::deserialize(&mut Cursor::new(buf.as_ref()))
-                    .unwrap()
-                    .frames
-            })
-            .collect()
-    }
-
-    #[test]
-    fn reliable_sends_stop_4096_indices_past_the_oldest_unacknowledged() {
-        let mut a = session(0, 1);
-        let mut b = session(1, 2);
-        let now = SystemTime::now();
-
-        for _ in 0..6000 {
-            a.handle(RakSessionInput::Send(
-                Box::new([0xFE]),
-                RakReliability::Reliable,
-                RakPriority::Normal,
-                now,
-            ))
-            .unwrap();
-        }
-
-        let mut highest = 0;
-        for _ in 0..500 {
-            a.tick(now).unwrap();
-            let mut datagrams = datagrams_of(&drain_outputs(&mut a));
-            datagrams.retain(|buf| {
-                !frames_of(std::slice::from_ref(buf))
-                    .iter()
-                    .any(|f| f.reliable_index == 0)
-            });
-            for frame in frames_of(&datagrams) {
-                highest = highest.max(frame.reliable_index);
-            }
-            for buf in datagrams {
-                b.handle(RakSessionInput::Datagram(buf, now)).unwrap();
-            }
-            b.tick(now).unwrap();
-            deliver(&mut b, &mut a, now);
-        }
-
-        assert!(highest >= 4000, "the window never filled: {highest}");
-        assert!(
-            highest < 4096,
-            "sent reliable index {highest} with index 0 unacknowledged"
-        );
-    }
-
-    #[test]
-    fn no_new_split_starts_while_256_are_in_flight() {
-        let mut session = session(0, 1);
-        let now = SystemTime::now();
-
-        for split_id in 0..256u16 {
-            let mut frame = Frame::new(RakReliability::Reliable, Box::new([0]));
-            frame.split_id = 1_000 + split_id;
-            frame.split_size = 2;
-            let sequence = 1_000 + split_id as u32;
-            session.outbound_cache.insert(
-                sequence,
-                FrameSet::new(sequence, vec![frame], false, true, false),
-            );
-        }
-
-        let len = 4 * session.mtu as usize;
-        send(&mut session, len, now).unwrap();
-        session.tick(now).unwrap();
-
-        assert!(frames_of(&datagrams_of(&drain_outputs(&mut session))).is_empty());
-    }
-
-    #[test]
-    fn acknowledged_sends_release_outbound_bytes() {
-        let mut a = session(0, 1);
-        let mut b = session(1, 2);
-        let now = SystemTime::now();
-
-        a.handle(RakSessionInput::Send(
-            vec![0xFE; 1024].into_boxed_slice(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Normal,
-            now,
-        ))
-        .unwrap();
-        assert!(a.outbound_bytes() >= 1024);
-
-        a.tick(now).unwrap();
-        deliver(&mut a, &mut b, now);
-        b.tick(now).unwrap();
-        deliver(&mut b, &mut a, now);
-
-        assert_eq!(a.outbound_bytes(), 0);
+        _ => true,
     }
 }
+
+#[cfg(test)]
+mod tests;

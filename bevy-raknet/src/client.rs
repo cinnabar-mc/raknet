@@ -1,10 +1,11 @@
+// Modified by Cinnabar contributors for caller-driven connection negotiation.
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use raknet::prelude::{RakClient as RakClientIntl, RakSession as RakSessionIntl, *};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
@@ -50,7 +51,7 @@ pub struct RakClient {
     socket: UdpSocket,
     session: Option<RakSessionIntl>,
     received: VecDeque<Box<[u8]>>,
-    pongs: VecDeque<(SocketAddr, Box<[u8]>, SystemTime)>,
+    pongs: VecDeque<(SocketAddr, Box<[u8]>, Duration)>,
     events: VecDeque<RakClientEvent>,
     buffer: Box<[u8]>,
 }
@@ -63,7 +64,10 @@ impl RakClient {
         let mut config = RakClientConfig::default();
         conf(&mut config);
 
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        config
+            .validate()
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.local_port))?;
         socket.set_nonblocking(true)?;
 
         Ok(Self {
@@ -73,20 +77,48 @@ impl RakClient {
             received: VecDeque::new(),
             pongs: VecDeque::new(),
             events: VecDeque::new(),
-            intl: RakClientIntl::new(config),
+            intl: RakClientIntl::new(config, RakClock::new(Instant::now())),
         })
     }
 
     pub fn connect(&mut self, addr: SocketAddr) {
-        let _ = self
-            .intl
-            .handle(RakClientInput::Connect(addr, SystemTime::now()));
+        let local = match self.socket.local_addr() {
+            Ok(local) => local,
+            Err(error) => {
+                debug!("client socket address is unavailable: {error}");
+                return;
+            }
+        };
+        let guid = match ClientGuid::generate() {
+            Ok(guid) => guid,
+            Err(error) => {
+                debug!("client identity generation failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.intl.handle(RakClientInput::Connect {
+            remote: addr,
+            local,
+            guid,
+            now: Instant::now(),
+        }) {
+            debug!("client failed to start connection: {error}");
+        }
     }
 
     pub fn ping(&mut self, addr: SocketAddr) {
-        let _ = self
-            .intl
-            .handle(RakClientInput::Ping(addr, SystemTime::now()));
+        let guid = match ClientGuid::generate() {
+            Ok(guid) => guid,
+            Err(error) => {
+                debug!("client ping identity generation failed: {error}");
+                return;
+            }
+        };
+        let _ = self.intl.handle(RakClientInput::Ping {
+            remote: addr,
+            guid,
+            now: Instant::now(),
+        });
     }
 
     pub fn is_connected(&self) -> bool {
@@ -114,7 +146,7 @@ impl RakClient {
             buf.into(),
             reliability,
             priority,
-            SystemTime::now(),
+            Instant::now(),
         ))?;
 
         if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
@@ -131,7 +163,7 @@ impl RakClient {
         self.received.pop_front()
     }
 
-    pub fn recv_pong(&mut self) -> Option<(SocketAddr, Box<[u8]>, SystemTime)> {
+    pub fn recv_pong(&mut self) -> Option<(SocketAddr, Box<[u8]>, Duration)> {
         self.pongs.pop_front()
     }
 
@@ -142,7 +174,7 @@ impl RakClient {
             return;
         };
 
-        let _ = session.handle(RakSessionInput::Disconnect(SystemTime::now()));
+        let _ = session.handle(RakSessionInput::Disconnect(Instant::now()));
 
         if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
             self.session = None;
@@ -157,7 +189,7 @@ impl RakClient {
     }
 
     pub fn update(&mut self) {
-        let now = SystemTime::now();
+        let now = Instant::now();
 
         for _ in 0..MAX_DATAGRAMS_PER_TICK {
             match self.socket.recv_from(&mut self.buffer) {
@@ -181,6 +213,20 @@ impl RakClient {
 
         while let Some(output) = self.intl.poll() {
             match output {
+                RakClientOutput::MtuProbe { id, datagram, peer } => {
+                    let started = Instant::now();
+                    let result = self.socket.send_to(&datagram, peer);
+                    let elapsed = started.elapsed();
+                    let input = RakClientInput::MtuProbeResult {
+                        id,
+                        now: Instant::now(),
+                        elapsed,
+                        too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
+                    };
+                    if let Err(error) = self.intl.handle(input) {
+                        debug!("client failed to complete an MTU probe: {error}");
+                    }
+                }
                 RakClientOutput::SocketDatagram(buf, addr) => {
                     let _ = self.socket.send_to(&buf, addr);
                 }
@@ -196,7 +242,12 @@ impl RakClient {
                     self.events.push_back(RakClientEvent::Connected);
                 }
                 RakClientOutput::Wait(_) => {}
-                RakClientOutput::Pong(addr, msg, time) => self.pongs.push_back((addr, msg, time)),
+                RakClientOutput::Pong {
+                    addr,
+                    message,
+                    latency,
+                    ..
+                } => self.pongs.push_back((addr, message, latency)),
             }
         }
 
@@ -219,7 +270,7 @@ impl Drop for RakClient {
             return;
         };
 
-        let _ = session.handle(RakSessionInput::DisconnectNow(SystemTime::now()));
+        let _ = session.handle(RakSessionInput::DisconnectNow(Instant::now()));
 
         while let Some(output) = session.poll() {
             if let RakSessionOutput::Datagram(buf, addr) = output {

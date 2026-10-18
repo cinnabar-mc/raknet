@@ -1,12 +1,12 @@
 use crate::types::RakReliability;
 use crate::types::priority::RakPriority;
-use std::time::SystemTime;
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub enum RakSessionInput {
-    Datagram(Box<[u8]>, SystemTime),
-    Send(Box<[u8]>, RakReliability, RakPriority, SystemTime),
-    Update(SystemTime),
-    Disconnect(SystemTime),
-    DisconnectNow(SystemTime),
+    Datagram(Box<[u8]>, Instant),
+    Send(Box<[u8]>, RakReliability, RakPriority, Instant),
+    Update(Instant),
+    Disconnect(Instant),
+    DisconnectNow(Instant),
 }

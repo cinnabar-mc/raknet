@@ -5,7 +5,7 @@ use raknet::prelude::{RakServer as RakServerIntl, RakSession as RakSessionIntl, 
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
@@ -79,7 +79,7 @@ impl RakServer {
             sessions: HashMap::new(),
             received: VecDeque::new(),
             events: VecDeque::new(),
-            intl: RakServerIntl::new(config, addr),
+            intl: RakServerIntl::new(config, addr, RakClock::new(Instant::now()), Instant::now()),
         })
     }
 
@@ -104,7 +104,7 @@ impl RakServer {
     where
         T: Into<Box<[u8]>>,
     {
-        let now = SystemTime::now();
+        let now = Instant::now();
         let mut disconnected = Vec::new();
 
         {
@@ -132,7 +132,7 @@ impl RakServer {
         T: Into<Box<[u8]>>,
     {
         let buf: Box<[u8]> = buf.into();
-        let now = SystemTime::now();
+        let now = Instant::now();
         let mut disconnected = Vec::new();
 
         for session in self.sessions.values_mut() {
@@ -156,7 +156,7 @@ impl RakServer {
     /// Starts closing the session. Keep calling `update` until the disconnected event
     /// arrives so queued data is sent and acknowledged.
     pub fn disconnect(&mut self, id: RakSessionId) {
-        let now = SystemTime::now();
+        let now = Instant::now();
         let mut disconnected = Vec::new();
 
         {
@@ -184,7 +184,7 @@ impl RakServer {
         self.events.pop_front()
     }
 
-    fn remove_sessions(&mut self, ids: Vec<(RakSessionId, RakDisconnectReason)>, now: SystemTime) {
+    fn remove_sessions(&mut self, ids: Vec<(RakSessionId, RakDisconnectReason)>, now: Instant) {
         for (id, reason) in ids {
             self.sessions.remove(&id);
             let _ = self.intl.handle(RakServerInput::RemoveSession(id, now));
@@ -194,7 +194,7 @@ impl RakServer {
     }
 
     pub fn update(&mut self) {
-        let now = SystemTime::now();
+        let now = Instant::now();
 
         for _ in 0..MAX_DATAGRAMS_PER_TICK {
             match self.socket.recv_from(&mut self.buffer) {
@@ -255,7 +255,7 @@ impl RakServer {
 
 impl Drop for RakServer {
     fn drop(&mut self) {
-        let now = SystemTime::now();
+        let now = Instant::now();
 
         for session in self.sessions.values_mut() {
             let _ = session.handle(RakSessionInput::DisconnectNow(now));

@@ -1,12 +1,15 @@
+// Modified by Cinnabar contributors for explicit connection endpoints and wire address bounds.
 use crate::protocol::codec::RakCodec;
 use crate::protocol::error::RakCodecError;
+use crate::util::constants::SYSTEM_ADDRESS_COUNT;
+use crate::util::socket_addr::canonical_socket_addr;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 impl RakCodec for SocketAddr {
     fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), RakCodecError> {
-        match self {
+        match canonical_socket_addr(*self) {
             SocketAddr::V4(addr) => {
                 writer.write_u8(4)?;
                 writer.write_all(&addr.ip().octets().map(|octet| !octet))?;
@@ -16,9 +19,9 @@ impl RakCodec for SocketAddr {
                 writer.write_u8(6)?;
                 writer.write_u16::<LittleEndian>(23)?;
                 writer.write_u16::<BigEndian>(addr.port())?;
-                writer.write_u32::<BigEndian>(addr.flowinfo())?;
+                writer.write_u32::<BigEndian>(0)?;
                 writer.write_all(&addr.ip().octets())?;
-                writer.write_u32::<BigEndian>(addr.scope_id())?;
+                writer.write_u32::<BigEndian>(0)?;
             }
         }
 
@@ -27,7 +30,7 @@ impl RakCodec for SocketAddr {
 
     fn deserialize<R: Read>(reader: &mut R) -> Result<Self, RakCodecError> {
         match reader.read_u8()? {
-            4 => {
+            0 | 4 => {
                 let mut octets = [0u8; 4];
                 reader.read_exact(&mut octets)?;
                 let ip = Ipv4Addr::from(octets.map(|octet| !octet));
@@ -38,15 +41,15 @@ impl RakCodec for SocketAddr {
             6 => {
                 reader.read_u16::<LittleEndian>()?;
                 let port = reader.read_u16::<BigEndian>()?;
-                let flowinfo = reader.read_u32::<BigEndian>()?;
+                reader.read_u32::<BigEndian>()?;
                 let mut octets = [0u8; 16];
                 reader.read_exact(&mut octets)?;
                 let ip = Ipv6Addr::from(octets);
-                let scope_id = reader.read_u32::<BigEndian>()?;
+                reader.read_u32::<BigEndian>()?;
 
-                Ok(SocketAddr::V6(SocketAddrV6::new(
-                    ip, port, flowinfo, scope_id,
-                )))
+                Ok(canonical_socket_addr(SocketAddr::V6(SocketAddrV6::new(
+                    ip, port, 0, 0,
+                ))))
             }
             _ => Err(RakCodecError::Malformed("socket addr")),
         }
@@ -54,13 +57,39 @@ impl RakCodec for SocketAddr {
 
     fn size_hint(&self) -> usize {
         size_of::<u8>()
-            + match self {
+            + match canonical_socket_addr(*self) {
                 SocketAddr::V4(..) => 4 + size_of::<u16>(),
                 SocketAddr::V6(..) => {
                     size_of::<u16>() + size_of::<u16>() + size_of::<u32>() + 16 + size_of::<u32>()
                 }
             }
     }
+}
+
+/// Reads at most twenty wire addresses and their two trailing timestamps.
+pub(crate) fn read_system_addresses_and_timestamps<R: Read>(
+    reader: &mut R,
+) -> Result<(Vec<SocketAddr>, u64, u64), RakCodecError> {
+    const MAX_BODY_SIZE: usize =
+        SYSTEM_ADDRESS_COUNT * (1 + 2 + 2 + 4 + 16 + 4) + 2 * size_of::<u64>();
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_BODY_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BODY_SIZE {
+        return Err(RakCodecError::Malformed("system address body is too large"));
+    }
+    let mut reader = Cursor::new(bytes.as_slice());
+    let mut addresses = Vec::new();
+    while bytes.len() - reader.position() as usize > 2 * size_of::<u64>() {
+        if addresses.len() == SYSTEM_ADDRESS_COUNT {
+            return Err(RakCodecError::Malformed("too many system addresses"));
+        }
+        addresses.push(SocketAddr::deserialize(&mut reader)?);
+    }
+    let first_timestamp = reader.read_u64::<BigEndian>()?;
+    let second_timestamp = reader.read_u64::<BigEndian>()?;
+    Ok((addresses, first_timestamp, second_timestamp))
 }
 
 #[cfg(test)]
