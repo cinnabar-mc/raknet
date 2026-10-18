@@ -4,13 +4,13 @@ use std::net::SocketAddrV4;
 const PEER: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19132));
 
 /// Collects complete wire outputs as an instantaneous synthetic socket would.
-fn collect(client: &mut RakClient, now: Instant) -> Vec<Box<[u8]>> {
+fn collect(client: &mut ClientEngine, now: Instant) -> Vec<Box<[u8]>> {
     let mut sent = Vec::new();
     while let Some(output) = client.poll() {
         match output {
-            RakClientOutput::MtuProbe { id, datagram, .. } => {
+            ClientOutput::MtuProbe { id, datagram, .. } => {
                 client
-                    .handle(RakClientInput::MtuProbeResult {
+                    .handle(ClientInput::MtuProbeResult {
                         id,
                         now,
                         elapsed: Duration::ZERO,
@@ -19,7 +19,7 @@ fn collect(client: &mut RakClient, now: Instant) -> Vec<Box<[u8]>> {
                     .unwrap();
                 sent.push(datagram);
             }
-            RakClientOutput::SocketDatagram(bytes, _) => sent.push(bytes),
+            ClientOutput::SocketDatagram(bytes, _) => sent.push(bytes),
             _ => {}
         }
     }
@@ -27,9 +27,9 @@ fn collect(client: &mut RakClient, now: Instant) -> Vec<Box<[u8]>> {
 }
 
 /// Delivers one encoded peer packet and returns the client's immediate wire response.
-fn deliver(client: &mut RakClient, packet: impl RakCodec, now: Instant) -> Vec<Box<[u8]>> {
+fn deliver(client: &mut ClientEngine, packet: impl RakCodec, now: Instant) -> Vec<Box<[u8]>> {
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             packet.serialized().unwrap(),
             PEER,
             now,
@@ -39,8 +39,8 @@ fn deliver(client: &mut RakClient, packet: impl RakCodec, now: Instant) -> Vec<B
 }
 
 /// Starts a client at a fixed domain time, with no real sockets or clock reads.
-fn begin(cap: u16) -> (RakClient, Instant) {
-    let mut client = RakClient::new(
+fn begin(cap: u16) -> (ClientEngine, Instant) {
+    let mut client = ClientEngine::new(
         RakClientConfig {
             max_mtu_size: cap,
             ..RakClientConfig::default()
@@ -49,7 +49,7 @@ fn begin(cap: u16) -> (RakClient, Instant) {
     );
     let now = crate::clock::test_now() + Duration::from_secs(1000);
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
@@ -77,7 +77,7 @@ fn reply_one_keeps_probes_running_and_probe_exhaustion_keeps_request_two_alive()
     let mut probes = Vec::new();
     for tick in 1..=14 {
         let now = start + Duration::from_millis(tick * 500);
-        client.handle(RakClientInput::Update(now)).unwrap();
+        client.handle(ClientInput::Update(now)).unwrap();
         let sent = collect(&mut client, now);
         assert!(
             sent.iter()
@@ -95,7 +95,7 @@ fn reply_one_keeps_probes_running_and_probe_exhaustion_keeps_request_two_alive()
     );
     assert!(client.is_connecting());
     assert!(matches!(
-        client.handle(RakClientInput::Update(start + Duration::from_secs(10))),
+        client.handle(ClientInput::Update(start + Duration::from_secs(10))),
         Err(RakClientError::ConnectionFailed)
     ));
 }
@@ -124,7 +124,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
     assert!(client.session.is_none());
 
     let at = start + Duration::from_millis(500);
-    client.handle(RakClientInput::Update(at)).unwrap();
+    client.handle(ClientInput::Update(at)).unwrap();
     assert!(
         collect(&mut client, at)
             .iter()
@@ -167,7 +167,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
     .unwrap();
     malformed[1] ^= 0xff;
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             malformed,
             PEER,
             start + Duration::from_millis(580),
@@ -176,7 +176,7 @@ fn protected_challenge_and_rotated_cookie_never_become_an_unvalidated_connected_
     assert!(collect(&mut client, start).is_empty());
 
     let at = start + Duration::from_millis(1060);
-    client.handle(RakClientInput::Update(at)).unwrap();
+    client.handle(ClientInput::Update(at)).unwrap();
     let sent = collect(&mut client, at);
     let request = sent
         .iter()
@@ -215,7 +215,7 @@ fn reply_two_selects_the_final_budget_independently_of_reply_one() {
 
 #[test]
 fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig {
             max_mtu_size: 400,
             ..RakClientConfig::default()
@@ -225,7 +225,7 @@ fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
     let now = crate::clock::test_now() + Duration::from_secs(1000);
     assert!(
         client
-            .handle(RakClientInput::Connect {
+            .handle(ClientInput::Connect {
                 guid: crate::client::TEST_CLIENT_GUID,
                 remote: PEER,
                 local: SocketAddr::new(PEER.ip(), 54321),
@@ -238,10 +238,10 @@ fn an_unsupported_caller_cap_fails_before_emitting_a_probe() {
 }
 
 /// Takes the single outstanding probe without completing its synthetic socket write.
-fn pending_probe(client: &mut RakClient) -> Option<(MtuProbeId, usize)> {
+fn pending_probe(client: &mut ClientEngine) -> Option<(MtuProbeId, usize)> {
     let mut probe = None;
     while let Some(output) = client.poll() {
-        if let RakClientOutput::MtuProbe { id, datagram, .. } = output {
+        if let ClientOutput::MtuProbe { id, datagram, .. } = output {
             assert!(probe.is_none(), "more than one probe write was outstanding");
             probe = Some((id, datagram.len()));
         }
@@ -264,13 +264,13 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         (Duration::ZERO, Duration::from_millis(101), false, 548, 111),
         (Duration::ZERO, Duration::from_millis(101), true, 1172, 111),
     ] {
-        let mut client = RakClient::new(
+        let mut client = ClientEngine::new(
             RakClientConfig::default(),
             crate::clock::RakClock::new(crate::clock::test_now()),
         );
         let start = crate::clock::test_now() + Duration::from_secs(1000);
         client
-            .handle(RakClientInput::Connect {
+            .handle(ClientInput::Connect {
                 guid: crate::client::TEST_CLIENT_GUID,
                 remote: PEER,
                 local: SocketAddr::new(PEER.ip(), 54321),
@@ -279,7 +279,7 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
             .unwrap();
         let (id, _) = pending_probe(&mut client).unwrap();
         client
-            .handle(RakClientInput::MtuProbeResult {
+            .handle(ClientInput::MtuProbeResult {
                 id,
                 now: start + preparation + elapsed,
                 elapsed,
@@ -289,20 +289,20 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         assert!(pending_probe(&mut client).is_none());
         let retry = start + Duration::from_millis(retry_ms);
         client
-            .handle(RakClientInput::Update(retry - Duration::from_millis(1)))
+            .handle(ClientInput::Update(retry - Duration::from_millis(1)))
             .unwrap();
         assert!(pending_probe(&mut client).is_none());
-        client.handle(RakClientInput::Update(retry)).unwrap();
+        client.handle(ClientInput::Update(retry)).unwrap();
         assert_eq!(pending_probe(&mut client).unwrap().1, payload_len);
     }
 
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
     let mut now = crate::clock::test_now() + Duration::from_secs(1000);
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
@@ -313,7 +313,7 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
         let (id, len) = pending_probe(&mut client).unwrap();
         assert_eq!(len, payload_len);
         client
-            .handle(RakClientInput::MtuProbeResult {
+            .handle(ClientInput::MtuProbeResult {
                 id,
                 now,
                 elapsed: Duration::ZERO,
@@ -321,7 +321,7 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
             })
             .unwrap();
         now += Duration::from_millis(10);
-        client.handle(RakClientInput::Update(now)).unwrap();
+        client.handle(ClientInput::Update(now)).unwrap();
     }
     assert!(
         pending_probe(&mut client).is_none(),
@@ -331,13 +331,13 @@ fn write_results_preserve_preparation_deadlines_and_the_integer_slow_write_bound
 
 #[test]
 fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negotiation() {
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
     let first = crate::clock::test_now() + Duration::from_secs(1000);
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
@@ -345,10 +345,10 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         })
         .unwrap();
     let (old, _) = pending_probe(&mut client).unwrap();
-    client.handle(RakClientInput::Disconnect).unwrap();
+    client.handle(ClientInput::Disconnect).unwrap();
     let start = first + Duration::from_secs(1);
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
@@ -358,7 +358,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
     let (current, _) = pending_probe(&mut client).unwrap();
     assert_ne!(old, current);
     client
-        .handle(RakClientInput::MtuProbeResult {
+        .handle(ClientInput::MtuProbeResult {
             id: old,
             now: first,
             elapsed: Duration::ZERO,
@@ -370,7 +370,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         "stale completion emitted a new timer"
     );
     client
-        .handle(RakClientInput::MtuProbeResult {
+        .handle(ClientInput::MtuProbeResult {
             id: old,
             now: start,
             elapsed: Duration::from_millis(101),
@@ -378,13 +378,13 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         })
         .unwrap();
     let at = start + Duration::from_millis(500);
-    client.handle(RakClientInput::Update(at)).unwrap();
+    client.handle(ClientInput::Update(at)).unwrap();
     assert!(
         pending_probe(&mut client).is_none(),
         "the new write still awaits its own completion"
     );
     client
-        .handle(RakClientInput::MtuProbeResult {
+        .handle(ClientInput::MtuProbeResult {
             id: current,
             now: at,
             elapsed: Duration::ZERO,
@@ -392,7 +392,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         })
         .unwrap();
     let at = at + Duration::from_millis(10);
-    client.handle(RakClientInput::Update(at)).unwrap();
+    client.handle(ClientInput::Update(at)).unwrap();
     let (pending, len) = pending_probe(&mut client).unwrap();
     assert_eq!(len, 1464);
     deliver(
@@ -410,7 +410,7 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         at,
     );
     client
-        .handle(RakClientInput::MtuProbeResult {
+        .handle(ClientInput::MtuProbeResult {
             id: pending,
             now: at,
             elapsed: Duration::ZERO,
@@ -418,12 +418,12 @@ fn stale_write_completions_do_not_advance_reconnects_or_restart_completed_negoti
         })
         .unwrap();
     client
-        .handle(RakClientInput::Update(at + Duration::from_secs(3)))
+        .handle(ClientInput::Update(at + Duration::from_secs(3)))
         .unwrap();
     assert!(
         std::iter::from_fn(|| client.poll()).all(|output| match output {
-            RakClientOutput::MtuProbe { .. } => false,
-            RakClientOutput::SocketDatagram(bytes, _) =>
+            ClientOutput::MtuProbe { .. } => false,
+            ClientOutput::SocketDatagram(bytes, _) =>
                 bytes[0] != packet_id::OPEN_CONNECTION_REQUEST_2,
             _ => true,
         })
@@ -435,12 +435,12 @@ fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake
     let (mut client, start) = begin(constants::MAX_MTU_SIZE);
     for tick in 1..=12 {
         let now = start + Duration::from_millis(tick * 500);
-        client.handle(RakClientInput::Update(now)).unwrap();
+        client.handle(ClientInput::Update(now)).unwrap();
         collect(&mut client, now);
     }
     let late = start + Duration::from_millis(6100);
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             OpenConnectionReply1 {
                 guid: 1,
                 cookie: None,
@@ -455,12 +455,12 @@ fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake
     let outputs: Vec<_> = std::iter::from_fn(|| client.poll()).collect();
     assert!(
         outputs.iter().any(|output| matches!(output,
-            RakClientOutput::Wait(wait) if *wait <= Duration::from_millis(500)
+            ClientOutput::Wait(wait) if *wait <= Duration::from_millis(500)
         )),
         "a late grant left its Request 2 retry asleep"
     );
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             OpenConnectionReply2::new(1, PEER, 1200, false)
                 .serialized()
                 .unwrap(),
@@ -470,7 +470,7 @@ fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake
         .unwrap();
     assert!(
         std::iter::from_fn(|| client.poll()).any(|output| matches!(output,
-            RakClientOutput::Wait(wait) if wait < Duration::from_secs(1)
+            ClientOutput::Wait(wait) if wait < Duration::from_secs(1)
         )),
         "the connected handshake needs its own timer wake"
     );
@@ -478,13 +478,13 @@ fn late_grants_replace_the_exhausted_probe_wake_and_wake_the_connected_handshake
 
 #[test]
 fn cancellation_drops_unclaimed_session_handoffs() {
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
     let now = crate::clock::test_now() + Duration::from_secs(1000);
     client
-        .adopt(RakSession::new(
+        .adopt(SessionEngine::new(
             RakSessionId(1),
             PEER,
             1,
@@ -494,7 +494,7 @@ fn cancellation_drops_unclaimed_session_handoffs() {
             Default::default(),
         ))
         .unwrap();
-    client.handle(RakClientInput::Disconnect).unwrap();
+    client.handle(ClientInput::Disconnect).unwrap();
     assert!(
         client.poll().is_none(),
         "a cancelled session must not be handed to its consumer"
@@ -503,7 +503,7 @@ fn cancellation_drops_unclaimed_session_handoffs() {
 
 #[test]
 fn identity_stays_with_each_attempt_through_challenges_retries_session_and_reconnect() {
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
@@ -513,7 +513,7 @@ fn identity_stays_with_each_attempt_through_challenges_retries_session_and_recon
     for (attempt, guid) in [first, second].into_iter().enumerate() {
         let now = origin + Duration::from_secs(attempt as u64);
         client
-            .handle(RakClientInput::Connect {
+            .handle(ClientInput::Connect {
                 remote: PEER,
                 local: SocketAddr::new(PEER.ip(), 54321),
                 guid,
@@ -541,7 +541,7 @@ fn identity_stays_with_each_attempt_through_challenges_retries_session_and_recon
             assert_eq!(request.cookie, Some(cookie));
         }
         let later = now + Duration::from_millis(500);
-        client.handle(RakClientInput::Update(later)).unwrap();
+        client.handle(ClientInput::Update(later)).unwrap();
         let sent = collect(&mut client, later);
         let retry = sent
             .iter()
@@ -578,12 +578,12 @@ fn identity_stays_with_each_attempt_through_challenges_retries_session_and_recon
             guid.as_u64()
         );
         assert_eq!(client.session.as_ref().unwrap().guid, guid.as_u64());
-        client.handle(RakClientInput::Disconnect).unwrap();
+        client.handle(ClientInput::Disconnect).unwrap();
     }
     // Explicit custom wire identities are kept separate from generated defaults.
     let ping_guid = ClientGuid::from_raw(1234);
     client
-        .handle(RakClientInput::Ping {
+        .handle(ClientInput::Ping {
             remote: PEER,
             guid: ping_guid,
             now: origin + Duration::from_secs(2),
@@ -604,13 +604,13 @@ fn identity_stays_with_each_attempt_through_challenges_retries_session_and_recon
 
 #[test]
 fn final_mtu_size_errors_exhaust_the_original_probe_budget() {
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
     let mut now = crate::clock::test_now() + Duration::from_secs(1000);
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: SocketAddr::new(PEER.ip(), 54321),
@@ -620,7 +620,7 @@ fn final_mtu_size_errors_exhaust_the_original_probe_budget() {
     for _ in 0..=constants::MTU_SIZES.len() {
         let (id, _) = pending_probe(&mut client).unwrap();
         client
-            .handle(RakClientInput::MtuProbeResult {
+            .handle(ClientInput::MtuProbeResult {
                 id,
                 now,
                 elapsed: Duration::ZERO,
@@ -628,7 +628,7 @@ fn final_mtu_size_errors_exhaust_the_original_probe_budget() {
             })
             .unwrap();
         now += Duration::from_millis(10);
-        client.handle(RakClientInput::Update(now)).unwrap();
+        client.handle(ClientInput::Update(now)).unwrap();
     }
     assert!(
         pending_probe(&mut client).is_none(),

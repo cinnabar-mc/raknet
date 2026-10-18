@@ -3,7 +3,7 @@
 use super::config::RakSessionConfig;
 use super::congestion_controller::{RakCongestionController, RakCongestionSnapshot};
 use super::state::RakSessionState;
-use super::{RakSession, RakSessionId};
+use super::{RakSessionId, SessionEngine};
 use crate::clock::RakClock;
 use crate::protocol::codec::RakCodec;
 use crate::protocol::packets::frame_set::FrameSet;
@@ -13,14 +13,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::AddrParseError;
 use std::time::{Duration, Instant};
 
-/// [`RakSession`] in a serializable form, so a session can be moved to another process
+/// [`SessionEngine`] in a serializable form, so a session can be moved to another process
 /// and resumed there.
 ///
 /// Times are millisecond offsets from the endpoint's wire-counter origin. Restore
 /// rebases them onto the destination's monotonic clock using explicit transfer
 /// elapsed time. Pending output is not carried; drain `poll()` before capture.
 #[derive(Clone, Debug, facet::Facet)]
-pub struct RakSessionSnapshot {
+pub(crate) struct SessionSnapshot {
     pub id: u64,
     /// Text form: facet-json cannot construct a `SocketAddr` on the way back in.
     pub addr: String,
@@ -71,17 +71,19 @@ pub struct RakSessionSnapshot {
 /// A snapshot cannot be reconstructed in the destination clock or address space.
 #[derive(Debug, thiserror::Error)]
 pub enum RakSessionRestoreError {
+    #[error("an incomplete client handshake cannot be restored as an established session")]
+    IncompleteHandshake,
     #[error("invalid snapshot address: {0}")]
     InvalidAddress(#[from] AddrParseError),
     #[error("snapshot time is outside the monotonic clock range")]
     TimeOutOfRange,
 }
 
-impl RakSession {
+impl SessionEngine {
     /// Captures this session's protocol state.
-    pub fn snapshot(&self, now: Instant) -> RakSessionSnapshot {
+    pub fn snapshot(&self, now: Instant) -> SessionSnapshot {
         let clock = self.clock;
-        RakSessionSnapshot {
+        SessionSnapshot {
             id: self.id.0,
             addr: self.addr.to_string(),
             state: self.state,
@@ -152,7 +154,7 @@ impl RakSession {
     /// # Errors
     /// Returns an error for invalid addresses or unrepresentable saved times.
     pub fn restore(
-        snapshot: RakSessionSnapshot,
+        snapshot: SessionSnapshot,
         now: Instant,
         elapsed: Duration,
     ) -> Result<Self, RakSessionRestoreError> {

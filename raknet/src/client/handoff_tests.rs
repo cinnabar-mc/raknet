@@ -6,9 +6,9 @@ const PEER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOS
 const LOCAL: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
 
 /// Completes offline negotiation through the public inputs with instantaneous writes.
-fn start_reliable_handshake(client: &mut RakClient, now: Instant) {
+fn start_reliable_handshake(client: &mut ClientEngine, now: Instant) {
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: PEER,
             local: LOCAL,
@@ -16,9 +16,9 @@ fn start_reliable_handshake(client: &mut RakClient, now: Instant) {
         })
         .unwrap();
     while let Some(output) = client.poll() {
-        if let RakClientOutput::MtuProbe { id, .. } = output {
+        if let ClientOutput::MtuProbe { id, .. } = output {
             client
-                .handle(RakClientInput::MtuProbeResult {
+                .handle(ClientInput::MtuProbeResult {
                     id,
                     now,
                     elapsed: Duration::ZERO,
@@ -40,16 +40,16 @@ fn start_reliable_handshake(client: &mut RakClient, now: Instant) {
             .unwrap(),
     ] {
         client
-            .handle(RakClientInput::Datagram(packet, PEER, now))
+            .handle(ClientInput::Datagram(packet, PEER, now))
             .unwrap();
         while client.poll().is_some() {}
     }
 }
 
 /// Creates a client waiting for reliable connection acceptance at a fixed domain time.
-fn negotiating(config: RakClientConfig) -> (RakClient, Instant) {
+fn negotiating(config: RakClientConfig) -> (ClientEngine, Instant) {
     let now = crate::clock::test_now() + Duration::from_secs(1000);
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         config,
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
@@ -91,21 +91,21 @@ fn accepted() -> Box<[u8]> {
 fn early_packets_survive_handoff_in_fifo_after_the_incoming_control_is_sent() {
     let (mut client, now) = negotiating(RakClientConfig::default());
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             datagram(0, 0, vec![Box::new([0xfe, 1])]),
             PEER,
             now,
         ))
         .unwrap();
     while let Some(output) = client.poll() {
-        assert!(!matches!(output, RakClientOutput::SessionConnected(_)));
+        assert!(!matches!(output, ClientOutput::SessionConnected(_)));
     }
     client
-        .handle(RakClientInput::Update(now + Duration::from_millis(100)))
+        .handle(ClientInput::Update(now + Duration::from_millis(100)))
         .unwrap();
     while client.poll().is_some() {}
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             datagram(
                 1,
                 1,
@@ -125,14 +125,14 @@ fn early_packets_survive_handoff_in_fifo_after_the_incoming_control_is_sent() {
     let mut session = None;
     while let Some(output) = client.poll() {
         match output {
-            RakClientOutput::SocketDatagram(bytes, _) if bytes[0] & 0xe0 == 0x80 => {
+            ClientOutput::SocketDatagram(bytes, _) if bytes[0] & 0xe0 == 0x80 => {
                 let set = FrameSet::deserialize(&mut Cursor::new(bytes.as_ref())).unwrap();
                 incoming_sent |= set
                     .frames
                     .iter()
                     .any(|frame| frame.payload[0] == packet_id::NEW_INCOMING_CONNECTION);
             }
-            RakClientOutput::SessionConnected(connected) => {
+            ClientOutput::SessionConnected(connected) => {
                 assert!(
                     incoming_sent,
                     "NewIncomingConnection must precede session exposure"
@@ -145,7 +145,7 @@ fn early_packets_survive_handoff_in_fifo_after_the_incoming_control_is_sent() {
     let mut session = session.expect("accepted handshake transfers its owner");
     // A later datagram must follow the packets retained before ownership transfer.
     session
-        .handle(RakSessionInput::Datagram(
+        .handle(SessionInput::Datagram(
             datagram(2, 6, vec![Box::new([0xfe, 4])]),
             now + Duration::from_millis(101),
         ))
@@ -165,7 +165,7 @@ fn early_packets_survive_handoff_in_fifo_after_the_incoming_control_is_sent() {
 #[test]
 fn lost_connection_probe_emits_a_reliable_ping_instead_of_an_application_packet() {
     let now = crate::clock::test_now() + Duration::from_secs(1000);
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         PEER,
         1,
@@ -175,7 +175,7 @@ fn lost_connection_probe_emits_a_reliable_ping_instead_of_an_application_packet(
         Default::default(),
     );
     session
-        .handle(RakSessionInput::Datagram(
+        .handle(SessionInput::Datagram(
             datagram(0, 0, vec![Box::new([0x04])]),
             now,
         ))
@@ -198,9 +198,9 @@ fn lost_connection_probe_emits_a_reliable_ping_instead_of_an_application_packet(
         ping.expect("liveness control triggers a ping").reliability,
         RakReliability::ReliableOrdered
     );
-    session.handle(RakSessionInput::Disconnect(now)).unwrap();
+    session.handle(SessionInput::Disconnect(now)).unwrap();
     session
-        .handle(RakSessionInput::Datagram(
+        .handle(SessionInput::Datagram(
             datagram(1, 1, vec![Box::new([0x04])]),
             now,
         ))
@@ -212,7 +212,7 @@ fn lost_connection_probe_emits_a_reliable_ping_instead_of_an_application_packet(
 fn accepted_then_closed_handoff_keeps_the_packet_prefix_and_terminal_event() {
     let (mut client, now) = negotiating(RakClientConfig::default());
     client
-        .handle(RakClientInput::Datagram(
+        .handle(ClientInput::Datagram(
             datagram(
                 0,
                 0,
@@ -233,8 +233,8 @@ fn accepted_then_closed_handoff_keeps_the_packet_prefix_and_terminal_event() {
     let mut session = None;
     while let Some(output) = client.poll() {
         match output {
-            RakClientOutput::SessionConnected(connected) => session = Some(connected),
-            RakClientOutput::SocketDatagram(bytes, _) if bytes[0] & 0xe0 == 0x80 => {
+            ClientOutput::SessionConnected(connected) => session = Some(connected),
+            ClientOutput::SocketDatagram(bytes, _) if bytes[0] & 0xe0 == 0x80 => {
                 let set = FrameSet::deserialize(&mut Cursor::new(bytes.as_ref())).unwrap();
                 assert!(
                     set.frames
@@ -270,16 +270,16 @@ fn handshake_limits_and_cancellation_discard_pending_packets_before_reconnect() 
             ..RakClientConfig::default()
         });
         client
-            .handle(RakClientInput::Datagram(
+            .handle(ClientInput::Datagram(
                 datagram(0, 0, vec![Box::new([0xfe, 1]), Box::new([0xfe, 2])]),
                 PEER,
                 now,
             ))
             .unwrap();
         if cancel {
-            client.handle(RakClientInput::Disconnect).unwrap();
+            client.handle(ClientInput::Disconnect).unwrap();
         } else {
-            let result = client.handle(RakClientInput::Datagram(
+            let result = client.handle(ClientInput::Datagram(
                 datagram(1, 2, vec![Box::new([0xfe, 3])]),
                 PEER,
                 now,
@@ -291,12 +291,12 @@ fn handshake_limits_and_cancellation_discard_pending_packets_before_reconnect() 
         }
         assert!(!client.is_connecting());
         while let Some(output) = client.poll() {
-            assert!(!matches!(output, RakClientOutput::SessionConnected(_)));
+            assert!(!matches!(output, ClientOutput::SessionConnected(_)));
         }
         let later = now + Duration::from_secs(1);
         start_reliable_handshake(&mut client, later);
         client
-            .handle(RakClientInput::Datagram(
+            .handle(ClientInput::Datagram(
                 datagram(0, 0, vec![accepted(), Box::new([0xfe, 9])]),
                 PEER,
                 later,
@@ -304,7 +304,7 @@ fn handshake_limits_and_cancellation_discard_pending_packets_before_reconnect() 
             .unwrap();
         let mut received = Vec::new();
         while let Some(output) = client.poll() {
-            if let RakClientOutput::SessionConnected(mut session) = output {
+            if let ClientOutput::SessionConnected(mut session) = output {
                 while let Some(output) = session.poll() {
                     if let RakSessionOutput::Packet(packet) = output {
                         received.push(packet);

@@ -3,7 +3,7 @@ use crate::types::priority::RakPriority;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
-pub enum RakSessionInput {
+pub(crate) enum SessionInput {
     Datagram(Box<[u8]>, Instant),
     Send(Box<[u8]>, RakReliability, RakPriority, Instant),
     Update(Instant),

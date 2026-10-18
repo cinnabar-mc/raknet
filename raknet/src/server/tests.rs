@@ -1,6 +1,6 @@
 use super::*;
 
-fn drain(server: &mut RakServer) -> Vec<RakServerOutput> {
+fn drain(server: &mut ServerEngine) -> Vec<ServerOutput> {
     let mut out = Vec::new();
     while let Some(o) = server.poll() {
         out.push(o);
@@ -8,9 +8,9 @@ fn drain(server: &mut RakServer) -> Vec<RakServerOutput> {
     out
 }
 
-fn first_byte(output: &RakServerOutput) -> Option<u8> {
+fn first_byte(output: &ServerOutput) -> Option<u8> {
     match output {
-        RakServerOutput::SocketDatagram(buf, _) => buf.first().copied(),
+        ServerOutput::SocketDatagram(buf, _) => buf.first().copied(),
         _ => None,
     }
 }
@@ -20,9 +20,9 @@ fn request_1(protocol: u8) -> Box<[u8]> {
     req.serialized().unwrap()
 }
 
-fn reply_cookie(server: &mut RakServer) -> Option<i32> {
+fn reply_cookie(server: &mut ServerEngine) -> Option<i32> {
     drain(server).into_iter().find_map(|out| match out {
-        RakServerOutput::SocketDatagram(buf, _)
+        ServerOutput::SocketDatagram(buf, _)
             if buf.first() == Some(&packet_id::OPEN_CONNECTION_REPLY_1) =>
         {
             OpenConnectionReply1::deserialize(&mut buf.as_ref())
@@ -43,22 +43,22 @@ fn request_2(server_addr: SocketAddr, client: u64, cookie: Option<i32>) -> Box<[
     req.serialized().unwrap()
 }
 
-use crate::client::RakClient;
+use crate::client::ClientEngine;
 use crate::client::config::RakClientConfig;
-use crate::client::input::RakClientInput;
-use crate::client::output::RakClientOutput;
+use crate::client::input::ClientInput;
+use crate::client::output::ClientOutput;
 
 /// Completes a synthetic probe write before delivering its bytes to the test server.
 fn client_datagram(
-    client: &mut RakClient,
-    output: RakClientOutput,
+    client: &mut ClientEngine,
+    output: ClientOutput,
     now: Instant,
 ) -> Option<Box<[u8]>> {
     match output {
-        RakClientOutput::SocketDatagram(bytes, _) => Some(bytes),
-        RakClientOutput::MtuProbe { id, datagram, .. } => {
+        ClientOutput::SocketDatagram(bytes, _) => Some(bytes),
+        ClientOutput::MtuProbe { id, datagram, .. } => {
             client
-                .handle(RakClientInput::MtuProbeResult {
+                .handle(ClientInput::MtuProbeResult {
                     id,
                     now,
                     elapsed: Duration::ZERO,
@@ -72,20 +72,20 @@ fn client_datagram(
 }
 
 fn connect_all(
-    server: &mut RakServer,
+    server: &mut ServerEngine,
     server_addr: SocketAddr,
     client_addrs: &[SocketAddr],
     now: Instant,
-) -> Vec<RakSession> {
-    let mut clients: Vec<(SocketAddr, Option<RakClient>)> = client_addrs
+) -> Vec<SessionEngine> {
+    let mut clients: Vec<(SocketAddr, Option<ClientEngine>)> = client_addrs
         .iter()
         .map(|&addr| {
-            let mut client = RakClient::new(
+            let mut client = ClientEngine::new(
                 RakClientConfig::default(),
                 crate::clock::RakClock::new(crate::clock::test_now()),
             );
             client
-                .handle(RakClientInput::Connect {
+                .handle(ClientInput::Connect {
                     guid: crate::client::TEST_CLIENT_GUID,
                     remote: server_addr,
                     local: SocketAddr::new(server_addr.ip(), 54321),
@@ -114,19 +114,19 @@ fn connect_all(
 
         for out in drain(server) {
             match out {
-                RakServerOutput::SocketDatagram(buf, to) => {
+                ServerOutput::SocketDatagram(buf, to) => {
                     let Some((_, slot)) = clients.iter_mut().find(|(addr, _)| *addr == to) else {
                         continue;
                     };
                     if let Some(client) = slot
                         && client
-                            .handle(RakClientInput::Datagram(buf, server_addr, now))
+                            .handle(ClientInput::Datagram(buf, server_addr, now))
                             .is_err()
                     {
                         *slot = None;
                     }
                 }
-                RakServerOutput::SessionConnected(session) => connected.push(*session),
+                ServerOutput::SessionConnected(session) => connected.push(*session),
                 _ => {}
             }
         }
@@ -134,15 +134,15 @@ fn connect_all(
 }
 
 fn connect(
-    server: &mut RakServer,
+    server: &mut ServerEngine,
     server_addr: SocketAddr,
     client_addr: SocketAddr,
     now: Instant,
-) -> Option<RakSession> {
+) -> Option<SessionEngine> {
     connect_all(server, server_addr, &[client_addr], now).pop()
 }
 
-fn open_pending(server: &mut RakServer, server_addr: SocketAddr, client_addr: SocketAddr) {
+fn open_pending(server: &mut ServerEngine, server_addr: SocketAddr, client_addr: SocketAddr) {
     let now = crate::clock::test_now();
     server
         .handle(RakServerInput::Datagram(
@@ -164,7 +164,7 @@ fn open_pending(server: &mut RakServer, server_addr: SocketAddr, client_addr: So
 #[test]
 fn a_client_completes_the_handshake() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -185,17 +185,17 @@ fn online_datagram() -> Box<[u8]> {
     Box::new([flags::VALID, 0, 0, 0])
 }
 
-fn session_datagrams(server: &mut RakServer) -> usize {
+fn session_datagrams(server: &mut ServerEngine) -> usize {
     drain(server)
         .iter()
-        .filter(|o| matches!(o, RakServerOutput::SessionDatagram(..)))
+        .filter(|o| matches!(o, ServerOutput::SessionDatagram(..)))
         .count()
 }
 
 #[test]
 fn a_flood_of_online_datagrams_blocks_the_ip_for_a_while() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -242,7 +242,7 @@ fn a_flood_of_online_datagrams_blocks_the_ip_for_a_while() {
 #[test]
 fn expired_blocks_are_pruned_on_update() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -267,7 +267,7 @@ fn expired_blocks_are_pruned_on_update() {
 #[test]
 fn a_blocked_ip_is_ignored_until_unblocked() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -312,7 +312,7 @@ fn a_blocked_ip_is_ignored_until_unblocked() {
 #[test]
 fn established_connections_never_exceed_max() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig {
             max_connections: 1,
             ..Default::default()
@@ -342,7 +342,7 @@ fn pending_session_closed_during_handshake_frees_its_slot() {
 
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -368,7 +368,7 @@ fn pending_session_closed_during_handshake_frees_its_slot() {
     assert!(!server.session_map.contains_key(&client_addr));
 }
 
-fn cookie_for(server: &mut RakServer, client_addr: SocketAddr, now: Instant) -> Option<i32> {
+fn cookie_for(server: &mut ServerEngine, client_addr: SocketAddr, now: Instant) -> Option<i32> {
     server
         .handle(RakServerInput::Datagram(
             request_1(constants::PROTOCOL),
@@ -380,7 +380,7 @@ fn cookie_for(server: &mut RakServer, client_addr: SocketAddr, now: Instant) -> 
 }
 
 fn accepts_request_2(
-    server: &mut RakServer,
+    server: &mut ServerEngine,
     server_addr: SocketAddr,
     client_addr: SocketAddr,
     cookie: Option<i32>,
@@ -402,7 +402,7 @@ fn accepts_request_2(
 #[test]
 fn reply_1_carries_a_cookie_by_default() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -422,7 +422,7 @@ fn reply_1_carries_a_cookie_by_default() {
 fn request_2_without_a_cookie_is_ignored() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -446,7 +446,7 @@ fn request_2_with_another_addresses_cookie_is_ignored() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let spoofed_addr: SocketAddr = "127.0.0.2:1".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -475,7 +475,7 @@ fn request_2_with_another_addresses_cookie_is_ignored() {
 #[test]
 fn cookie_survives_one_rotation_but_not_two() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -510,7 +510,7 @@ fn cookie_survives_one_rotation_but_not_two() {
 fn cookies_can_be_disabled() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig {
             cookies: false,
             ..Default::default()
@@ -536,7 +536,7 @@ fn rate_limits_offline_packets_per_ip() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig {
             packet_limit: 2,
             ..Default::default()
@@ -567,7 +567,7 @@ fn rate_limits_offline_packets_per_ip() {
 fn rate_limit_is_shared_by_every_port_of_an_ip() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
 
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig {
             packet_limit: 2,
             ..Default::default()
@@ -600,7 +600,7 @@ fn already_connected_reply_on_duplicate_request() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -647,7 +647,7 @@ fn ip_recently_connected_reply_after_disconnect() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -699,7 +699,7 @@ fn adopted_session_continues_on_a_second_server() {
     let peer_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
 
     // A session whose sequence state has advanced past its initial values.
-    let mut server_a = RakServer::new(
+    let mut server_a = ServerEngine::new(
         RakServerConfig::default(),
         "127.0.0.1:19160".parse().unwrap(),
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -709,7 +709,7 @@ fn adopted_session_continues_on_a_second_server() {
     server_a.session_map.insert(peer_addr, id_on_a);
     server_a.session_addr.insert(id_on_a, peer_addr);
 
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         id_on_a,
         peer_addr,
         0xDEAD_BEEF,
@@ -720,7 +720,7 @@ fn adopted_session_continues_on_a_second_server() {
     );
     let now = crate::clock::test_now();
     session
-        .handle(RakSessionInput::Send(
+        .handle(SessionInput::Send(
             b"hello".to_vec().into_boxed_slice(),
             RakReliability::ReliableOrdered,
             RakPriority::Immediate,
@@ -735,7 +735,7 @@ fn adopted_session_continues_on_a_second_server() {
 
     // A separate instance whose id counter is already past server A's, so reusing
     // the incoming id would collide.
-    let mut server_b = RakServer::new(
+    let mut server_b = ServerEngine::new(
         RakServerConfig::default(),
         "127.0.0.1:19161".parse().unwrap(),
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -747,7 +747,7 @@ fn adopted_session_continues_on_a_second_server() {
 
     let outputs = drain(&mut server_b);
     let adopted = outputs.into_iter().find_map(|o| match o {
-        RakServerOutput::SessionConnected(session) => Some(*session),
+        ServerOutput::SessionConnected(session) => Some(*session),
         _ => None,
     });
     let adopted = adopted.expect("adopt must emit SessionConnected");
@@ -777,7 +777,7 @@ fn adopted_session_continues_on_a_second_server() {
     assert!(
         routed
             .iter()
-            .any(|o| matches!(o, RakServerOutput::SessionDatagram(_, id) if *id == adopted.id)),
+            .any(|o| matches!(o, ServerOutput::SessionDatagram(_, id) if *id == adopted.id)),
         "a datagram from the adopted session's peer must be routed by its new id"
     );
 }
@@ -787,7 +787,7 @@ fn evicts_stale_pending_connection() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
@@ -826,19 +826,19 @@ fn evicts_stale_pending_connection() {
 fn pending_session_acks_and_resends_connection_request_accepted() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let client_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
-    let mut server = RakServer::new(
+    let mut server = ServerEngine::new(
         RakServerConfig::default(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
         crate::clock::test_now(),
     );
     let now = crate::clock::test_now();
-    let mut client = RakClient::new(
+    let mut client = ClientEngine::new(
         RakClientConfig::default(),
         crate::clock::RakClock::new(crate::clock::test_now()),
     );
     client
-        .handle(RakClientInput::Connect {
+        .handle(ClientInput::Connect {
             guid: crate::client::TEST_CLIENT_GUID,
             remote: server_addr,
             local: SocketAddr::new(server_addr.ip(), 54321),
@@ -860,11 +860,11 @@ fn pending_session_acks_and_resends_connection_request_accepted() {
             break;
         }
         for out in drain(&mut server) {
-            if let RakServerOutput::SocketDatagram(buf, _) = out
+            if let ServerOutput::SocketDatagram(buf, _) = out
                 && buf.first().is_some_and(|b| b & flags::VALID == 0)
             {
                 client
-                    .handle(RakClientInput::Datagram(buf, server_addr, now))
+                    .handle(ClientInput::Datagram(buf, server_addr, now))
                     .unwrap();
             }
         }
@@ -875,7 +875,7 @@ fn pending_session_acks_and_resends_connection_request_accepted() {
         .handle(RakServerInput::Update(now + Duration::from_millis(20)))
         .unwrap();
     let acked = drain(&mut server).iter().any(|out| {
-        matches!(out, RakServerOutput::SocketDatagram(buf, _)
+        matches!(out, ServerOutput::SocketDatagram(buf, _)
             if buf.first().is_some_and(|b| b & flags::ACK != 0))
     });
     assert!(
@@ -887,7 +887,7 @@ fn pending_session_acks_and_resends_connection_request_accepted() {
         .handle(RakServerInput::Update(now + Duration::from_millis(2100)))
         .unwrap();
     let resent = drain(&mut server).iter().any(|out| {
-        matches!(out, RakServerOutput::SocketDatagram(buf, _)
+        matches!(out, ServerOutput::SocketDatagram(buf, _)
             if buf.first().is_some_and(|b| b & flags::VALID != 0 && b & flags::ACK == 0 && b & flags::NACK == 0))
     });
     assert!(
@@ -900,7 +900,7 @@ fn accepted_reply_to(client_addr: SocketAddr) -> ConnectionRequestAccepted {
     use crate::protocol::packets::frame_set::FrameSet;
 
     let now = crate::clock::test_now();
-    let mut session = RakSession::new(
+    let mut session = SessionEngine::new(
         RakSessionId(0),
         client_addr,
         0,
@@ -916,7 +916,7 @@ fn accepted_reply_to(client_addr: SocketAddr) -> ConnectionRequestAccepted {
     };
     let mut buf = Vec::new();
     request.serialize(&mut buf).unwrap();
-    RakServer::handle_connection_request(&mut session, client_addr, &mut Cursor::new(&buf), now)
+    ServerEngine::handle_connection_request(&mut session, client_addr, &mut Cursor::new(&buf), now)
         .unwrap();
     session.tick(now).unwrap();
 

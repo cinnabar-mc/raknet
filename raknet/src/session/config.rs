@@ -25,3 +25,26 @@ impl Default for RakSessionConfig {
         }
     }
 }
+
+impl RakSessionConfig {
+    /// Validates local capacities and cadence before session establishment.
+    pub fn validate(&self) -> Result<(), super::error::RakSessionError> {
+        use super::error::RakSessionError;
+        if !(1..=MAX_ORDERING_CHANNELS).contains(&self.ordering_channels) {
+            return Err(RakSessionError::InvalidConfig(
+                "ordering channel count is outside its supported range",
+            ));
+        }
+        if self.max_queued_bytes <= 0 || self.max_outbound_bytes <= 0 {
+            return Err(RakSessionError::InvalidConfig(
+                "session byte capacities must be positive",
+            ));
+        }
+        if self.autoflush && self.autoflush_interval_ms.is_zero() {
+            return Err(RakSessionError::InvalidConfig(
+                "automatic flush cadence must be positive",
+            ));
+        }
+        Ok(())
+    }
+}

@@ -1,11 +1,11 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
 use super::MtuProbeId;
-use crate::session::RakSession;
+use crate::session::SessionEngine;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
-pub enum RakClientOutput {
+pub(crate) enum ClientOutput {
     /// Write one probe, then report its token and measured write result as `MtuProbeResult`.
     MtuProbe {
         id: MtuProbeId,
@@ -14,7 +14,7 @@ pub enum RakClientOutput {
     },
     SocketDatagram(Box<[u8]>, SocketAddr),
     SessionDatagram(Box<[u8]>),
-    SessionConnected(Box<RakSession>),
+    SessionConnected(Box<SessionEngine>),
     Wait(Duration),
     /// A reply with the echoed wire counter and measured monotonic latency.
     Pong {

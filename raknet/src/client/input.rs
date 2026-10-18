@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::Instant;
 
-pub enum RakClientInput {
+pub(crate) enum ClientInput {
     /// Completes a probe write. `elapsed` covers the socket write only, including failures.
     MtuProbeResult {
         id: MtuProbeId,

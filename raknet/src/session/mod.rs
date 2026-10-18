@@ -3,6 +3,7 @@ pub mod config;
 pub mod congestion_controller;
 pub mod error;
 pub mod input;
+pub(crate) mod lifecycle;
 pub mod output;
 mod ranges;
 mod receive;
@@ -20,7 +21,7 @@ use crate::protocol::types::frame::Frame;
 use crate::sans::Sans;
 use crate::session::congestion_controller::RakCongestionController;
 use crate::session::error::RakSessionError;
-use crate::session::input::RakSessionInput;
+use crate::session::input::SessionInput;
 use crate::session::output::{RakDisconnectReason, RakSessionOutput};
 use crate::types::priority::RakPriority;
 use crate::types::reliability::RakReliability;
@@ -58,7 +59,7 @@ const MAX_SPLITS_IN_FLIGHT: usize = 256;
 const SESSION_TIMEOUT: Duration = Duration::from_millis(15000);
 
 #[derive(Clone, Debug)]
-pub struct RakSession {
+pub(crate) struct SessionEngine {
     pub id: RakSessionId,
     pub addr: SocketAddr,
     pub state: RakSessionState,
@@ -109,8 +110,8 @@ pub struct RakSession {
     output: VecDeque<RakSessionOutput>,
 }
 
-impl Sans for RakSession {
-    type Input = RakSessionInput;
+impl Sans for SessionEngine {
+    type Input = SessionInput;
     type Output = RakSessionOutput;
     type Error = RakSessionError;
 
@@ -120,7 +121,7 @@ impl Sans for RakSession {
         }
 
         match msg {
-            RakSessionInput::Datagram(buf, now) => {
+            SessionInput::Datagram(buf, now) => {
                 self.last_recv = now;
 
                 let Some(&b) = buf.first() else {
@@ -139,13 +140,13 @@ impl Sans for RakSession {
                     _ => self.handle_frame_set(&mut cursor, now)?,
                 }
             }
-            RakSessionInput::Send(..) if self.state == RakSessionState::Closing => {
+            SessionInput::Send(..) if self.state == RakSessionState::Closing => {
                 return Err(RakSessionError::Closed);
             }
-            RakSessionInput::Send(buf, ..) if buf.len() > self.max_message_len() => {
+            SessionInput::Send(buf, ..) if buf.len() > self.max_message_len() => {
                 return Err(RakSessionError::MessageSizeExceeded(buf.len()));
             }
-            RakSessionInput::Send(buf, _, _, now)
+            SessionInput::Send(buf, _, _, now)
                 if self.outbound_bytes + buf.len() > self.config.max_outbound_bytes as usize =>
             {
                 debug!(
@@ -154,12 +155,12 @@ impl Sans for RakSession {
                 );
                 self.disconnect(true, RakDisconnectReason::OutboundBytesExceeded, now)?
             }
-            RakSessionInput::Send(buf, reliability, priority, now) => {
+            SessionInput::Send(buf, reliability, priority, now) => {
                 self.send_frame(Frame::new(reliability, buf), priority, now)?
             }
-            RakSessionInput::Update(now) => self.handle_timeout(now)?,
-            RakSessionInput::Disconnect(now) => self.close(now)?,
-            RakSessionInput::DisconnectNow(now) => {
+            SessionInput::Update(now) => self.handle_timeout(now)?,
+            SessionInput::Disconnect(now) => self.close(now)?,
+            SessionInput::DisconnectNow(now) => {
                 self.send_queue(now)?;
                 self.flush();
                 self.disconnect(true, RakDisconnectReason::Requested, now)?
@@ -173,7 +174,7 @@ impl Sans for RakSession {
     }
 }
 
-impl RakSession {
+impl SessionEngine {
     /// Creates session timers in the same domain clock used by its subsequent inputs.
     pub fn new(
         id: RakSessionId,
@@ -241,10 +242,6 @@ impl RakSession {
 
             output: VecDeque::new(),
         }
-    }
-
-    pub fn get_addr(self) -> SocketAddr {
-        self.addr
     }
 
     pub fn get_state(&self) -> RakSessionState {
@@ -797,7 +794,7 @@ impl RakSession {
         let payload = ping.serialized()?;
         if reliability.is_reliable() {
             // Reliable liveness needs the same retention and delivery limits as application data.
-            self.handle(RakSessionInput::Send(
+            self.handle(SessionInput::Send(
                 payload,
                 reliability,
                 RakPriority::Immediate,

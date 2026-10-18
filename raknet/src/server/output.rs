@@ -1,9 +1,9 @@
-use crate::session::{RakSession, RakSessionId};
+use crate::session::{RakSessionId, SessionEngine};
 use std::net::SocketAddr;
 
 #[derive(Clone, Debug)]
-pub enum RakServerOutput {
+pub(crate) enum ServerOutput {
     SocketDatagram(Box<[u8]>, SocketAddr),
     SessionDatagram(Box<[u8]>, RakSessionId),
-    SessionConnected(Box<RakSession>),
+    SessionConnected(Box<SessionEngine>),
 }
