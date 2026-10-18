@@ -684,7 +684,7 @@ impl RakSession {
             .collect()
     }
 
-    /// Emits protocol control independently from application congestion and queue admission.
+    /// Emits unreliable or terminal control without waiting for application congestion.
     fn send_control(&mut self, frame: Frame, now: Instant) -> Result<(), RakSessionError> {
         let frames = self.prepare_frames(frame);
         self.queue_frames(frames, RakPriority::Immediate, now)
@@ -785,7 +785,18 @@ impl RakSession {
         let ping = ConnectedPing {
             timestamp: self.clock.timestamp(now),
         };
-        self.send_control(Frame::new(reliability, ping.serialized()?), now)
+        let payload = ping.serialized()?;
+        if reliability.is_reliable() {
+            // Reliable liveness needs the same retention and delivery limits as application data.
+            self.handle(RakSessionInput::Send(
+                payload,
+                reliability,
+                RakPriority::Immediate,
+                now,
+            ))
+        } else {
+            self.send_control(Frame::new(reliability, payload), now)
+        }
     }
 
     /// Restores the completed handshake prefix before an optional terminal notification.

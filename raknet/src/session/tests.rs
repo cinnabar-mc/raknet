@@ -1247,29 +1247,41 @@ fn close_resends_unacknowledged_data() {
 }
 
 #[test]
-fn unacknowledged_sends_beyond_max_outbound_bytes_close_the_session() {
-    let mut session = session(0, 1);
-    session.config.max_outbound_bytes = 64 * 1024;
-    let now = domain_time();
-
-    for _ in 0..100 {
-        let send = RakSessionInput::Send(
-            vec![0xFE; 1024].into_boxed_slice(),
-            RakReliability::ReliableOrdered,
-            RakPriority::Normal,
-            now,
-        );
-        if session.handle(send).is_err() {
-            break;
+fn unacknowledged_application_and_liveness_sends_respect_outbound_memory_limit() {
+    for liveness in [false, true] {
+        let mut sender = session(0, 1);
+        sender.config.max_outbound_bytes = 1024;
+        let now = domain_time();
+        for seq in 0..256 {
+            let result = if liveness {
+                sender.handle(datagram_at(
+                    seq,
+                    vec![Frame::new(
+                        RakReliability::Unreliable,
+                        Box::new([packet_id::DETECT_LOST_CONNECTIONS]),
+                    )],
+                    now,
+                ))
+            } else {
+                send(&mut sender, 128, now)
+            };
+            if result.is_err() || sender.state == RakSessionState::Disconnected {
+                break;
+            }
+            sender.tick(now).unwrap();
+            drain_outputs(&mut sender);
         }
-        session.tick(now).unwrap();
+        assert_eq!(sender.state, RakSessionState::Disconnected);
+        assert_eq!(
+            disconnect_reason(&sender),
+            Some(RakDisconnectReason::OutboundBytesExceeded)
+        );
+        assert!(
+            payloads_of(&drain_outputs(&mut sender))
+                .iter()
+                .any(|payload| payload.as_ref() == [packet_id::DISCONNECT])
+        );
     }
-
-    assert_eq!(session.state, RakSessionState::Disconnected);
-    assert_eq!(
-        disconnect_reason(&session),
-        Some(RakDisconnectReason::OutboundBytesExceeded)
-    );
 }
 
 fn send(session: &mut RakSession, len: usize, now: Instant) -> Result<(), RakSessionError> {
