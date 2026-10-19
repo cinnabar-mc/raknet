@@ -21,6 +21,9 @@ pub enum RakClientError {
     /// Complete early application packets exceeded the configured handshake FIFO.
     #[error("Handshake receive buffer exceeded")]
     HandshakeReceiveBufferExceeded,
+    /// The local socket owner already retains the maximum pending discovery replies.
+    #[error("Pending ping capacity exceeded")]
+    PendingPingCapacityExceeded,
     #[error("Connection Failed")]
     ConnectionFailed,
     #[error("Connection Attempt Failed")]
