@@ -11,6 +11,9 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+#[cfg(test)]
+mod bounded_delivery_tests;
+
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 
 pub struct RakClientPlugin;
