@@ -20,6 +20,7 @@ async fn inspect(client: &RakClient<RunningClient>) -> Result<PingState, String>
         .state
         .msg_tx
         .send(RakClientMsg::InspectPings(send))
+        .await
         .map_err(|_| "original client command owner closed".to_owned())?;
     receive
         .await

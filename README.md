@@ -132,8 +132,23 @@ outputs as well as the return value of `handle`.
 
 Drain application packets promptly and bound your own queues. Protocol retention
 limits do not bound every adapter or application queue. The Tokio adapter bounds
-session input and received-message channels and closes an overloaded session;
-its command and datagram channels are unbounded.
+session input and received-message channels and closes an overloaded session.
+Its endpoint command FIFOs retain at most `MAX_RECEIVE_MESSAGES` requests;
+session-command, accepted-session and datagram channels still need separate
+bounds. A command-count limit is not an aggregate byte or RSS limit.
+
+Running Tokio server setters return `Result` with `TrySendError::Full(input)` or
+`Closed(input)` when the original FIFO cannot admit a control. Rejected
+`set_message` input is returned without conversion or copying. Configured
+setters remain infallible setup. Async endpoint requests wait for real capacity;
+canceling before admission queues nothing, and canceling after admission does
+not retract the queued request. Ping's existing timeout includes that capacity
+wait. Snapshot adoption restores the original clock before waiting.
+
+Endpoint stop requests bypass a full command FIFO and retain their first close
+cutoff. Fully await consuming `stop` to join its original socket owner; dropping
+that future or the running resource does not promise a completed join. The
+existing socket-write and session cleanup behavior still applies.
 
 Bevy's original final receive queues retain at most `MAX_RECEIVE_MESSAGES` per
 session and that session's `max_queued_bytes` of complete bodies. The first

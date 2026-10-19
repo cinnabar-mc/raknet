@@ -7,6 +7,7 @@ pub use phases::{ConfiguredClient, RunningClient};
 use crate::client::msg::RakClientMsg;
 use crate::prelude::{RakServerError, RakSession};
 use crate::session::{RestoredSession, SessionEvent, spawn_closing, spawn_established};
+use crate::stop::StopState;
 use driver::Driver;
 use raknet::prelude::{
     ClientGuid, Established, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
@@ -17,12 +18,15 @@ use raknet::prelude::{
 use std::collections::HashMap;
 use std::mem::take;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Sender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+#[cfg(test)]
+use tokio::time::timeout;
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use tracing::debug;
 
 struct ClientSockets {
@@ -195,9 +199,11 @@ impl RakClient<ConfiguredClient> {
             }
         };
         let config = self.state.config;
-        let (msg_tx, msg_rx) = unbounded_channel();
+        let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
+        let stop = Arc::new(StopState::default());
 
         let handle = tokio::spawn({
+            let stop = stop.clone();
             let sockets = sockets;
             let mut msg_rx = msg_rx;
 
@@ -225,7 +231,24 @@ impl RakClient<ConfiguredClient> {
                 let mut stop_deadline: Option<Instant> = None;
 
                 loop {
+                    if stop_deadline.is_none()
+                        && let Some(deadline) = stop.deadline()
+                    {
+                        msg_rx.close();
+                        if let Some(session) = &session_tx {
+                            let _ =
+                                session.try_send(SessionEvent::Close(Instant::now().into_std()));
+                        }
+                        stop_deadline = Some(deadline);
+                    }
+                    if let Some(deadline) = stop_deadline
+                        && ((session_tx.is_none() && msg_rx.is_empty())
+                            || Instant::now() >= deadline)
+                    {
+                        break;
+                    }
                     tokio::select! {
+                        _ = stop.wait(), if stop_deadline.is_none() => continue,
                         Ok((datagram, addr)) = sockets.recv(&mut buf4, &mut buf6) => {
                             let now = Instant::now().into_std();
 
@@ -262,6 +285,13 @@ impl RakClient<ConfiguredClient> {
                                             .filter(|ping| ping.sender.is_closed()).count(),
                                     });
                                 }
+                                #[cfg(test)]
+                                RakClientMsg::InspectCommands(reply) => {
+                                    let _ = reply.send(crate::endpoint_command_tests::QueueState {
+                                        queued: msg_rx.len(),
+                                        address: sockets.v4.local_addr().ok(),
+                                    });
+                                }
                                 RakClientMsg::Connect(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
                                     let result = sockets.local_addr(addr)
@@ -290,15 +320,6 @@ impl RakClient<ConfiguredClient> {
                                         Ok(()) => adopting = Some(reply),
                                         Err(error) => { let _ = reply.send(Err(error)); }
                                     }
-                                }
-                                RakClientMsg::Stop => {
-                                    if let Some(session) = &session_tx {
-                                        let _ = session.try_send(SessionEvent::Close(now));
-                                    }
-
-                                    stop_deadline = Some(
-                                        Instant::now() + constants::CLOSE_TIMEOUT + Duration::from_secs(1),
-                                    );
                                 }
                             }
                         }
@@ -357,7 +378,7 @@ impl RakClient<ConfiguredClient> {
                                     disconnect_tx.clone(),
                                 );
 
-                                if stop_deadline.is_some() {
+                                if stop_deadline.is_some() || stop.requested() {
                                     let _ =
                                         tx.try_send(SessionEvent::Close(Instant::now().into_std()));
                                     session_tx = Some(tx);
@@ -406,12 +427,6 @@ impl RakClient<ConfiguredClient> {
                             }
                         }
                     }
-
-                    if let Some(deadline) = stop_deadline
-                        && (session_tx.is_none() || Instant::now() >= deadline)
-                    {
-                        break;
-                    }
                 }
 
                 while let Ok((buf, addr)) = dgram_rx.try_recv() {
@@ -424,15 +439,51 @@ impl RakClient<ConfiguredClient> {
             state: RunningClient {
                 handle: Some(handle),
                 msg_tx,
+                stop,
             },
         })
     }
 }
 
 impl RakClient<RunningClient> {
+    /// Reserves this endpoint's original FIFO without retracting an already committed command.
+    async fn command(
+        &self,
+        message: RakClientMsg,
+        deadline: Option<Instant>,
+    ) -> Result<(), RakClientError> {
+        tokio::select! {
+            _ = self.state.stop.wait() => Err(RakClientError::Closed),
+            permit = self.state.msg_tx.reserve() => {
+                let permit = permit.map_err(|_| RakClientError::Closed)?;
+                if self.state.stop.requested() {
+                    return Err(RakClientError::Closed);
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(RakClientError::Timeout);
+                }
+                permit.send(message);
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads only the original queue at this probe's FIFO position and the same bound socket.
+    #[cfg(test)]
+    pub(crate) fn command_queue_probe(
+        &self,
+    ) -> oneshot::Receiver<crate::endpoint_command_tests::QueueState> {
+        let (send, receive) = oneshot::channel();
+        let _ = self
+            .state
+            .msg_tx
+            .try_send(RakClientMsg::InspectCommands(send));
+        receive
+    }
+
     /// Requests graceful stop and consumes the running capability.
     pub async fn stop(mut self) {
-        let _ = self.state.msg_tx.send(RakClientMsg::Stop);
+        self.state.stop.request();
         if let Some(handle) = self.state.handle.take() {
             let _ = handle.await;
         }
@@ -442,17 +493,18 @@ impl RakClient<RunningClient> {
     ///
     /// At most `constants::MAX_RECEIVE_MESSAGES` reply records are retained by the endpoint.
     /// Excess requests fail with `PendingPingCapacityExceeded` before a wire request is issued.
+    /// This timeout includes waiting for command capacity; an expired waiter cannot commit.
     /// Canceling an admitted wait does not retract an already queued wire request.
     pub async fn ping(&self, addr: SocketAddr) -> Result<(Box<[u8]>, Duration), RakClientError> {
-        let msg_tx = &self.state.msg_tx;
-
         let (tx, rx) = oneshot::channel();
-
-        let _ = msg_tx.send(RakClientMsg::Ping(addr, tx));
-        timeout(PING_TIMEOUT, rx)
-            .await
-            .map_err(|_| RakClientError::Timeout)?
-            .map_err(|_| RakClientError::Closed)?
+        let deadline = Instant::now() + PING_TIMEOUT;
+        timeout_at(deadline, async {
+            self.command(RakClientMsg::Ping(addr, tx), Some(deadline))
+                .await?;
+            rx.await.map_err(|_| RakClientError::Closed)?
+        })
+        .await
+        .map_err(|_| RakClientError::Timeout)?
     }
 
     /// Resumes a session captured with [`RakSession::snapshot`] on another client.
@@ -472,16 +524,12 @@ impl RakClient<RunningClient> {
                 cause,
             });
         }
-        let msg_tx = &self.state.msg_tx;
-
         let session = snapshot
             .restore(Instant::now().into_std(), elapsed)
             .map_err(RakClientError::from)?;
         let (tx, rx) = oneshot::channel();
 
-        msg_tx
-            .send(RakClientMsg::Adopt(session, tx))
-            .map_err(|_| RakClientError::Closed)?;
+        self.command(RakClientMsg::Adopt(session, tx), None).await?;
 
         Ok(rx.await.map_err(|_| RakClientError::Closed)??)
     }
@@ -490,11 +538,8 @@ impl RakClient<RunningClient> {
         &self,
         addr: SocketAddr,
     ) -> Result<RakSession<Established>, RakClientError> {
-        let msg_tx = &self.state.msg_tx;
-
         let (tx, rx) = oneshot::channel();
-
-        let _ = msg_tx.send(RakClientMsg::Connect(addr, tx));
+        self.command(RakClientMsg::Connect(addr, tx), None).await?;
         rx.await.map_err(|_| RakClientError::Closed)?
     }
 }
@@ -545,3 +590,6 @@ mod tests;
 
 #[cfg(test)]
 mod bounded_pings_tests;
+
+#[cfg(test)]
+mod command_tests;

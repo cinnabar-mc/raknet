@@ -2,6 +2,7 @@ mod client;
 mod configuration;
 mod server;
 mod session;
+mod stop;
 
 pub mod prelude {
     pub use super::client::{
@@ -21,3 +22,6 @@ pub mod prelude {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod endpoint_command_tests;
