@@ -59,11 +59,12 @@ async fn adopting_a_snapshot_preserves_time_spent_waiting_for_the_actor() {
         Default::default(),
     );
     let snapshot = original.snapshot(now).unwrap();
-    let (msg_tx, mut msg_rx) = unbounded_channel();
+    let (msg_tx, mut msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
     let client = RakClient {
         state: RunningClient {
             handle: Some(tokio::spawn(async {})),
             msg_tx,
+            stop: Arc::new(StopState::default()),
         },
     };
     let adopting =

@@ -17,5 +17,4 @@ pub enum RakClientMsg {
         RestoredSession,
         oneshot::Sender<Result<crate::session::RestoredSession, RakClientError>>,
     ),
-    Stop,
 }

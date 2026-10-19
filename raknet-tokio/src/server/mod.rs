@@ -7,6 +7,7 @@ pub use phases::{ConfiguredServer, RunningServer};
 use crate::server::error::RakServerError;
 use crate::server::msg::RakServerMsg;
 use crate::session::{RakSession, RestoredSession, SessionEvent, spawn_closing, spawn_established};
+use crate::stop::StopState;
 use raknet::prelude::{
     Established, RakClock, RakServer as RakServerIntl, RakServerConfig, RakServerInput,
     RakServerOutput, RakSessionId, RakSessionInput, RakSessionSnapshot,
@@ -14,10 +15,11 @@ use raknet::prelude::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Sender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::debug;
 
@@ -84,9 +86,11 @@ impl RakServer<ConfiguredServer> {
         let config = self.state.config;
         let addr = self.state.addr;
         let (session_tx, session_rx) = unbounded_channel();
-        let (msg_tx, msg_rx) = unbounded_channel();
+        let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
+        let stop = Arc::new(StopState::default());
 
         let handle = tokio::spawn({
+            let stop = stop.clone();
             let socket = socket;
             let mut msg_rx = msg_rx;
 
@@ -117,7 +121,24 @@ impl RakServer<ConfiguredServer> {
                 update_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
                 loop {
+                    if stop_deadline.is_none()
+                        && let Some(deadline) = stop.deadline()
+                    {
+                        msg_rx.close();
+                        let now = Instant::now().into_std();
+                        for session in sessions.values() {
+                            let _ = session.try_send(SessionEvent::Close(now));
+                        }
+                        stop_deadline = Some(deadline);
+                    }
+                    if let Some(deadline) = stop_deadline
+                        && ((sessions.is_empty() && msg_rx.is_empty())
+                            || Instant::now() >= deadline)
+                    {
+                        break;
+                    }
                     tokio::select! {
+                        _ = stop.wait(), if stop_deadline.is_none() => continue,
                         _ = update_interval.tick() => {
                             let now = Instant::now().into_std();
 
@@ -175,17 +196,6 @@ impl RakServer<ConfiguredServer> {
                                         Err(cause) => { let _ = reply.send(Err(cause.into())); }
                                     }
                                 }
-                                RakServerMsg::Stop => {
-                                    let now = Instant::now().into_std();
-
-                                    for session in sessions.values() {
-                                        let _ = session.try_send(SessionEvent::Close(now));
-                                    }
-
-                                    stop_deadline = Some(
-                                        Instant::now() + constants::CLOSE_TIMEOUT + Duration::from_secs(1),
-                                    );
-                                }
                             }
                         }
                     }
@@ -230,7 +240,7 @@ impl RakServer<ConfiguredServer> {
                                     disconnect_tx.clone(),
                                 );
 
-                                if stop_deadline.is_some() {
+                                if stop_deadline.is_some() || stop.requested() {
                                     let _ =
                                         tx.try_send(SessionEvent::Close(Instant::now().into_std()));
                                     sessions.insert(id, tx);
@@ -247,12 +257,6 @@ impl RakServer<ConfiguredServer> {
                             }
                         }
                     }
-
-                    if let Some(deadline) = stop_deadline
-                        && (sessions.is_empty() || Instant::now() >= deadline)
-                    {
-                        break;
-                    }
                 }
 
                 while let Ok((buf, addr)) = dgram_rx.try_recv() {
@@ -266,6 +270,7 @@ impl RakServer<ConfiguredServer> {
                 handle: Some(handle),
                 session_rx,
                 msg_tx,
+                stop,
             },
         })
     }
@@ -278,35 +283,75 @@ impl RakServer<RunningServer> {
         &self,
     ) -> tokio::sync::oneshot::Receiver<crate::endpoint_command_tests::QueueState> {
         let (send, receive) = tokio::sync::oneshot::channel();
-        let _ = self.state.msg_tx.send(RakServerMsg::InspectCommands(send));
+        let _ = self
+            .state
+            .msg_tx
+            .try_send(RakServerMsg::InspectCommands(send));
         receive
     }
 
-    /// Updates the running endpoint advertisement through its private actor.
-    pub fn set_message<T: Into<Box<[u8]>>>(&mut self, value: T) {
-        let _ = self
-            .state
-            .msg_tx
-            .send(RakServerMsg::SetMessage(value.into()));
+    /// Reserves before converting input, returning the original value on Full or Closed.
+    fn try_command<T>(
+        &self,
+        value: T,
+        command: impl FnOnce(T) -> RakServerMsg,
+    ) -> Result<(), TrySendError<T>> {
+        if self.state.stop.requested() {
+            return Err(TrySendError::Closed(value));
+        }
+        match self.state.msg_tx.try_reserve() {
+            Ok(permit) => {
+                if self.state.stop.requested() {
+                    return Err(TrySendError::Closed(value));
+                }
+                permit.send(command(value));
+                Ok(())
+            }
+            Err(TrySendError::Full(())) => Err(TrySendError::Full(value)),
+            Err(TrySendError::Closed(())) => Err(TrySendError::Closed(value)),
+        }
     }
-    /// Updates the running endpoint's admission limit.
-    pub fn set_max_connections(&mut self, value: usize) {
-        let _ = self
-            .state
-            .msg_tx
-            .send(RakServerMsg::SetMaxConnections(value));
+
+    /// Reserves the original FIFO while retaining the caller's already-restored session clock.
+    async fn command(&self, message: RakServerMsg) -> Result<(), RakServerError> {
+        tokio::select! {
+            _ = self.state.stop.wait() => Err(RakServerError::Closed),
+            permit = self.state.msg_tx.reserve() => {
+                let permit = permit.map_err(|_| RakServerError::Closed)?;
+                if self.state.stop.requested() {
+                    return Err(RakServerError::Closed);
+                }
+                permit.send(message);
+                Ok(())
+            }
+        }
     }
-    /// Drops datagrams from an IP for a caller-selected duration.
-    pub fn block(&mut self, ip: IpAddr, duration: Duration) {
-        let _ = self.state.msg_tx.send(RakServerMsg::Block(ip, duration));
+
+    /// Tries to update the advertisement, retaining unaccepted input on Full or Closed.
+    pub fn set_message<T: Into<Box<[u8]>>>(&mut self, value: T) -> Result<(), TrySendError<T>> {
+        self.try_command(value, |value| RakServerMsg::SetMessage(value.into()))
     }
-    /// Removes the endpoint's explicit IP block.
-    pub fn unblock(&mut self, ip: IpAddr) {
-        let _ = self.state.msg_tx.send(RakServerMsg::Unblock(ip));
+    /// Tries to update future admission without reordering earlier accepted controls.
+    pub fn set_max_connections(&mut self, value: usize) -> Result<(), TrySendError<usize>> {
+        self.try_command(value, RakServerMsg::SetMaxConnections)
+    }
+    /// Tries to enqueue one ordered explicit IP block.
+    pub fn block(
+        &mut self,
+        ip: IpAddr,
+        duration: Duration,
+    ) -> Result<(), TrySendError<(IpAddr, Duration)>> {
+        self.try_command((ip, duration), |(ip, duration)| {
+            RakServerMsg::Block(ip, duration)
+        })
+    }
+    /// Tries to enqueue one ordered removal of an explicit IP block.
+    pub fn unblock(&mut self, ip: IpAddr) -> Result<(), TrySendError<IpAddr>> {
+        self.try_command(ip, RakServerMsg::Unblock)
     }
     /// Consumes the running capability and awaits its graceful stop.
     pub async fn stop(mut self) {
-        let _ = self.state.msg_tx.send(RakServerMsg::Stop);
+        self.state.stop.request();
         if let Some(handle) = self.state.handle.take() {
             let _ = handle.await;
         }
@@ -327,16 +372,12 @@ impl RakServer<RunningServer> {
                 cause,
             });
         }
-        let msg_tx = &self.state.msg_tx;
-
         let session = snapshot
             .restore(Instant::now().into_std(), elapsed)
             .map_err(RakServerError::from)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        msg_tx
-            .send(RakServerMsg::Adopt(session, tx))
-            .map_err(|_| RakServerError::Closed)?;
+        self.command(RakServerMsg::Adopt(session, tx)).await?;
 
         Ok(rx.await.map_err(|_| RakServerError::Closed)??)
     }
@@ -393,3 +434,6 @@ impl ServerStartError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod command_tests;

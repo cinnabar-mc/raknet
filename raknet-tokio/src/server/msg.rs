@@ -11,7 +11,6 @@ pub enum RakServerMsg {
     SetMaxConnections(usize),
     Block(IpAddr, Duration),
     Unblock(IpAddr),
-    Stop,
     Adopt(
         CoreRestoredSession,
         oneshot::Sender<Result<RestoredSession, super::error::RakServerError>>,

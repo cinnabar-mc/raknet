@@ -31,7 +31,7 @@ async fn running_endpoint_command_admission_is_bounded_before_actor_progress() {
             let server_front = server.command_queue_probe();
             let client_front = client.command_queue_probe();
             for limit in 0..=constants::MAX_RECEIVE_MESSAGES {
-                server.set_max_connections(limit);
+                let _ = server.set_max_connections(limit);
             }
             let mut pings: Vec<_> = (0..=constants::MAX_RECEIVE_MESSAGES)
                 .map(|_| Box::pin(client.ping(silent_address)))
@@ -64,7 +64,9 @@ async fn running_endpoint_command_admission_is_bounded_before_actor_progress() {
                 .map_err(|_| "original client drain fence closed".to_owned())?;
 
             let marker = Box::<[u8]>::from(&b"healthy original endpoint after command drain"[..]);
-            server.set_message(marker.clone());
+            server
+                .set_message(marker.clone())
+                .map_err(|_| "fresh advertisement was not admitted".to_owned())?;
             server
                 .command_queue_probe()
                 .await
