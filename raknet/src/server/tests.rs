@@ -949,3 +949,202 @@ fn connection_request_accepted_carries_ten_system_addresses_of_the_client_family
         assert_eq!(accepted.request_timestamp, 2);
     }
 }
+
+/// Observes routing from genuinely established sessions without inspecting private limiter state.
+fn routed_session_ids(server: &mut ServerEngine) -> Vec<RakSessionId> {
+    drain(server)
+        .into_iter()
+        .filter_map(|output| match output {
+            ServerOutput::SessionDatagram(_, id) => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Individually legal connections behind one NAT must not spend each other's online allowance.
+#[test]
+fn same_ip_sessions_keep_independent_online_admission() {
+    let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+    let now = crate::clock::test_now();
+    let mut server = ServerEngine::new(
+        RakServerConfig::default(),
+        server_addr,
+        crate::clock::RakClock::new(now),
+        now,
+    );
+    let clients: [SocketAddr; 2] = [
+        "127.0.0.1:1".parse().unwrap(),
+        "127.0.0.1:2".parse().unwrap(),
+    ];
+    let sessions = connect_all(&mut server, server_addr, &clients, now);
+    assert_eq!(
+        sessions.len(),
+        clients.len(),
+        "both original handshakes must complete"
+    );
+    let ids = clients.map(|addr| {
+        sessions
+            .iter()
+            .find(|session| session.addr == addr)
+            .unwrap()
+            .id
+    });
+    drain(&mut server);
+    let per_client = usize::try_from(server.config.online_packet_limit).unwrap() / 2 + 1;
+    let now = now + Duration::from_secs(1);
+    for _ in 0..per_client {
+        for addr in clients {
+            server
+                .handle(RakServerInput::Datagram(online_datagram(), addr, now))
+                .unwrap();
+        }
+    }
+    let expected: Vec<_> = (0..per_client).flat_map(|_| ids).collect();
+    assert_eq!(
+        routed_session_ids(&mut server),
+        expected,
+        "same-IP sessions must retain independent online allowance and routing order"
+    );
+}
+
+/// A sender exceeding its online allowance cannot silence an established peer on another port.
+#[test]
+fn an_online_flood_does_not_automatically_block_a_same_ip_bystander() {
+    let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+    let now = crate::clock::test_now();
+    let mut server = ServerEngine::new(
+        RakServerConfig::default(),
+        server_addr,
+        crate::clock::RakClock::new(now),
+        now,
+    );
+    let clients: [SocketAddr; 2] = [
+        "127.0.0.1:1".parse().unwrap(),
+        "127.0.0.1:2".parse().unwrap(),
+    ];
+    let sessions = connect_all(&mut server, server_addr, &clients, now);
+    assert_eq!(
+        sessions.len(),
+        clients.len(),
+        "both original handshakes must complete"
+    );
+    let ids = clients.map(|addr| {
+        sessions
+            .iter()
+            .find(|session| session.addr == addr)
+            .unwrap()
+            .id
+    });
+    drain(&mut server);
+    let limit = usize::try_from(server.config.online_packet_limit).unwrap();
+    let now = now + Duration::from_secs(1);
+    for _ in 0..limit * 2 {
+        server
+            .handle(RakServerInput::Datagram(online_datagram(), clients[0], now))
+            .unwrap();
+    }
+    assert_eq!(
+        routed_session_ids(&mut server),
+        vec![ids[0]; limit],
+        "the original online allowance still protects the endpoint"
+    );
+    let later = now + Duration::from_secs(1);
+    for addr in clients {
+        server
+            .handle(RakServerInput::Datagram(online_datagram(), addr, later))
+            .unwrap();
+    }
+    assert_eq!(
+        routed_session_ids(&mut server),
+        [ids[1]],
+        "only the over-limit source port may be automatically blocked"
+    );
+}
+
+/// Explicit IP blocks keep their original scope across both ports and both packet classes.
+#[test]
+fn explicit_ip_blocks_still_cover_both_same_nat_sessions_and_offline_requests() {
+    let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+    let now = crate::clock::test_now();
+    let mut server = ServerEngine::new(
+        RakServerConfig::default(),
+        server_addr,
+        crate::clock::RakClock::new(now),
+        now,
+    );
+    let clients: [SocketAddr; 2] = [
+        "127.0.0.1:1".parse().unwrap(),
+        "127.0.0.1:2".parse().unwrap(),
+    ];
+    let sessions = connect_all(&mut server, server_addr, &clients, now);
+    assert_eq!(
+        sessions.len(),
+        clients.len(),
+        "both original handshakes must complete"
+    );
+    let ids = clients.map(|addr| {
+        sessions
+            .iter()
+            .find(|session| session.addr == addr)
+            .unwrap()
+            .id
+    });
+    drain(&mut server);
+    let ping = UnconnectedPing {
+        timestamp: 0,
+        client: 1,
+    }
+    .serialized()
+    .unwrap();
+    server
+        .handle(RakServerInput::Block(
+            clients[0].ip(),
+            Duration::from_secs(60),
+            now,
+        ))
+        .unwrap();
+    for addr in clients {
+        server
+            .handle(RakServerInput::Datagram(online_datagram(), addr, now))
+            .unwrap();
+        server
+            .handle(RakServerInput::Datagram(ping.clone(), addr, now))
+            .unwrap();
+    }
+    assert!(
+        drain(&mut server).is_empty(),
+        "the explicit IP block covers every source port"
+    );
+    server
+        .handle(RakServerInput::Unblock(clients[0].ip()))
+        .unwrap();
+    for addr in clients {
+        server
+            .handle(RakServerInput::Datagram(online_datagram(), addr, now))
+            .unwrap();
+        server
+            .handle(RakServerInput::Datagram(ping.clone(), addr, now))
+            .unwrap();
+    }
+    let output = drain(&mut server);
+    let routed: Vec<_> = output
+        .iter()
+        .filter_map(|output| match output {
+            ServerOutput::SessionDatagram(_, id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let pongs: Vec<_> = output
+        .iter()
+        .filter_map(|output| match output {
+            ServerOutput::SocketDatagram(bytes, addr)
+                if bytes.first() == Some(&packet_id::UNCONNECTED_PONG) =>
+            {
+                Some(*addr)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(routed, ids);
+    assert_eq!(pongs, clients);
+}
