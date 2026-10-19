@@ -1,16 +1,21 @@
 //! Typed application handles backed by one private session actor.
 
+mod admission;
 mod command;
 mod driver;
 
+use admission::{ActorAdmission, Admission};
 use command::RakSessionMsg;
 use driver::Driver;
 use raknet::prelude::*;
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
+#[cfg(test)]
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep};
 use tracing::debug;
@@ -31,12 +36,15 @@ pub(crate) enum SessionEvent {
 /// }
 /// ```
 pub struct RakSession<S: SessionPhase> {
-    msg_tx: UnboundedSender<RakSessionMsg>,
+    msg_tx: Sender<RakSessionMsg>,
+    admission: Arc<Admission>,
     buf_rx: Receiver<Box<[u8]>>,
     terminal_rx: oneshot::Receiver<ClosedSession>,
     close_ack: Option<oneshot::Receiver<Result<(), RakSessionError>>>,
     addr: SocketAddr,
     max_message_len: usize,
+    #[cfg(test)]
+    actor: Option<tokio::task::JoinHandle<()>>,
     phase: PhantomData<S>,
 }
 
@@ -95,41 +103,66 @@ fn spawn<S: SessionPhase>(
     datagram_tx: UnboundedSender<(Box<[u8]>, SocketAddr)>,
     disconnect_tx: UnboundedSender<RakSessionId>,
 ) -> (RakSession<S>, Sender<SessionEvent>) {
-    let (msg_tx, mut msg_rx) = unbounded_channel();
+    let admission = Admission::new(
+        driver.config().max_outbound_bytes,
+        driver.config().close_timeout,
+        driver.state() == RakSessionState::Connected,
+    );
+    let actor_admission = ActorAdmission(Arc::clone(&admission));
+    let (msg_tx, mut msg_rx) = channel(SESSION_QUEUE_CAPACITY);
     let (buf_tx, buf_rx) = channel(SESSION_QUEUE_CAPACITY);
     let (tx, mut rx) = channel(SESSION_QUEUE_CAPACITY);
     let (terminal_tx, terminal_rx) = oneshot::channel();
-    tokio::spawn(async move {
+    let _actor = tokio::spawn(async move {
+        let admission_owner = actor_admission;
+        let admission = &admission_owner.0;
         let timer = sleep(std::time::Duration::ZERO);
         tokio::pin!(timer);
         loop {
             tokio::select! {
-                Some(message) = msg_rx.recv() => match message {
-                    RakSessionMsg::Send(bytes, reliability, priority, reply) => {
-                        let _ = reply.send(driver.send(bytes, reliability, priority, Instant::now().into_std()));
+                biased;
+                close = admission.close_ready() => {
+                    let result = driver.close(close.started.into_std(), false);
+                    // Age the same close immediately; FIFO draining never rebases its cutoff.
+                    let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std()));
+                    let _ = close.reply.send(result);
+                }
+                _ = async {
+                    tokio::select! {
+                        Some(message) = msg_rx.recv() => match message {
+                            RakSessionMsg::Send(bytes, reliability, priority, reply, credit) => {
+                                let result = driver.send(bytes, reliability, priority, Instant::now().into_std());
+                                drop(credit);
+                                let _ = reply.send(result);
+                            }
+                            RakSessionMsg::IsClosed(reply) => {
+                                let _ = reply.send(driver.state() != RakSessionState::Connected);
+                            }
+                            RakSessionMsg::Snapshot(reply) => {
+                                let result = if buf_tx.capacity() != buf_tx.max_capacity() {
+                                    Err(RakSessionCaptureError::PendingOutput)
+                                } else {
+                                    driver.snapshot(Instant::now().into_std())
+                                };
+                                let _ = reply.send(result);
+                            }
+                            #[cfg(test)]
+                            RakSessionMsg::InspectCommands(reply) => {
+                                let _ = reply.send(msg_rx.len());
+                            }
+                        },
+                        event = rx.recv() => match event {
+                            Some(SessionEvent::Io(input)) => { let _ = driver.handle(input); }
+                            Some(SessionEvent::Close(now)) => { let _ = driver.close(now, false); }
+                            None => { let _ = driver.close(Instant::now().into_std(), true); }
+                        },
+                        _ = buf_tx.closed() => { let _ = driver.close(Instant::now().into_std(), true); }
+                        _ = &mut timer => { let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std())); }
                     }
-                    RakSessionMsg::Close(reply) => {
-                        let _ = reply.send(driver.close(Instant::now().into_std(), false));
-                    }
-                    RakSessionMsg::IsClosed(reply) => {
-                        let _ = reply.send(driver.state() != RakSessionState::Connected);
-                    }
-                    RakSessionMsg::Snapshot(reply) => {
-                        let result = if buf_tx.capacity() != buf_tx.max_capacity() {
-                            Err(RakSessionCaptureError::PendingOutput)
-                        } else {
-                            driver.snapshot(Instant::now().into_std())
-                        };
-                        let _ = reply.send(result);
-                    }
-                },
-                event = rx.recv() => match event {
-                    Some(SessionEvent::Io(input)) => { let _ = driver.handle(input); }
-                    Some(SessionEvent::Close(now)) => { let _ = driver.close(now, false); }
-                    None => { let _ = driver.close(Instant::now().into_std(), true); }
-                },
-                _ = buf_tx.closed() => { let _ = driver.close(Instant::now().into_std(), true); }
-                _ = &mut timer => { let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std())); }
+                } => {},
+            }
+            if driver.state() != RakSessionState::Connected {
+                admission.seal();
             }
             while let Some(output) = driver.poll() {
                 match output {
@@ -160,11 +193,14 @@ fn spawn<S: SessionPhase>(
     (
         RakSession {
             msg_tx,
+            admission,
             buf_rx,
             terminal_rx,
             close_ack: None,
             addr,
             max_message_len,
+            #[cfg(test)]
+            actor: Some(_actor),
             phase: PhantomData,
         },
         tx,
@@ -190,7 +226,7 @@ impl<S: SessionPhase> RakSession<S> {
     /// Observes the actor's current network state.
     pub async fn is_closed(&self) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.msg_tx.send(RakSessionMsg::IsClosed(tx));
+        let _ = self.msg_tx.send(RakSessionMsg::IsClosed(tx)).await;
         rx.await.unwrap_or(true)
     }
     /// Returns the negotiated peer address.
@@ -209,6 +245,7 @@ impl<S: SessionPhase> RakSession<S> {
         let (tx, rx) = oneshot::channel();
         self.msg_tx
             .send(RakSessionMsg::Snapshot(tx))
+            .await
             .map_err(|_| SnapshotError::Session(RakSessionError::Closed))?;
         Ok(rx
             .await
@@ -227,7 +264,12 @@ impl<S: SessionPhase> RakSession<S> {
 }
 
 impl RakSession<Established> {
-    /// Admits one message; cancellation after admission does not undo the send.
+    /// Admits one message under the original command-count and outbound-byte budgets.
+    ///
+    /// Waiting retains the body in this caller's future. Cancellation before queue
+    /// commitment releases its reservations; cancellation afterwards does not undo it.
+    /// A body exceeding the negotiated limit or the entire queue byte budget returns
+    /// `MessageSizeExceeded` without entering the queue.
     pub async fn send<T>(
         &self,
         bytes: T,
@@ -237,10 +279,25 @@ impl RakSession<Established> {
     where
         T: Into<Box<[u8]>>,
     {
+        let bytes = bytes.into();
+        let mut credit = self
+            .admission
+            .reserve(bytes.len(), self.max_message_len)
+            .await?;
+        let permit = tokio::select! {
+            biased;
+            _ = self.admission.closed() => return Err(RakSessionError::Closed),
+            permit = self.msg_tx.reserve() => permit.map_err(|_| RakSessionError::Closed)?,
+        };
         let (tx, rx) = oneshot::channel();
-        self.msg_tx
-            .send(RakSessionMsg::Send(bytes.into(), reliability, priority, tx))
-            .map_err(|_| RakSessionError::Closed)?;
+        credit.commit()?;
+        permit.send(RakSessionMsg::Send(
+            bytes,
+            reliability,
+            priority,
+            tx,
+            credit,
+        ));
         rx.await.map_err(|_| RakSessionError::Closed)?
     }
     /// Synchronously consumes send permission before any cancellable close wait.
@@ -248,18 +305,21 @@ impl RakSession<Established> {
         let (tx, rx) = oneshot::channel();
         let closing = RakSession {
             msg_tx: self.msg_tx,
+            admission: self.admission,
             buf_rx: self.buf_rx,
             terminal_rx: self.terminal_rx,
             close_ack: Some(rx),
             addr: self.addr,
             max_message_len: self.max_message_len,
+            #[cfg(test)]
+            actor: self.actor,
             phase: PhantomData,
         };
-        match closing.msg_tx.send(RakSessionMsg::Close(tx)) {
+        match closing.admission.request_close(tx) {
             Ok(()) => Ok(closing),
-            Err(_) => Err(SessionCloseError {
+            Err(cause) => Err(SessionCloseError {
                 session: closing,
-                cause: RakSessionError::Closed,
+                cause,
             }),
         }
     }
@@ -300,3 +360,9 @@ pub enum RestoredSession {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod command_byte_tests;
+
+#[cfg(test)]
+mod admission_tests;

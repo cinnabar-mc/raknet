@@ -25,6 +25,17 @@ impl Driver {
             phase: Some(Phase::Closing(session)),
         }
     }
+    /// Borrows the same validated session policy before starting the actor.
+    pub(super) fn config(&self) -> &RakSessionConfig {
+        match self
+            .phase
+            .as_ref()
+            .expect("the actor owns its session phase")
+        {
+            Phase::Established(session) => session.config(),
+            Phase::Closing(session) => session.config(),
+        }
+    }
     /// Applies protocol I/O in either live phase.
     pub(super) fn handle(&mut self, input: RakSessionInput) -> Result<(), RakSessionError> {
         match self.phase.as_mut().ok_or(RakSessionError::Closed)? {

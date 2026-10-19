@@ -133,9 +133,16 @@ outputs as well as the return value of `handle`.
 Drain application packets promptly and bound your own queues. Protocol retention
 limits do not bound every adapter or application queue. The Tokio adapter bounds
 session input and received-message channels and closes an overloaded session.
-Its endpoint command FIFOs retain at most `MAX_RECEIVE_MESSAGES` requests;
-session-command, accepted-session and datagram channels still need separate
-bounds. A command-count limit is not an aggregate byte or RSS limit.
+Its endpoint and session command FIFOs retain at most `MAX_RECEIVE_MESSAGES`
+requests each. Session send commands also reserve their actual body bytes from
+that session's `max_outbound_bytes` before commitment. Waiting bodies remain
+caller-owned; canceling before commitment returns the reservations, while
+canceling an admitted reply wait does not retract its send. A body larger than
+that entire byte budget returns `MessageSizeExceeded` before commitment, even
+when the negotiated message limit is larger. Close bypasses a full command FIFO,
+seals new sends, and retains earlier committed work under the first close cutoff.
+Accepted-session and datagram channels still need separate bounds. These are
+per-stage storage bounds, not an aggregate byte or RSS limit.
 
 Running Tokio server setters return `Result` with `TrySendError::Full(input)` or
 `Closed(input)` when the original FIFO cannot admit a control. Rejected
