@@ -89,6 +89,17 @@ struct PendingPing {
     sender: oneshot::Sender<PingResult>,
 }
 
+/// Reclaims canceled discovery metadata and derives the count from its sole owning map.
+fn reap_pings(pings: &mut HashMap<SocketAddr, Vec<PendingPing>>) -> usize {
+    let mut retained = 0_usize;
+    pings.retain(|_, queue| {
+        queue.retain(|ping| !ping.sender.is_closed());
+        retained = retained.saturating_add(queue.len());
+        !queue.is_empty()
+    });
+    retained
+}
+
 /// Builds ping input and reply metadata, or reports generation failure to the caller.
 fn prepare_ping(
     guid: std::io::Result<ClientGuid>,
@@ -233,11 +244,13 @@ impl RakClient<ConfiguredClient> {
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
-                                    if let Some((guid, ping)) = prepare_ping(ClientGuid::generate(), addr, now, clock, sender) {
+                                    if reap_pings(&mut pings) >= constants::MAX_RECEIVE_MESSAGES {
+                                        let _ = sender.send(Err(RakClientError::PendingPingCapacityExceeded));
+                                    } else if let Some((guid, ping)) = prepare_ping(ClientGuid::generate(), addr, now, clock, sender) {
                                         let _ = client.ping(addr, guid, now);
-                                        let queue = pings.entry(addr).or_default();
-                                        queue.retain(|ping| !ping.sender.is_closed());
-                                        queue.push(ping);
+                                        if !ping.sender.is_closed() {
+                                            pings.entry(addr).or_default().push(ping);
+                                        }
                                     }
                                 }
                                 #[cfg(test)]
@@ -290,6 +303,7 @@ impl RakClient<ConfiguredClient> {
                             }
                         }
                         _ = &mut timer => {
+                            reap_pings(&mut pings);
                             let result = client.handle(RakClientInput::Update(Instant::now().into_std()));
                             fail_pending_connect(&mut client, &mut connect, result);
                         }
@@ -385,6 +399,9 @@ impl RakClient<ConfiguredClient> {
                                         let ping = queue.remove(index);
                                         let _ = ping.sender.send(Ok((message, latency)));
                                     }
+                                    if queue.is_empty() {
+                                        pings.remove(&addr);
+                                    }
                                 }
                             }
                         }
@@ -421,6 +438,11 @@ impl RakClient<RunningClient> {
         }
     }
 
+    /// Awaits an original discovery reply under the existing finite timeout.
+    ///
+    /// At most `constants::MAX_RECEIVE_MESSAGES` reply records are retained by the endpoint.
+    /// Excess requests fail with `PendingPingCapacityExceeded` before a wire request is issued.
+    /// Canceling an admitted wait does not retract an already queued wire request.
     pub async fn ping(&self, addr: SocketAddr) -> Result<(Box<[u8]>, Duration), RakClientError> {
         let msg_tx = &self.state.msg_tx;
 
