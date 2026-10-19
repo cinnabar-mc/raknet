@@ -17,4 +17,6 @@ pub enum RakDisconnectReason {
     Remote,
     ProtocolViolation,
     OutboundBytesExceeded,
+    /// A local adapter could not retain the next complete application message.
+    ReceiveBufferExceeded,
 }

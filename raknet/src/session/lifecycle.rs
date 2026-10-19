@@ -123,6 +123,11 @@ impl<S: SessionPhase> RakSession<S> {
         self.engine.max_message_len()
     }
 
+    /// Borrows the original immutable session policy for a caller-owned delivery edge.
+    pub fn config(&self) -> &super::config::RakSessionConfig {
+        &self.engine.config
+    }
+
     /// Explicitly flushes protocol work when the caller owns the flush cadence.
     pub fn tick(&mut self, now: Instant) -> Result<(), RakSessionError> {
         self.engine.tick(now)

@@ -1,5 +1,6 @@
 pub mod client;
 mod configuration;
+mod delivery;
 pub mod server;
 mod session;
 
