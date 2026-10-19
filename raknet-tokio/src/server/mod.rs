@@ -170,6 +170,10 @@ impl RakServer<ConfiguredServer> {
                                         address: socket.local_addr().ok(),
                                     });
                                 }
+                                #[cfg(test)]
+                                RakServerMsg::InspectRoutes(reply) => {
+                                    let _ = reply.send(sessions.len());
+                                }
                                 RakServerMsg::SetMessage(msg) => {
                                     let _ = server.handle(RakServerInput::SetMessage(msg));
                                 },
@@ -277,6 +281,23 @@ impl RakServer<ConfiguredServer> {
 }
 
 impl RakServer<RunningServer> {
+    /// Reads the actual route map after earlier endpoint work without modifying it.
+    #[cfg(test)]
+    pub(crate) fn route_count_probe(&self) -> tokio::sync::oneshot::Receiver<usize> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let _ = self
+            .state
+            .msg_tx
+            .try_send(RakServerMsg::InspectRoutes(send));
+        receive
+    }
+
+    /// Reads the original accepted FIFO without taking or acknowledging a handle.
+    #[cfg(test)]
+    pub(crate) fn unaccepted_count(&self) -> usize {
+        self.state.session_rx.len()
+    }
+
     /// Reads only the original queue at this probe's FIFO position and the same bound socket.
     #[cfg(test)]
     pub(crate) fn command_queue_probe(

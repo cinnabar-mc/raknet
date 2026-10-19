@@ -366,3 +366,6 @@ mod command_byte_tests;
 
 #[cfg(test)]
 mod admission_tests;
+
+#[cfg(test)]
+mod accepted_lifetime_tests;
