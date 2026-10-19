@@ -1,16 +1,17 @@
+use super::admission::SendCredit;
 use raknet::prelude::{
     RakPriority, RakReliability, RakSessionCaptureError, RakSessionError, RakSessionSnapshot,
 };
 use tokio::sync::oneshot::Sender;
 
-pub enum RakSessionMsg {
+pub(super) enum RakSessionMsg {
     Send(
         Box<[u8]>,
         RakReliability,
         RakPriority,
         Sender<Result<(), RakSessionError>>,
+        SendCredit,
     ),
-    Close(Sender<Result<(), RakSessionError>>),
     IsClosed(Sender<bool>),
     /// Capture the session's protocol state, leaving the live task running.
     Snapshot(Sender<Result<RakSessionSnapshot, RakSessionCaptureError>>),

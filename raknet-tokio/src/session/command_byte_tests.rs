@@ -112,7 +112,7 @@ async fn established_session_commands_bound_actual_queued_payload_before_actor_p
         let (send, receive) = oneshot::channel();
         sessions[0]
             .msg_tx
-            .send(RakSessionMsg::InspectCommands(send))
+            .try_send(RakSessionMsg::InspectCommands(send))
             .map_err(|_| "original established command owner closed".to_owned())?;
         let mut commands: Vec<_> = (0..=constants::MAX_RECEIVE_MESSAGES)
             .map(|_| {
