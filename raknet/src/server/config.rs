@@ -20,6 +20,8 @@ pub struct RakServerConfig {
 
     pub packet_limit: i32,
     pub total_packet_limit: i32,
+    /// Online datagrams per admitted source address in each fixed online rate window.
+    /// Exceeding it blocks that source socket; explicit Block/Unblock remains IP-wide.
     pub online_packet_limit: i32,
 
     pub block_duration: Duration,

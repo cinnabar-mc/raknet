@@ -64,8 +64,9 @@ pub(crate) struct ServerEngine {
     offline_per_ip: HashMap<IpAddr, i32>,
 
     online_window: Instant,
-    online_per_ip: HashMap<IpAddr, i32>,
+    online_per_addr: HashMap<SocketAddr, i32>,
     blocked: HashMap<IpAddr, Instant>,
+    blocked_addrs: HashMap<SocketAddr, Instant>,
 
     cookie_key: RandomState,
     cookie_salts: [u64; 2],
@@ -86,7 +87,7 @@ impl Sans for ServerEngine {
                     return Ok(());
                 };
 
-                if self.blocked(addr.ip(), now) {
+                if self.blocked(addr.ip(), now) || self.blocked_addr(addr, now) {
                     return Ok(());
                 }
 
@@ -111,6 +112,7 @@ impl Sans for ServerEngine {
                 if let Some(addr) = self.session_addr.remove(&id) {
                     self.session_map.remove(&addr);
                     self.session_pending.remove(&addr);
+                    self.online_per_addr.remove(&addr);
                     self.recently_disconnected.insert(addr, now);
                 }
 
@@ -122,6 +124,12 @@ impl Sans for ServerEngine {
             RakServerInput::Update(now) => {
                 self.rotate_cookie_salt(now);
                 self.blocked.retain(|_, until| now < *until);
+                self.blocked_addrs.retain(|_, until| now < *until);
+                if now.saturating_duration_since(self.online_window)
+                    >= constants::ONLINE_RATE_LIMIT_WINDOW
+                {
+                    self.online_per_addr.clear();
+                }
                 self.evict_stale_temp_sessions(now);
                 self.tick_temp_sessions(now)?;
             }
@@ -152,8 +160,9 @@ impl ServerEngine {
             offline_total: 0,
             offline_per_ip: HashMap::new(),
             online_window: now,
-            online_per_ip: HashMap::new(),
+            online_per_addr: HashMap::new(),
             blocked: HashMap::new(),
+            blocked_addrs: HashMap::new(),
 
             cookie_key: RandomState::new(),
             cookie_salts: [random(), random()],
@@ -219,6 +228,7 @@ impl ServerEngine {
 
     fn forget(&mut self, addr: SocketAddr) {
         self.session_pending.remove(&addr);
+        self.online_per_addr.remove(&addr);
         if let Some(id) = self.session_map.remove(&addr) {
             self.session_addr.remove(&id);
         }
@@ -245,16 +255,36 @@ impl ServerEngine {
         *count > self.config.packet_limit
     }
 
-    fn online_rate_limited(&mut self, ip: IpAddr, now: Instant) -> bool {
+    /// Restarts the packet-driven window without resetting any peer's automatic cooldown.
+    fn reset_online_window(&mut self, now: Instant) {
         if now.saturating_duration_since(self.online_window) >= constants::ONLINE_RATE_LIMIT_WINDOW
         {
             self.online_window = now;
-            self.online_per_ip.clear();
+            self.online_per_addr.clear();
         }
+    }
 
-        let count = self.online_per_ip.entry(ip.to_canonical()).or_insert(0);
+    /// Accounts only the exact admitted route, leaving other clients behind its IP independent.
+    fn online_rate_limited(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        self.reset_online_window(now);
+        let count = self.online_per_addr.entry(addr).or_insert(0);
+        if *count >= self.config.online_packet_limit {
+            return true;
+        }
         *count += 1;
-        *count > self.config.online_packet_limit
+        false
+    }
+
+    /// Retains an admitted source's cooldown independently of explicit canonical-IP blocks.
+    fn blocked_addr(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        match self.blocked_addrs.get(&addr) {
+            Some(&until) if now < until => true,
+            Some(_) => {
+                self.blocked_addrs.remove(&addr);
+                false
+            }
+            None => false,
+        }
     }
 
     fn blocked(&mut self, ip: IpAddr, now: Instant) -> bool {
@@ -348,13 +378,14 @@ impl ServerEngine {
         addr: SocketAddr,
         now: Instant,
     ) -> Result<(), RakServerError> {
-        if self.online_rate_limited(addr.ip(), now) {
-            debug!(
-                "blocking {} for exceeding the online packet limit",
-                addr.ip()
-            );
-            self.blocked
-                .insert(addr.ip().to_canonical(), now + self.config.block_duration);
+        // Unknown online tuples have no routing authority and must not allocate per-port state.
+        if !self.session_map.contains_key(&addr) && !self.session_pending.contains_key(&addr) {
+            return Ok(());
+        }
+        if self.online_rate_limited(addr, now) {
+            debug!("blocking {} for exceeding the online packet limit", addr);
+            self.blocked_addrs
+                .insert(addr, now + self.config.block_duration);
             return Ok(());
         }
 
