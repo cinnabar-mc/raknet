@@ -133,8 +133,14 @@ outputs as well as the return value of `handle`.
 Drain application packets promptly and bound your own queues. Protocol retention
 limits do not bound every adapter or application queue. The Tokio adapter bounds
 session input and received-message channels and closes an overloaded session;
-its command and datagram channels are unbounded. The Bevy adapter's received
-message queues must be drained by application systems.
+its command and datagram channels are unbounded.
+
+Bevy's original final receive queues retain at most `MAX_RECEIVE_MESSAGES` per
+session and that session's `max_queued_bytes` of complete bodies. The first
+rejected body retires that peer with `ReceiveBufferExceeded`; its accepted
+prefix remains readable, and later bodies cannot cross the rejected gap after
+capacity is released. Existing protocol failures retain their original reason.
+These are local storage bounds, not remote-delivery receipts or an RSS limit.
 
 ## Bevy integration
 
@@ -154,6 +160,17 @@ capability. Application sends require an exclusive established capability from
 returns a closing capability without `send`; continue plugin updates until the
 disconnected event arrives. Neither resource exposes unrestricted application
 sends or mutable protocol state.
+
+Keep draining both `recv` and lifecycle events after disconnection. A client
+cannot start another connection while its original data or notifications remain
+unread. A server retains that admission slot until both drain, including when
+`max_connections` is lowered; zero refuses new admissions. Closing removes live
+send permission without discarding the final receive prefix.
+
+Discovery pongs have the same count and configured byte bounds. Excess replies
+are counted and discarded without retiring a game peer. Public `ping` drains
+its original nonblocking outgoing discovery work immediately, so calls before a
+frame cannot build a separate retained queue.
 
 The current Bevy client resource owns one IPv4 socket and one connection. For
 many clients, explicit IPv6 policy or stricter I/O backpressure, use the core

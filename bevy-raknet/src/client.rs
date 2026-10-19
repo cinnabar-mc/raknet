@@ -1,4 +1,5 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
+use crate::delivery::ReceiveBudget;
 use crate::session::SessionSlot;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -10,6 +11,9 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+#[cfg(test)]
+mod bounded_delivery_tests;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 
@@ -53,8 +57,11 @@ pub struct RakClient {
     intl: Driver,
     socket: UdpSocket,
     session: Option<SessionSlot>,
+    delivery: Option<ReceiveBudget>,
     received: VecDeque<Box<[u8]>>,
     pongs: VecDeque<(SocketAddr, Box<[u8]>, Duration)>,
+    pong_budget: ReceiveBudget,
+    dropped_pongs: u64,
     events: VecDeque<RakClientEvent>,
     buffer: Box<[u8]>,
 }
@@ -90,17 +97,21 @@ impl RakClient {
             buffer: vec![0; config.max_mtu_size as usize].into_boxed_slice(),
             socket,
             session: None,
+            delivery: None,
             received: VecDeque::new(),
             pongs: VecDeque::new(),
+            pong_budget: ReceiveBudget::new(config.session.max_queued_bytes),
+            dropped_pongs: 0,
             events: VecDeque::new(),
             intl: Driver::new(config, RakClock::new(Instant::now()))
                 .expect("the same pure client configuration was validated before binding"),
         })
     }
 
-    /// Borrows the actual idle endpoint's one connection-start capability.
+    /// Borrows connection-start permission after the preceding data and events have drained.
     pub fn idle(&mut self) -> Option<RakClientIdle<'_>> {
-        (self.session.is_none() && self.intl.is_idle()).then_some(RakClientIdle { client: self })
+        (self.delivery.is_none() && self.session.is_none() && self.intl.is_idle())
+            .then_some(RakClientIdle { client: self })
     }
 
     /// Borrows application-send permission only from an established slot.
@@ -144,6 +155,8 @@ impl RakClient {
             }
         };
         let _ = self.intl.ping(addr, guid, Instant::now());
+        // Discovery is best effort, but repeated calls before a frame cannot retain its output.
+        self.drain_endpoint(Instant::now());
     }
 
     /// Observes network establishment without granting a session capability.
@@ -172,42 +185,72 @@ impl RakClient {
             return Err(RakSessionError::Closed);
         };
 
-        session.send(buf.into(), reliability, priority, Instant::now())?;
-
-        if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
-            self.session = None;
-            self.intl.reset();
-            self.events
-                .push_back(RakClientEvent::Disconnected { reason });
-        }
+        let now = Instant::now();
+        session.send(buf.into(), reliability, priority, now)?;
+        self.drain_current(now);
 
         Ok(())
     }
 
+    /// Takes the oldest accepted body, releasing its original delivery charge even after close.
     pub fn recv(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop_front()
+        let bytes = self.received.pop_front()?;
+        self.delivery
+            .as_mut()
+            .expect("the original body retains its delivery owner")
+            .release(bytes.len());
+        self.reap_delivery();
+        Some(bytes)
     }
 
+    /// Takes a bounded discovery reply and releases its count and byte charge.
     pub fn recv_pong(&mut self) -> Option<(SocketAddr, Box<[u8]>, Duration)> {
-        self.pongs.pop_front()
+        let pong = self.pongs.pop_front()?;
+        self.pong_budget.release(pong.1.len());
+        Some(pong)
     }
 
     /// Consumes the owned core phase before any output is drained.
     fn begin_close(&mut self) -> Result<(), RakSessionError> {
         let session = self.session.take().ok_or(RakSessionError::Closed)?;
-        let (mut session, result) = session.close(Instant::now(), false);
-        if let Some(reason) = drain_session(&mut session, &self.socket, &mut self.received) {
-            self.intl.reset();
-            self.events
-                .push_back(RakClientEvent::Disconnected { reason });
-        } else {
-            self.session = Some(session);
-        }
+        let now = Instant::now();
+        let (session, result) = session.close(now, false);
+        self.session = Some(session);
+        self.drain_current(now);
         result
     }
 
+    /// Takes a lifecycle notification; unread notifications retain the preceding allocation.
     pub fn next_event(&mut self) -> Option<RakClientEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.reap_delivery();
+        Some(event)
+    }
+
+    /// Releases the one lifecycle reservation only after its original data and notifications drain.
+    fn reap_delivery(&mut self) {
+        if self.session.is_none() && self.received.is_empty() && self.events.is_empty() {
+            self.delivery = None;
+        }
+    }
+
+    /// Retires only the current typed slot, retaining the accepted final FIFO and its terminal.
+    fn drain_current(&mut self, now: Instant) {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return;
+        };
+        if let Some(reason) = drain_session(
+            &mut self.session,
+            &self.socket,
+            &mut self.received,
+            delivery,
+            now,
+        ) {
+            self.session = None;
+            self.intl.reset();
+            self.events
+                .push_back(RakClientEvent::Disconnected { reason });
+        }
     }
 
     pub fn update(&mut self) {
@@ -233,6 +276,16 @@ impl RakClient {
             debug!("client failed to handle update: {e}");
         }
 
+        self.drain_endpoint(now);
+
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.handle(RakSessionInput::Update(now));
+            self.drain_current(now);
+        }
+    }
+
+    /// Drains the original endpoint output immediately without staging another discovery queue.
+    fn drain_endpoint(&mut self, now: Instant) {
         while let Some(output) = self.intl.poll() {
             match output {
                 RakClientOutput::MtuProbe { id, datagram, peer } => {
@@ -260,11 +313,15 @@ impl RakClient {
                 RakClientOutput::SessionConnected(session) => {
                     debug!("session connected");
 
-                    self.session = Some(SessionSlot::Established(session));
+                    let session = SessionSlot::Established(session);
+                    self.delivery = Some(session.receive_budget());
+                    self.session = Some(session);
                     self.events.push_back(RakClientEvent::Connected);
                 }
                 RakClientOutput::SessionClosing(session) => {
-                    self.session = Some(SessionSlot::Closing(session));
+                    let session = SessionSlot::Closing(session);
+                    self.delivery = Some(session.receive_budget());
+                    self.session = Some(session);
                 }
                 RakClientOutput::Wait(_) => {}
                 RakClientOutput::Pong {
@@ -272,18 +329,17 @@ impl RakClient {
                     message,
                     latency,
                     ..
-                } => self.pongs.push_back((addr, message, latency)),
-            }
-        }
-
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.handle(RakSessionInput::Update(now));
-
-            if let Some(reason) = drain_session(session, &self.socket, &mut self.received) {
-                self.session = None;
-                self.intl.reset();
-                self.events
-                    .push_back(RakClientEvent::Disconnected { reason });
+                } => {
+                    if self.pong_budget.admit(message.len()) {
+                        self.pongs.push_back((addr, message, latency));
+                    } else {
+                        self.dropped_pongs = self.dropped_pongs.saturating_add(1);
+                        debug!(
+                            discarded = self.dropped_pongs,
+                            "discarding an excess discovery reply"
+                        );
+                    }
+                }
             }
         }
     }
@@ -345,23 +401,38 @@ impl Drop for RakClient {
     }
 }
 
+/// Transfers the original output FIFO, permanently sealing delivery at its first rejected body.
 fn drain_session(
-    session: &mut SessionSlot,
+    session: &mut Option<SessionSlot>,
     socket: &UdpSocket,
     received: &mut VecDeque<Box<[u8]>>,
+    delivery: &mut ReceiveBudget,
+    now: Instant,
 ) -> Option<RakDisconnectReason> {
     let mut disconnected = None;
-    while let Some(output) = session.poll() {
+    while let Some(output) = session.as_mut().and_then(SessionSlot::poll) {
         match output {
             RakSessionOutput::Datagram(buf, addr) => {
                 let _ = socket.send_to(&buf, addr);
             }
-            RakSessionOutput::Packet(buf) => received.push_back(buf),
-            RakSessionOutput::Disconnected(_, reason) => disconnected = Some(reason),
+            RakSessionOutput::Packet(buf) => {
+                if delivery.admit(buf.len()) {
+                    received.push_back(buf);
+                } else if delivery.seal() {
+                    let original = session
+                        .take()
+                        .expect("the output retains its original core");
+                    let (closing, _) = original.close(now, true);
+                    *session = Some(closing);
+                }
+            }
+            RakSessionOutput::Disconnected(_, reason) => {
+                disconnected.get_or_insert(delivery.reason(reason));
+            }
             RakSessionOutput::Wait(_) => {}
         }
     }
-    disconnected
+    disconnected.or_else(|| delivery.failure())
 }
 
 /// An exclusive idle endpoint capability, consumed by connection start.

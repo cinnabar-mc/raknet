@@ -10,6 +10,15 @@ pub(crate) enum SessionSlot {
 }
 
 impl SessionSlot {
+    /// Captures final-delivery accounting from the same actually negotiated policy.
+    pub(crate) fn receive_budget(&self) -> crate::delivery::ReceiveBudget {
+        let policy = match self {
+            Self::Established(session) => session.config(),
+            Self::Closing(session) => session.config(),
+        };
+        crate::delivery::ReceiveBudget::new(policy.max_queued_bytes)
+    }
+
     /// Returns whether this slot still owns local application-send permission.
     pub(crate) fn established(&self) -> bool {
         matches!(self, Self::Established(_))
