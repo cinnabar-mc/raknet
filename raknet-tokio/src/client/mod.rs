@@ -240,6 +240,15 @@ impl RakClient<ConfiguredClient> {
                                         queue.push(ping);
                                     }
                                 }
+                                #[cfg(test)]
+                                RakClientMsg::InspectPings(reply) => {
+                                    let _ = reply.send(bounded_pings_tests::PingState {
+                                        rows: pings.len(),
+                                        requests: pings.values().map(Vec::len).sum(),
+                                        canceled: pings.values().flatten()
+                                            .filter(|ping| ping.sender.is_closed()).count(),
+                                    });
+                                }
                                 RakClientMsg::Connect(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
                                     let result = sockets.local_addr(addr)
@@ -511,3 +520,6 @@ impl ClientStartError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bounded_pings_tests;
