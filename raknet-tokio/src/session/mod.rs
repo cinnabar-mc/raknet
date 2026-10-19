@@ -37,6 +37,8 @@ pub struct RakSession<S: SessionPhase> {
     close_ack: Option<oneshot::Receiver<Result<(), RakSessionError>>>,
     addr: SocketAddr,
     max_message_len: usize,
+    #[cfg(test)]
+    actor: Option<tokio::task::JoinHandle<()>>,
     phase: PhantomData<S>,
 }
 
@@ -99,7 +101,7 @@ fn spawn<S: SessionPhase>(
     let (buf_tx, buf_rx) = channel(SESSION_QUEUE_CAPACITY);
     let (tx, mut rx) = channel(SESSION_QUEUE_CAPACITY);
     let (terminal_tx, terminal_rx) = oneshot::channel();
-    tokio::spawn(async move {
+    let _actor = tokio::spawn(async move {
         let timer = sleep(std::time::Duration::ZERO);
         tokio::pin!(timer);
         loop {
@@ -121,6 +123,10 @@ fn spawn<S: SessionPhase>(
                             driver.snapshot(Instant::now().into_std())
                         };
                         let _ = reply.send(result);
+                    }
+                    #[cfg(test)]
+                    RakSessionMsg::InspectCommands(reply) => {
+                        let _ = reply.send(msg_rx.len());
                     }
                 },
                 event = rx.recv() => match event {
@@ -165,6 +171,8 @@ fn spawn<S: SessionPhase>(
             close_ack: None,
             addr,
             max_message_len,
+            #[cfg(test)]
+            actor: Some(_actor),
             phase: PhantomData,
         },
         tx,
@@ -253,6 +261,8 @@ impl RakSession<Established> {
             close_ack: Some(rx),
             addr: self.addr,
             max_message_len: self.max_message_len,
+            #[cfg(test)]
+            actor: self.actor,
             phase: PhantomData,
         };
         match closing.msg_tx.send(RakSessionMsg::Close(tx)) {
@@ -300,3 +310,6 @@ pub enum RestoredSession {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod command_byte_tests;

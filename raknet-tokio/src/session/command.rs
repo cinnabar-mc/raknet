@@ -14,4 +14,6 @@ pub enum RakSessionMsg {
     IsClosed(Sender<bool>),
     /// Capture the session's protocol state, leaving the live task running.
     Snapshot(Sender<Result<RakSessionSnapshot, RakSessionCaptureError>>),
+    #[cfg(test)]
+    InspectCommands(Sender<usize>),
 }
