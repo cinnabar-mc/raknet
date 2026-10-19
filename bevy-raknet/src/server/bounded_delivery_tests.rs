@@ -92,6 +92,8 @@ fn send(client: &mut RakClient, bytes: &[u8]) {
         .unwrap();
 }
 
+type Echo = (Box<[u8]>, Box<[u8]>);
+
 /// Echoes one real application message while another peer's receive remains untouched.
 fn exchange(
     server: &mut RakServer,
@@ -99,7 +101,7 @@ fn exchange(
     id: RakSessionId,
     mut other: Option<&mut RakClient>,
     marker: &[u8],
-) -> Option<(Box<[u8]>, Box<[u8]>)> {
+) -> Option<Echo> {
     send(client, marker);
     let mut request = None;
     for _ in 0..PROGRESS_WATCHDOG {
