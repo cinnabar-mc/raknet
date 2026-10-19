@@ -142,6 +142,13 @@ impl RakServer<ConfiguredServer> {
                         }
                         Some(msg) = msg_rx.recv() => {
                             match msg {
+                                #[cfg(test)]
+                                RakServerMsg::InspectCommands(reply) => {
+                                    let _ = reply.send(crate::endpoint_command_tests::QueueState {
+                                        queued: msg_rx.len(),
+                                        address: socket.local_addr().ok(),
+                                    });
+                                }
                                 RakServerMsg::SetMessage(msg) => {
                                     let _ = server.handle(RakServerInput::SetMessage(msg));
                                 },
@@ -265,6 +272,16 @@ impl RakServer<ConfiguredServer> {
 }
 
 impl RakServer<RunningServer> {
+    /// Reads only the original queue at this probe's FIFO position and the same bound socket.
+    #[cfg(test)]
+    pub(crate) fn command_queue_probe(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<crate::endpoint_command_tests::QueueState> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let _ = self.state.msg_tx.send(RakServerMsg::InspectCommands(send));
+        receive
+    }
+
     /// Updates the running endpoint advertisement through its private actor.
     pub fn set_message<T: Into<Box<[u8]>>>(&mut self, value: T) {
         let _ = self

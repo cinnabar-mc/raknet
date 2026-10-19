@@ -21,3 +21,6 @@ pub mod prelude {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod endpoint_command_tests;

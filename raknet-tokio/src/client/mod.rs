@@ -262,6 +262,13 @@ impl RakClient<ConfiguredClient> {
                                             .filter(|ping| ping.sender.is_closed()).count(),
                                     });
                                 }
+                                #[cfg(test)]
+                                RakClientMsg::InspectCommands(reply) => {
+                                    let _ = reply.send(crate::endpoint_command_tests::QueueState {
+                                        queued: msg_rx.len(),
+                                        address: sockets.v4.local_addr().ok(),
+                                    });
+                                }
                                 RakClientMsg::Connect(addr, sender) => {
                                     let addr = canonical_socket_addr(addr);
                                     let result = sockets.local_addr(addr)
@@ -430,6 +437,16 @@ impl RakClient<ConfiguredClient> {
 }
 
 impl RakClient<RunningClient> {
+    /// Reads only the original queue at this probe's FIFO position and the same bound socket.
+    #[cfg(test)]
+    pub(crate) fn command_queue_probe(
+        &self,
+    ) -> oneshot::Receiver<crate::endpoint_command_tests::QueueState> {
+        let (send, receive) = oneshot::channel();
+        let _ = self.state.msg_tx.send(RakClientMsg::InspectCommands(send));
+        receive
+    }
+
     /// Requests graceful stop and consumes the running capability.
     pub async fn stop(mut self) {
         let _ = self.state.msg_tx.send(RakClientMsg::Stop);

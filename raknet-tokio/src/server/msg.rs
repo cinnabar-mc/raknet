@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub enum RakServerMsg {
+    #[cfg(test)]
+    InspectCommands(oneshot::Sender<crate::endpoint_command_tests::QueueState>),
     SetMessage(Box<[u8]>),
     SetMaxConnections(usize),
     Block(IpAddr, Duration),
