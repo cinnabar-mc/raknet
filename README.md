@@ -169,8 +169,13 @@ wait. Snapshot adoption restores the original clock before waiting.
 
 Endpoint stop requests bypass a full command FIFO and retain their first close
 cutoff. Fully await consuming `stop` to join its original socket owner; dropping
-that future or the running resource does not promise a completed join. The
-existing socket-write and session cleanup behavior still applies.
+that future or the running resource does not promise a completed join. Each
+endpoint retains one physical send, including its original route credit, while
+socket readiness is pending. Stop, route retirement and the first cutoff remain
+selectable; final draining uses the same remaining allowance. Unsent output is
+dropped at the cutoff. Ordinary input, commands and core updates pause behind
+that head, so this does not establish shared-socket fairness during a stalled
+write or promise remote delivery.
 
 Bevy's original final receive queues retain at most `MAX_RECEIVE_MESSAGES` per
 session and that session's `max_queued_bytes` of complete bodies. The first

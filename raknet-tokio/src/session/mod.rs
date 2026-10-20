@@ -479,3 +479,6 @@ mod lifetime_tests;
 
 #[cfg(test)]
 mod router_wire_tests;
+
+#[cfg(test)]
+pub(crate) mod physical_send_tests;
