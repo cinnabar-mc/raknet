@@ -1,6 +1,41 @@
 use super::*;
 use std::time::Duration;
 
+/// Ordinary adapter writes must reach the real peer without a periodic timer update.
+#[test]
+fn normal_send_reaches_the_negotiated_peer_without_a_timer_tick() {
+    let now = std::time::Instant::now();
+    let (local, mut peer) = crate::test_support::negotiated_pair(
+        "127.0.0.1:54321".parse().unwrap(),
+        "127.0.0.1:19132".parse().unwrap(),
+        now,
+        now,
+        Default::default(),
+    );
+    let mut driver = Driver::established(local);
+    let expected = Box::<[u8]>::from(&b"\xfeordinary application write"[..]);
+    driver
+        .send(
+            expected.clone(),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+            now,
+        )
+        .unwrap();
+    while let Some(output) = driver.poll() {
+        if let RakSessionOutput::Datagram(bytes, _) = output {
+            peer.handle(RakSessionInput::Datagram(bytes, now)).unwrap();
+        }
+    }
+    let received: Vec<_> = std::iter::from_fn(|| peer.poll())
+        .filter_map(|output| match output {
+            RakSessionOutput::Packet(bytes) => Some(bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(received, [expected]);
+}
+
 #[tokio::test]
 async fn max_message_len_comes_from_the_session_config() {
     let now = Instant::now().into_std();
