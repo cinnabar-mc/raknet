@@ -145,9 +145,19 @@ A server's original `max_connections` reservation follows its accepted handle,
 including unread retired data and terminal metadata, until final `finish` or
 whole-handle drop. Lowering the setting or setting it to zero changes only future
 admission. Network retirement removes the dead route promptly; its weak reservation
-does not retain the handle or its payload. Datagram channels and final receive
-byte accounting still need separate bounds. These are per-stage storage bounds,
-not an aggregate byte or RSS limit.
+does not retain the handle or its payload. Datagram channels need their own
+bounds. These are per-stage storage bounds, not an aggregate byte or RSS limit.
+
+The Tokio final receive FIFO also uses the session's positive `max_queued_bytes`
+as a new aggregate complete-body budget. One already-valid body larger than
+that budget may enter an empty FIFO alone; no successor enters behind it.
+The first count or byte refusal permanently seals final delivery and takes the
+existing immediate-close path. Its accepted prefix remains readable; popping
+older bodies cannot admit a successor across that gap. Earlier protocol terminal
+causes are preserved. Credit ends when `recv` pops the original body or the
+receiver drops it, so caller-owned returned bodies are outside this FIFO bound.
+This does not reduce the core's supported single-message size or impose an MTU
+floor, and it does not bound consumer-retained memory or total RSS.
 
 Running Tokio server setters return `Result` with `TrySendError::Full(input)` or
 `Closed(input)` when the original FIFO cannot admit a control. Rejected
