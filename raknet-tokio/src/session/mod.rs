@@ -239,10 +239,11 @@ fn spawn<S: SessionPhase>(
                     }
                     RakSessionOutput::Datagram(..) => {}
                     RakSessionOutput::Packet(bytes) => {
-                        if bytes.is_empty() {
+                        if bytes.is_empty() || !application_open {
                             continue;
                         }
                         if let Err(TrySendError::Full(_)) = buf_tx.try_send(bytes) {
+                            application_open = false;
                             debug!("closing session with {addr}, its packets are not being read");
                             let _ = driver.close(Instant::now().into_std(), true);
                         }
