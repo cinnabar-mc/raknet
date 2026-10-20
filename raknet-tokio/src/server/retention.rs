@@ -11,6 +11,34 @@ use tokio::sync::mpsc::Sender;
 pub(super) struct Route {
     pub(super) input: Sender<SessionEvent>,
     pub(super) lifetime: SessionLifetime,
+    pub(super) task: std::sync::Weak<crate::inline::Task>,
+}
+
+impl Route {
+    /// Commits to the original bounded input and drives that owner when idle.
+    pub(super) fn try_send(
+        &self,
+        event: SessionEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<SessionEvent>> {
+        crate::inline::Task::drive(&self.task, || self.input.try_send(event))
+    }
+}
+
+/// Registers the original route and withdraws direct writes from an older identical ID.
+pub(super) fn insert(
+    id: RakSessionId,
+    route: Route,
+    sessions: &mut HashMap<RakSessionId, Route>,
+    retained: &HashMap<RakSessionId, SessionLifetime>,
+) {
+    if let Some(previous) = sessions.get(&id) {
+        previous.lifetime.set_direct_wire(false);
+    }
+    if let Some(previous) = retained.get(&id) {
+        previous.set_direct_wire(false);
+    }
+    route.lifetime.set_direct_wire(true);
+    sessions.insert(id, route);
 }
 
 /// Admits committed wire output only for its exact live or retained original route.

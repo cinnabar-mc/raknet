@@ -96,7 +96,8 @@ impl RakServer<ConfiguredServer> {
         #[cfg(test)]
         let send_gate = crate::session::physical_send_tests::capture(&stop);
 
-        let handle = tokio::spawn({
+        let socket = Arc::new(socket);
+        let (handle, _) = crate::inline::Task::spawn(|endpoint| {
             let stop = stop.clone();
             let socket = socket;
             let mut msg_rx = msg_rx;
@@ -116,7 +117,20 @@ impl RakServer<ConfiguredServer> {
                 )
                 .expect("session configuration was validated before binding");
 
-                let (dgram_tx, mut dgram_rx) = wire::datagrams();
+                let weak_socket = Arc::downgrade(&socket);
+                let writer = wire::SocketWriter::new(
+                    Arc::clone(&stop),
+                    move |bytes, peer| {
+                        weak_socket
+                            .upgrade()
+                            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
+                            .try_send_to(bytes, peer)
+                    },
+                    #[cfg(test)]
+                    send_gate.clone(),
+                );
+                let (dgram_tx, mut dgram_rx) =
+                    wire::datagrams_on(endpoint, Some(Arc::clone(&writer)));
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let mut stop_deadline: Option<Instant> = None;
@@ -147,7 +161,7 @@ impl RakServer<ConfiguredServer> {
                         msg_rx.close();
                         let now = Instant::now().into_std();
                         for session in sessions.values() {
-                            let _ = session.input.try_send(SessionEvent::Close(now));
+                            let _ = session.try_send(SessionEvent::Close(now));
                         }
                         stop_deadline = Some(deadline);
                     }
@@ -169,6 +183,7 @@ impl RakServer<ConfiguredServer> {
                             Err(_) => break,
                         }
                     }
+                    writer.set_pending(pending.is_some());
                     tokio::select! {
                         _ = stop.wait(), if stop_deadline.is_none() => continue,
                         _ = async {
@@ -273,7 +288,7 @@ impl RakServer<ConfiguredServer> {
 
                                     let input = RakSessionInput::Datagram(buf, now);
                                     if let Err(TrySendError::Full(_)) =
-                                        session.input.try_send(SessionEvent::Io(input))
+                                        session.try_send(SessionEvent::Io(input))
                                     {
                                         debug!("closing session {id:?}, its input queue is full");
                                         retention::retire(
@@ -299,12 +314,15 @@ impl RakServer<ConfiguredServer> {
                                 let id = session.id();
                                 let (session, tx) =
                                     spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
-                                sessions.insert(
+                                retention::insert(
                                     id,
                                     Route {
                                         input: tx,
+                                        task: session.task(),
                                         lifetime: session.lifetime(Some(&retirement)),
                                     },
+                                    &mut sessions,
+                                    &retained,
                                 );
                                 if let Some(reply) = adoptions.remove(&id) {
                                     let _ = reply.send(Ok(RestoredSession::Closing(session)));
@@ -324,22 +342,28 @@ impl RakServer<ConfiguredServer> {
                                 if stop_deadline.is_some() || stop.requested() {
                                     let _ =
                                         tx.try_send(SessionEvent::Close(Instant::now().into_std()));
-                                    sessions.insert(
+                                    retention::insert(
                                         id,
                                         Route {
                                             input: tx,
+                                            task: session.task(),
                                             lifetime: session.lifetime(Some(&retirement)),
                                         },
+                                        &mut sessions,
+                                        &retained,
                                     );
                                     continue;
                                 }
 
-                                sessions.insert(
+                                retention::insert(
                                     id,
                                     Route {
                                         input: tx,
+                                        task: session.task(),
                                         lifetime: session.lifetime(Some(&retirement)),
                                     },
+                                    &mut sessions,
+                                    &retained,
                                 );
 
                                 if let Some(reply) = adoptions.remove(&id) {

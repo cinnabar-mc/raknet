@@ -154,17 +154,22 @@ async fn close_outside_full_fifo_preserves_committed_body_and_closing_snapshot()
         input,
         mut datagrams,
     } = actor();
+    let original_actor = session.task.upgrade().unwrap();
     let body = vec![0xfe; BODY_BYTES].into_boxed_slice();
     let mut send = Box::pin(session.send(
         body.clone(),
         RakReliability::ReliableOrdered,
         RakPriority::Immediate,
     ));
-    let pending = poll_fn(|context| Poll::Ready(send.as_mut().poll(context).is_pending())).await;
+    let (pending, was_full) = poll_fn(|context| {
+        let _held = original_actor.hold();
+        let pending = send.as_mut().poll(context).is_pending();
+        fill_controls(&session);
+        Poll::Ready((pending, session.msg_tx.capacity() == 0))
+    })
+    .await;
     // The reply wait is canceled after original queue commitment.
     drop(send);
-    fill_controls(&session);
-    let was_full = session.msg_tx.capacity() == 0;
     let (close_admitted, closing) = match session.close() {
         Ok(closing) => (true, closing),
         Err(error) => (false, error.into_parts().0),
