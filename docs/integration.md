@@ -160,7 +160,7 @@ scheduling and is unsuitable as the default for bulk reliable traffic.
 
 ### Capacity and I/O backpressure
 
-Check `max_message_len()` before moving a large message into `Send`. A message
+Check `max_message_len()` before moving a large message into `send`. A message
 over that limit returns `MessageSizeExceeded`. Observe `outbound_bytes()` and
 apply bounded application admission before submitting more work; exceeding
 `RakSessionConfig::max_outbound_bytes` requests disconnection, rather than
@@ -185,12 +185,19 @@ is acknowledged or the configured close timeout expires; it is not a guarantee
 that the peer application processed that data. Send any preceding terminal
 datagram before removing the route. Dropping a pure-core session performs no I/O.
 
-Tokio `session.close()` consumes Established synchronously and returns Closing
-before any cancellable wait. Drain `recv` through its terminal result, then take
-terminal metadata with `finish()`. A close request is not completion of the wire
-shutdown. Keep the running client/server owner alive; `stop().await` consumes it
-and awaits its stop. Bevy users close an exclusive established capability
-and keep updating until the disconnected event arrives.
+Tokio `session.close()` consumes Established synchronously, before any
+cancellable wait. It returns `Result<RakSession<Closing>, SessionCloseError>`;
+on error, `into_parts()` recovers the same closing handle and cause. Keep that
+handle to drain the accepted prefix even when the close command was rejected.
+Drain `recv` through its terminal result, then take terminal metadata with
+`finish()`. If the actor has not finished, `finish()` returns the original handle
+instead of dropping it. The metadata retains the protocol disconnection reason;
+the receive terminal alone does not distinguish every protocol cause.
+
+A close request is not completion of the wire shutdown. Keep the running
+client/server owner alive; `stop().await` consumes it and awaits its stop.
+Bevy users close an exclusive established capability and keep updating until
+the disconnected event arrives.
 
 ### Automatic adapter configuration
 
