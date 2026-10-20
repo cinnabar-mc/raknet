@@ -49,7 +49,7 @@ impl Driver {
             Phase::Closing(session) => session.handle(input),
         }
     }
-    /// Sends only while the actor still owns established permission.
+    /// Drives an admitted write without waiting for the automatic maintenance cadence.
     pub(super) fn send(
         &mut self,
         bytes: Box<[u8]>,
@@ -58,7 +58,13 @@ impl Driver {
         now: Instant,
     ) -> Result<(), RakSessionError> {
         match self.phase.as_mut().ok_or(RakSessionError::Closed)? {
-            Phase::Established(session) => session.send(bytes, reliability, priority, now),
+            Phase::Established(session) => {
+                session.send(bytes, reliability, priority, now)?;
+                if priority != RakPriority::Immediate {
+                    session.tick(now)?;
+                }
+                Ok(())
+            }
             Phase::Closing(_) => Err(RakSessionError::Closed),
         }
     }

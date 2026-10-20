@@ -374,6 +374,8 @@ impl RakSession<Established> {
     /// commitment releases its reservations; cancellation afterwards does not undo it.
     /// A body exceeding the negotiated limit or the entire queue byte budget returns
     /// `MessageSizeExceeded` without entering the queue.
+    /// Admitted writes drive sending without waiting for the maintenance timer;
+    /// congestion control and physical socket admission can still defer delivery.
     pub async fn send<T>(
         &self,
         bytes: T,
