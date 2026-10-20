@@ -266,6 +266,9 @@ impl ServerEngine {
 
     /// Accounts only the exact admitted route, leaving other clients behind its IP independent.
     fn online_rate_limited(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        if self.config.online_packet_limit <= 0 {
+            return false;
+        }
         self.reset_online_window(now);
         let count = self.online_per_addr.entry(addr).or_insert(0);
         if *count >= self.config.online_packet_limit {

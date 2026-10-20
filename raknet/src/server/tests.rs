@@ -1,5 +1,13 @@
 use super::*;
 
+/// Exercises the explicitly configured online quota independently of serving defaults.
+fn online_limited_config() -> RakServerConfig {
+    RakServerConfig {
+        online_packet_limit: 120,
+        ..Default::default()
+    }
+}
+
 fn drain(server: &mut ServerEngine) -> Vec<ServerOutput> {
     let mut out = Vec::new();
     while let Some(o) = server.poll() {
@@ -196,7 +204,7 @@ fn session_datagrams(server: &mut ServerEngine) -> usize {
 fn a_flood_of_online_datagrams_blocks_the_ip_for_a_while() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(crate::clock::test_now()),
         crate::clock::test_now(),
@@ -967,7 +975,7 @@ fn same_ip_sessions_keep_independent_online_admission() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = crate::clock::test_now();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(now),
         now,
@@ -1013,7 +1021,7 @@ fn an_online_flood_does_not_automatically_block_a_same_ip_bystander() {
     let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
     let now = crate::clock::test_now();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(now),
         now,
@@ -1156,7 +1164,7 @@ fn unknown_online_routes_do_not_allocate_or_spend_admitted_state() {
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let now = crate::clock::test_now();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(now),
         now,
@@ -1203,7 +1211,7 @@ fn automatic_peer_cooldown_survives_retirement_and_explicit_ip_unblock() {
     ];
     let now = crate::clock::test_now();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(now),
         now,
@@ -1303,7 +1311,7 @@ fn idle_updates_preserve_the_original_online_window_boundary() {
     let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let now = crate::clock::test_now();
     let mut server = ServerEngine::new(
-        RakServerConfig::default(),
+        online_limited_config(),
         server_addr,
         crate::clock::RakClock::new(now),
         now,
