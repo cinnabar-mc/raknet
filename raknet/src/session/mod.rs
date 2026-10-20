@@ -914,11 +914,6 @@ impl SessionEngine {
 
         debug!("session closed by {}", self.addr);
 
-        if !self.inbound_deferred {
-            let received = self.sequences_recv.drain().collect();
-            self.queue_acks(received, false)?;
-            self.flush();
-        }
         self.disconnect(false, RakDisconnectReason::Remote, now)?;
         Ok(())
     }

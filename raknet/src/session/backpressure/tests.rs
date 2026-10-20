@@ -6,6 +6,7 @@ use crate::protocol::packets::ack::Ack;
 use crate::protocol::packets::connected_ping::ConnectedPing;
 use crate::protocol::packets::disconnect::Disconnect;
 use crate::protocol::packets::frame_set::FrameSet;
+use crate::protocol::types::frame::Frame;
 use crate::util::{flags, packet_id};
 use std::io::Cursor;
 use std::time::Instant;
@@ -448,4 +449,79 @@ fn control_poll_preserves_packet_fifo_and_terminal_capture_ownership() {
         Some(RakDisconnectReason::Remote)
     );
     retire(sender, now);
+}
+
+/// Empty leading fragments cannot bypass application admission when a split completes.
+#[test]
+fn backpressure_retries_splits_with_empty_leading_fragments() {
+    for reliability in [RakReliability::Reliable, RakReliability::ReliableOrdered] {
+        for leading in [1, 2] {
+            for reverse in [false, true] {
+                let (sender, mut receiver, now) = connected_pair();
+                let reliable = receiver.engine.inbound_rel_base;
+                let sequence = receiver.engine.inbound_seq;
+                let order = receiver.engine.inbound_ord_idx[0];
+                let mut indices: Vec<u32> = (0..=leading).collect();
+                if reverse {
+                    indices.reverse();
+                }
+                let mut retry = None;
+                for (arrival, index) in indices.into_iter().enumerate() {
+                    let payload: Box<[u8]> = if index == leading {
+                        Box::from([0xfe])
+                    } else {
+                        Box::from([])
+                    };
+                    let mut frame = Frame::new(reliability, payload);
+                    frame.reliable_index = crate::util::u24::add(reliable, arrival as u32);
+                    frame.order_index = order;
+                    frame.split_size = leading + 1;
+                    frame.split_id = 700;
+                    frame.split_index = index;
+                    let bytes = FrameSet::new(
+                        crate::util::u24::add(sequence, arrival as u32),
+                        vec![frame],
+                        false,
+                        false,
+                        false,
+                    )
+                    .serialized()
+                    .unwrap();
+                    receiver
+                        .handle_backpressured(RakSessionInput::Datagram(bytes.clone(), now))
+                        .unwrap();
+                    retry = Some(bytes);
+                }
+                receiver.tick(now).unwrap();
+                let completion = crate::util::u24::add(sequence, leading);
+                for bytes in wire(&mut receiver) {
+                    if bytes[0] & flags::ACK != 0 {
+                        assert!(
+                            !Ack::deserialize(&mut bytes.as_ref())
+                                .unwrap()
+                                .sequences
+                                .contains(&completion)
+                        );
+                    }
+                }
+                receiver
+                    .handle(RakSessionInput::Datagram(retry.unwrap(), now))
+                    .unwrap();
+                receiver.tick(now).unwrap();
+                assert!(
+                    matches!(receiver.poll(), Some(RakSessionOutput::Packet(bytes)) if bytes.as_ref() == [0xfe])
+                );
+                let acknowledged = wire(&mut receiver).into_iter().any(|bytes| {
+                    bytes[0] & flags::ACK != 0
+                        && Ack::deserialize(&mut bytes.as_ref())
+                            .unwrap()
+                            .sequences
+                            .contains(&completion)
+                });
+                assert!(acknowledged);
+                retire(sender, now);
+                retire(receiver, now);
+            }
+        }
+    }
 }

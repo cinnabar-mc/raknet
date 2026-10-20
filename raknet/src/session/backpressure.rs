@@ -125,14 +125,11 @@ impl SessionEngine {
             {
                 return false;
             }
-            if frame.split_index == 0 {
-                frame.payload.as_ref()
-            } else {
-                let Some(first) = held.and_then(|fragments| fragments.get(&0)) else {
-                    return false;
-                };
-                first.payload.as_ref()
-            }
+            std::iter::once(frame)
+                .chain(held.into_iter().flat_map(|fragments| fragments.values()))
+                .filter(|fragment| !fragment.payload.is_empty())
+                .min_by_key(|fragment| fragment.split_index)
+                .map_or(&[][..], |fragment| fragment.payload.as_ref())
         } else {
             frame.payload.as_ref()
         };

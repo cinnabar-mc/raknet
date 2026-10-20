@@ -2181,27 +2181,28 @@ fn closing_snapshot_preserves_notification_retry() {
     assert_eq!(sender.outbound_rel, reliable);
 }
 
-/// A remote close cannot acknowledge reliable application input refused in the same datagram.
+/// A remote close cannot acknowledge reliable application input on either side of its frame.
 #[test]
-fn disconnect_does_not_ack_a_refused_reliable_prefix() {
-    let mut receiver = session(0, 1);
-    let now = domain_time();
-    let input = datagram_at(
-        0,
-        vec![
+fn disconnect_does_not_ack_unretained_reliable_frames() {
+    for reverse in [false, true] {
+        let mut receiver = session(0, 1);
+        let now = domain_time();
+        let mut frames = vec![
             Frame::new(RakReliability::Reliable, Box::from([0xfe])),
             Frame::new(RakReliability::Unreliable, Box::from([0x15])),
-        ],
-        now,
-    );
-    let SessionInput::Datagram(bytes, _) = input else {
-        unreachable!()
-    };
-    receiver.handle_datagram(bytes, now, false).unwrap();
-    let outputs = drain_outputs(&mut receiver);
-    assert!(datagrams_of(&outputs).is_empty());
-    assert_eq!(
-        disconnect_reason_of(&outputs),
-        Some(RakDisconnectReason::Remote)
-    );
+        ];
+        if reverse {
+            frames.reverse();
+        }
+        let SessionInput::Datagram(bytes, _) = datagram_at(0, frames, now) else {
+            unreachable!()
+        };
+        receiver.handle_datagram(bytes, now, false).unwrap();
+        let outputs = drain_outputs(&mut receiver);
+        assert!(datagrams_of(&outputs).is_empty());
+        assert_eq!(
+            disconnect_reason_of(&outputs),
+            Some(RakDisconnectReason::Remote)
+        );
+    }
 }

@@ -394,48 +394,44 @@ impl ServerEngine {
 
         if let Entry::Occupied(mut entry) = self.session_pending.entry(addr) {
             let mut success = false;
-            let mut closed = false;
-
             let (_, session) = entry.get_mut();
 
             let handled = session.handle(SessionInput::Datagram(buf, now));
+            let mut closed = session.state == RakSessionState::Disconnected;
 
             while let Some(msg) = session.poll() {
                 match msg {
                     RakSessionOutput::Datagram(buf, addr) => self
                         .output
                         .push_back(ServerOutput::SocketDatagram(buf, addr)),
-                    RakSessionOutput::Packet(buf) => {
+                    RakSessionOutput::Packet(buf) if !closed => {
                         if let Some(&b) = buf.first() {
                             let mut cursor = Cursor::new(buf.as_ref());
-                            match b {
-                                packet_id::CONNECTION_REQUEST => Self::handle_connection_request(
-                                    session,
-                                    addr,
-                                    &mut cursor,
-                                    now,
-                                )?,
+                            let result = match b {
+                                packet_id::CONNECTION_REQUEST => {
+                                    Self::handle_connection_request(session, addr, &mut cursor, now)
+                                }
                                 packet_id::NEW_INCOMING_CONNECTION => {
-                                    Self::handle_new_incoming_connection(
-                                        session,
-                                        addr,
-                                        &mut cursor,
-                                    )?;
-
-                                    success = true;
-                                    break;
+                                    Self::handle_new_incoming_connection(session, addr, &mut cursor)
+                                        .map(|()| success = true)
                                 }
                                 _ => {
                                     debug!(
                                         "unexpected packet {:02X} received from {} during connection phase",
                                         b, addr
                                     );
+                                    Ok(())
                                 }
+                            };
+                            closed |=
+                                result.is_err() || session.state == RakSessionState::Disconnected;
+                            if success && !closed {
+                                break;
                             }
                         }
                     }
                     RakSessionOutput::Disconnected(..) => closed = true,
-                    RakSessionOutput::Wait(_) => {}
+                    RakSessionOutput::Wait(_) | RakSessionOutput::Packet(_) => {}
                 }
             }
 

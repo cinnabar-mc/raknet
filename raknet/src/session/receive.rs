@@ -97,8 +97,11 @@ impl SessionEngine {
 
         self.inbound_deferred = false;
         let mut result = Ok(());
-        for frame in set.frames {
+        let mut frames = set.frames.into_iter();
+        while let Some(frame) = frames.next() {
             if matches!(self.state, RakSessionState::Disconnected) {
+                self.inbound_deferred |= frame.reliability.is_reliable()
+                    || frames.any(|frame| frame.reliability.is_reliable());
                 break;
             }
             if !admit_application && self.defer_application(&frame) {
@@ -112,6 +115,20 @@ impl SessionEngine {
         }
         if self.inbound_deferred || result.is_err() {
             self.sequences_recv.remove(&set.sequence);
+        }
+        if matches!(
+            self.output.back(),
+            Some(super::output::RakSessionOutput::Disconnected(
+                _,
+                RakDisconnectReason::Remote
+            ))
+        ) {
+            // Receipt ACKs precede terminal output only after the full datagram is accounted for.
+            let terminal = self.output.pop_back();
+            let received = self.sequences_recv.drain().collect();
+            self.queue_acks(received, false)?;
+            self.flush();
+            self.output.extend(terminal);
         }
         self.refresh_stall(now);
         result

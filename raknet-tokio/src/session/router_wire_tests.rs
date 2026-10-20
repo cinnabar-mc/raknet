@@ -46,7 +46,7 @@ impl Original {
         }
     }
 
-    /// Delivers the same frame once and returns the original peer's protocol output.
+    /// Delivers a datagram to a live peer and returns its protocol output.
     fn forward(
         &mut self,
         datagram: wire::Datagram,
@@ -61,6 +61,9 @@ impl Original {
             .peer
             .as_mut()
             .ok_or_else(|| "original peer was already consumed".to_owned())?;
+        if closing && peer.state() == RakSessionState::Disconnected {
+            return Ok(());
+        }
         peer.handle(RakSessionInput::Datagram(bytes, Instant::now().into_std()))
             .map_err(|error| format!("original peer receive: {error}"))?;
         peer.tick(Instant::now().into_std())
