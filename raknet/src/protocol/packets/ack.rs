@@ -26,6 +26,21 @@ impl Ack {
     }
 
     pub fn split(sequences: Vec<u32>, is_nack: bool, max_size: usize) -> Vec<Self> {
+        if !sequences.is_empty()
+            && sequences.len() <= MAX_ACK_ENTRIES
+            && HEADER_SIZE
+                + if sequences.len() == 1 {
+                    SINGLE_SIZE
+                } else {
+                    RANGE_SIZE
+                }
+                <= max_size
+            && sequences
+                .windows(2)
+                .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+        {
+            return vec![Self { is_nack, sequences }];
+        }
         let sequences = Self::new(sequences, is_nack).sequences;
 
         let mut boundaries = Vec::new();
@@ -116,6 +131,10 @@ impl RakCodec for Ack {
             .filter(|pair| pair[1] != pair[0] + 1)
             .count();
         writer.write_u16::<BigEndian>(count as u16)?;
+        if count == 1 {
+            Self::serialize_range(first, *self.sequences.last().unwrap(), writer)?;
+            return Ok(());
+        }
         let mut start = first;
         let mut end = first;
         for &sequence in rest {

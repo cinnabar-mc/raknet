@@ -3,7 +3,7 @@ use crate::protocol::error::RakCodecError;
 use crate::types::reliability::RakReliability;
 use crate::util::flags::SPLIT;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 #[derive(Clone, Debug, PartialEq, Eq, facet::Facet)]
 pub struct Frame {
@@ -105,12 +105,15 @@ impl RakCodec for Frame {
             split_index = reader.read_u32::<BigEndian>()?;
         };
 
-        let mut payload = vec![0; length].into_boxed_slice();
-        reader.read_exact(&mut payload)?;
+        let mut payload = Vec::with_capacity(length);
+        reader.take(length as u64).read_to_end(&mut payload)?;
+        if payload.len() != length {
+            return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
 
         Ok(Self {
             reliability,
-            payload,
+            payload: payload.into_boxed_slice(),
             reliable_index,
             sequence_index,
             order_index,
@@ -148,6 +151,21 @@ impl RakCodec for Frame {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn payload_reads_stop_at_the_declared_length_and_reject_truncation() {
+        for length in [0, 64, 1024, 1400] {
+            let expected = Frame::new(RakReliability::ReliableOrdered, vec![0xfe; length].into());
+            let mut encoded = Vec::new();
+            expected.serialize(&mut encoded).unwrap();
+            let mut cursor = Cursor::new([encoded.as_slice(), &[0xaa, 0xbb]].concat());
+            assert_eq!(Frame::deserialize(&mut cursor).unwrap(), expected);
+            assert_eq!(cursor.position() as usize, encoded.len());
+            for end in 0..encoded.len() {
+                assert!(Frame::deserialize(&mut &encoded[..end]).is_err());
+            }
+        }
+    }
 
     #[test]
     fn reliable_sequenced_frame_carries_message_index() {
