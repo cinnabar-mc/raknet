@@ -3,8 +3,10 @@
 //! The Go side is `tools/go-raknet/cmd/peer`. Set `RAKNET_GO_PEER` to a built peer,
 //! or put `go` on PATH to build it; otherwise every test skips with a named reason,
 //! or fails when `RAKNET_REQUIRE_GO_PEER` is set.
-//! A case listed in `DIVERGENCES` must still fail its go-raknet parity check, so a
-//! fix forces removal of its entry.
+//!
+//! Delivery tests assert intact transfer in both roles. Edge-case tests observe one
+//! endpoint at a time, Rust and then go-raknet in the same role, and compare the pair
+//! with `EXPECTED`; a fix that changes either outcome forces its entry to be updated.
 
 use raknet::protocol::codec::RakCodec;
 use raknet::protocol::packets::ack::Ack;
@@ -18,119 +20,75 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-/// Cases known to differ from go-raknet, with the exact observation each must keep producing.
+/// What the endpoint under test did with follow-up traffic, or how its peer saw it close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Delivered,
+    /// The session or connection ended; a peer-side send error counts as this too.
+    Closed,
+    TimedOut,
+}
+
+use Outcome::{Closed, Delivered, TimedOut};
+
+/// Observed `(rust, go)` outcomes per `case/role`, with Rust and Go each playing that role.
 ///
-/// Names are `case/role`, comparing Rust and Go playing the same role; see `RoleOutcomes`.
-const DIVERGENCES: &[(&str, &str)] = &[
+/// Equal pairs are parity; unequal pairs are recorded divergences.
+const EXPECTED: &[(&str, Outcome, Outcome)] = &[
+    ("loss_burst_receiver/client", Delivered, Delivered),
     // New: the client recovers from a gap over 2048 datagrams since the 50000 gap
     // fix (6fc4d7c), but a server session still delivers nothing after one.
-    ("loss_burst_receiver/server", "rust timeout; go all"),
+    ("loss_burst_receiver/server", TimedOut, Delivered),
     // Known: the disconnect notification is sent once, not until acknowledged (98dc6d1).
-    (
-        "lost_disconnect_closer/client",
-        "rust peer noticed only by timeout; go peer noticed promptly",
-    ),
-    (
-        "lost_disconnect_closer/server",
-        "rust peer noticed only by timeout; go peer noticed promptly",
-    ),
-    // Known: empty or count-mismatched split fragments end the session (250a0fc).
-    ("empty_split_fragment/client", "rust closed; go all"),
-    ("empty_split_fragment/server", "rust closed; go all"),
-    ("mismatched_split_count/client", "rust closed; go all"),
-    ("mismatched_split_count/server", "rust closed; go all"),
+    // The outcome is whether the closer's peer saw the close within 2 s.
+    ("lost_disconnect_closer/client", TimedOut, Closed),
+    ("lost_disconnect_closer/server", TimedOut, Closed),
+    ("truncated_frame_datagram/client", Delivered, Delivered),
     // New: a go-raknet listener closes the connection when it rejects a datagram;
     // the Rust server skips it and keeps the session.
-    ("truncated_frame_datagram/server", "rust all; go closed"),
-    ("reversed_ack_range/server", "rust all; go closed"),
-    // Known: 15 s silence timeout against go-raknet's 5 s plus two round trips.
-    (
-        "dead_peer_detection/client",
-        "rust closed at the 15 s timeout; go about 10 s",
-    ),
-    (
-        "dead_peer_detection/server",
-        "rust closed at the 15 s timeout; go about 10 s",
-    ),
+    ("truncated_frame_datagram/server", Delivered, Closed),
+    ("reversed_ack_range/client", Delivered, Delivered),
+    ("reversed_ack_range/server", Delivered, Closed),
+    // Known: empty or count-mismatched split fragments end the session (250a0fc).
+    ("empty_split_fragment/client", Closed, Delivered),
+    ("empty_split_fragment/server", Closed, Delivered),
+    ("mismatched_split_count/client", Closed, Delivered),
+    ("mismatched_split_count/server", Closed, Delivered),
+    // Known: a 15 s silence timeout against go-raknet's 5 s plus two round trips.
+    // The outcome is whether the endpoint closed a silent peer within 12 s.
+    ("dead_peer_detection/client", TimedOut, Closed),
+    ("dead_peer_detection/server", TimedOut, Closed),
 ];
 
-/// Collects parity verdicts so one run reports every case; listed divergences must still reproduce.
-#[derive(Default)]
-struct Verdicts(Vec<String>);
-
-impl Verdicts {
-    /// `observed` summarises the outcome; a listed divergence must reproduce it exactly.
-    fn check(&mut self, case: &str, matches_go: bool, observed: &str, detail: &str) {
-        match (DIVERGENCES.iter().find(|(c, _)| *c == case), matches_go) {
-            (Some(_), true) => self.0.push(format!(
-                "{case} now matches go-raknet ({observed}; {detail}); remove its divergence entry"
-            )),
-            (Some((_, expected)), false) if *expected != observed => self.0.push(format!(
-                "{case} divergence changed: expected `{expected}`, observed `{observed}` ({detail})"
-            )),
-            (None, false) => self.0.push(format!(
-                "{case} diverges from go-raknet: {observed} ({detail})"
-            )),
-            _ => eprintln!("{case}: {observed} ({detail})"),
-        }
-    }
-
-    fn finish(self) {
-        assert!(
-            self.0.is_empty(),
-            "go-raknet parity:\n{}",
-            self.0.join("\n")
+/// Checks one edge case's observed outcomes against `EXPECTED` for each role.
+fn assert_expected(name: &str, rust: [Option<Outcome>; 2], go: [Option<Outcome>; 2]) {
+    let mut problems = Vec::new();
+    for role in ROLES {
+        let id = case(name, role);
+        let observed = (
+            rust[role.index()].expect("rust outcome recorded"),
+            go[role.index()].expect("go outcome recorded"),
         );
-    }
-}
-
-/// One behaviour observed with each implementation in each role.
-///
-/// A link with Rust in role R puts Go in the other role, so the Go outcome for R
-/// always comes from the link where Go plays R. Expected Go behaviour is measured,
-/// never assumed.
-#[derive(Default)]
-struct RoleOutcomes {
-    rust: [Option<String>; 2],
-    go: [Option<String>; 2],
-    detail: Vec<String>,
-}
-
-impl RoleOutcomes {
-    /// Records what the Rust endpoint did while playing `role`.
-    fn rust(&mut self, role: Role, outcome: &str, detail: String) {
-        self.rust[role.index()] = Some(outcome.into());
-        self.detail
-            .push(format!("rust as {}: {detail}", role.name()));
-    }
-
-    /// Records what the Go peer did in a link where Rust plays `rust_role`.
-    fn go(&mut self, rust_role: Role, outcome: &str, detail: String) {
-        let role = rust_role.opposite();
-        self.go[role.index()] = Some(outcome.into());
-        self.detail.push(format!("go as {}: {detail}", role.name()));
-    }
-
-    /// Compares Rust and Go in each role.
-    fn check(self, verdicts: &mut Verdicts, name: &str) {
-        let detail = self.detail.join("; ");
-        for role in ROLES {
-            let rust = self.rust[role.index()]
-                .as_deref()
-                .expect("rust outcome recorded");
-            let go = self.go[role.index()]
-                .as_deref()
-                .expect("go outcome recorded");
-            let observed = format!("rust {rust}; go {go}");
-            verdicts.check(&case(name, role), rust == go, &observed, &detail);
+        match EXPECTED.iter().find(|(c, ..)| *c == id) {
+            Some(&(_, r, g)) if (r, g) == observed => eprintln!("{id}: rust {r:?}, go {g:?}"),
+            Some(&(_, r, g)) => problems.push(format!(
+                "{id}: expected rust {r:?}, go {g:?}; observed rust {:?}, go {:?}",
+                observed.0, observed.1
+            )),
+            None => problems.push(format!("{id}: no expected entry for {observed:?}")),
         }
     }
+    assert!(
+        problems.is_empty(),
+        "go-raknet parity:\n{}",
+        problems.join("\n")
+    );
 }
 
 /// Locates or builds the Go peer once per test binary.
@@ -177,13 +135,13 @@ struct Received {
 }
 
 impl Received {
-    /// Classifies the outcome without counts, which vary with scheduling.
-    fn summary(&self, count: usize) -> &'static str {
+    /// Reduces receipt of `count` messages to an outcome; corrupt or stray messages always fail.
+    fn outcome(&self, count: usize) -> Outcome {
+        assert!(self.unexpected.is_empty(), "unexpected messages: {self:?}");
         match &self.ended {
-            _ if !self.unexpected.is_empty() => "unexpected messages",
-            _ if self.delivered == count => "all",
-            Some(ended) if ended.starts_with("closed") => "closed",
-            _ => "timeout",
+            _ if self.delivered == count => Delivered,
+            Some(ended) if ended.starts_with("closed") || ended.starts_with("error") => Closed,
+            _ => TimedOut,
         }
     }
 }
@@ -232,7 +190,6 @@ impl GoPeer {
     async fn expect_any(&mut self, prefixes: &[&str], within: Duration) -> Option<String> {
         timeout(within, async {
             while let Some(line) = self.events.recv().await {
-                assert!(!line.starts_with("error"), "go peer: {line}");
                 if prefixes.iter().any(|p| line.starts_with(p)) {
                     return Some(line);
                 }
@@ -255,11 +212,11 @@ impl GoPeer {
         while received.delivered < count {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match self
-                .expect_any(&["recv", "unexpected", "closed"], left)
+                .expect_any(&["recv", "unexpected", "closed", "error"], left)
                 .await
             {
                 Some(line) if line == format!("recv {size} ok") => received.delivered += 1,
-                Some(line) if line.starts_with("closed") => {
+                Some(line) if line.starts_with("closed") || line.starts_with("error") => {
                     received.ended = Some(line);
                     break;
                 }
@@ -472,45 +429,30 @@ struct Exchange {
 }
 
 impl Exchange {
-    fn rust(&self) -> &'static str {
-        self.at_rust.summary(self.count)
-    }
-
-    fn go(&self) -> &'static str {
-        self.at_go.summary(self.count)
-    }
-
-    fn ok(&self) -> bool {
-        self.queued && self.rust() == "all" && self.go() == "all"
-    }
-
-    fn detail(&self) -> String {
-        format!(
-            "rust sent all: {}; at rust {:?}; at go {:?}",
+    /// Asserts both directions arrived intact and nothing else reached either application.
+    fn assert_ok(&self, what: &str) {
+        let ok = self.queued
+            && self.at_rust.delivered == self.count
+            && self.at_go.delivered == self.count
+            && self.at_rust.unexpected.is_empty()
+            && self.at_go.unexpected.is_empty();
+        assert!(
+            ok,
+            "{what}: rust sent all: {}; at rust {:?}; at go {:?}",
             self.queued, self.at_rust, self.at_go
-        )
-    }
-
-    /// Records each receiver's outcome under the role it played.
-    fn record(&self, outcomes: &mut RoleOutcomes, role: Role) {
-        outcomes.rust(role, self.rust(), self.detail());
-        outcomes.go(role, self.go(), self.detail());
+        );
     }
 }
 
-/// Clean handshake and ordered delivery both ways.
+/// Clean handshake and ordered delivery both ways, in both roles.
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_and_ordered_delivery() {
     let peer = require_peer!();
-    let mut outcomes = RoleOutcomes::default();
     for role in ROLES {
         let mut link = Link::connect(&peer, role, 1).await;
         let exchange = link.exchange(300, 50, Duration::from_secs(10)).await;
-        exchange.record(&mut outcomes, role);
+        exchange.assert_ok(&format!("ordered delivery, rust as {}", role.name()));
     }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "ordered_delivery");
-    verdicts.finish();
 }
 
 /// Four 1 MiB messages each way under random loss, duplication and reordering.
@@ -525,17 +467,66 @@ async fn bulk_under_random_impairment() {
         delay: Duration::from_millis(2),
         jitter: Duration::from_millis(3),
     };
-    let mut outcomes = RoleOutcomes::default();
     for role in ROLES {
         let mut link = Link::connect(&peer, role, 7).await;
         link.shim.set(Direction::ToUpstream, impairment);
         link.shim.set(Direction::ToClient, impairment);
         let exchange = link.exchange(1 << 20, 4, Duration::from_secs(60)).await;
-        exchange.record(&mut outcomes, role);
+        exchange.assert_ok(&format!("bulk transfer, rust as {}", role.name()));
     }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "bulk_under_random_impairment");
-    verdicts.finish();
+}
+
+/// Rewrites the datagram number of one data datagram to land `jump` past its original.
+fn jump_sequence(bytes: &[u8], jump: u32) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let seq = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], 0]).wrapping_add(jump) & 0xff_ffff;
+    out[1..4].copy_from_slice(&seq.to_le_bytes()[..3]);
+    out
+}
+
+/// One datagram numbered more than 2048 ahead stalls neither receiver, in both roles.
+#[tokio::test(flavor = "multi_thread")]
+async fn datagram_far_ahead() {
+    let peer = require_peer!();
+    for role in ROLES {
+        for to_rust in [true, false] {
+            let mut link = Link::connect(&peer, role, 13).await;
+            let towards = if to_rust {
+                link.towards_rust()
+            } else {
+                link.rust_out
+            };
+            let seen = Arc::new(AtomicUsize::new(0));
+            link.shim.set_filter(Some(Box::new(move |direction, bytes| {
+                if direction == towards
+                    && is_data(bytes)
+                    && seen.fetch_add(1, Ordering::Relaxed) == 20
+                {
+                    Verdict::Replace(jump_sequence(bytes, 3000))
+                } else {
+                    Verdict::Forward
+                }
+            })));
+            let exchange = link.exchange(2000, 100, Duration::from_secs(20)).await;
+            exchange.assert_ok(&format!(
+                "datagram far ahead towards {}, rust as {}",
+                if to_rust { "rust" } else { "go" },
+                role.name()
+            ));
+        }
+    }
+}
+
+/// A one second port outage (ICMP unreachable, transient socket errors) during transfer.
+#[tokio::test(flavor = "multi_thread")]
+async fn transient_socket_errors() {
+    let peer = require_peer!();
+    for role in ROLES {
+        let mut link = Link::connect(&peer, role, 17).await;
+        link.shim.outage(Duration::from_secs(1)).await;
+        let exchange = link.exchange(1000, 200, Duration::from_secs(20)).await;
+        exchange.assert_ok(&format!("port outage, rust as {}", role.name()));
+    }
 }
 
 /// Is `bytes` a data datagram (not an ACK or NACK)?
@@ -595,98 +586,38 @@ fn skip_after_burst(towards: Direction) -> raknet_tokio::impairment::Filter {
     })
 }
 
-/// Sends 4 MiB towards `towards` across a skipped burst and summarises its receipt.
-async fn burst(link: &mut Link, towards: Direction) -> (&'static str, String) {
+/// The receiver's outcome for 4 MiB sent towards it across a skipped burst.
+async fn after_burst(link: &mut Link, rust_receives: bool) -> Outcome {
+    let towards = if rust_receives {
+        link.towards_rust()
+    } else {
+        link.rust_out
+    };
     link.shim.set_filter(Some(skip_after_burst(towards)));
-    let received = if towards == link.towards_rust() {
+    if rust_receives {
         link.go.command(&format!("send {} 4", 1 << 20)).await;
-        link.rust_receive(1 << 20, 4, Duration::from_secs(20)).await
+        let received = link.rust_receive(1 << 20, 4, Duration::from_secs(20)).await;
+        received.outcome(4)
     } else {
         link.rust_send(1 << 20, 4).await;
-        link.go.receive(1 << 20, 4, Duration::from_secs(20)).await
-    };
-    (received.summary(4), format!("{received:?}"))
+        let received = link.go.receive(1 << 20, 4, Duration::from_secs(20)).await;
+        received.outcome(4)
+    }
 }
 
-/// A receiver survives a loss burst longer than 2048 datagrams with 4 MiB in flight.
+/// A receiver delivers 4 MiB across a loss burst longer than 2048 datagrams.
 #[tokio::test(flavor = "multi_thread")]
 async fn loss_burst_with_megabytes_in_flight() {
     let peer = require_peer!();
-    let mut outcomes = RoleOutcomes::default();
+    let (mut rust, mut go) = ([None; 2], [None; 2]);
     for role in ROLES {
         let mut link = Link::connect(&peer, role, 11).await;
-        let towards = link.towards_rust();
-        let (outcome, detail) = burst(&mut link, towards).await;
-        outcomes.rust(role, outcome, detail);
-        let mut link = Link::connect(&peer, role, 12).await;
-        let towards = link.rust_out;
-        let (outcome, detail) = burst(&mut link, towards).await;
-        outcomes.go(role, outcome, detail);
+        rust[role.index()] = Some(after_burst(&mut link, true).await);
+        // Go plays this role in the link where Rust plays the other one.
+        let mut link = Link::connect(&peer, role.opposite(), 12).await;
+        go[role.index()] = Some(after_burst(&mut link, false).await);
     }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "loss_burst_receiver");
-    verdicts.finish();
-}
-
-/// Rewrites the datagram number of one data datagram to land `jump` past its original.
-fn jump_sequence(bytes: &[u8], jump: u32) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    let seq = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], 0]).wrapping_add(jump) & 0xff_ffff;
-    out[1..4].copy_from_slice(&seq.to_le_bytes()[..3]);
-    out
-}
-
-/// One datagram numbered more than 2048 ahead does not stall its receiver.
-#[tokio::test(flavor = "multi_thread")]
-async fn datagram_far_ahead() {
-    let peer = require_peer!();
-    let mut outcomes = RoleOutcomes::default();
-    for role in ROLES {
-        for to_rust in [true, false] {
-            let mut link = Link::connect(&peer, role, 13).await;
-            let towards = if to_rust {
-                link.towards_rust()
-            } else {
-                link.rust_out
-            };
-            let seen = Arc::new(AtomicUsize::new(0));
-            link.shim.set_filter(Some(Box::new(move |direction, bytes| {
-                if direction == towards
-                    && is_data(bytes)
-                    && seen.fetch_add(1, Ordering::Relaxed) == 20
-                {
-                    Verdict::Replace(jump_sequence(bytes, 3000))
-                } else {
-                    Verdict::Forward
-                }
-            })));
-            let exchange = link.exchange(2000, 100, Duration::from_secs(20)).await;
-            if to_rust {
-                outcomes.rust(role, exchange.rust(), exchange.detail());
-            } else {
-                outcomes.go(role, exchange.go(), exchange.detail());
-            }
-        }
-    }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "datagram_far_ahead_receiver");
-    verdicts.finish();
-}
-
-/// A one second port outage (ICMP unreachable, transient socket errors) during transfer.
-#[tokio::test(flavor = "multi_thread")]
-async fn transient_socket_errors() {
-    let peer = require_peer!();
-    let mut outcomes = RoleOutcomes::default();
-    for role in ROLES {
-        let mut link = Link::connect(&peer, role, 17).await;
-        link.shim.outage(Duration::from_secs(1)).await;
-        let exchange = link.exchange(1000, 200, Duration::from_secs(20)).await;
-        exchange.record(&mut outcomes, role);
-    }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "transient_socket_errors");
-    verdicts.finish();
+    assert_expected("loss_burst_receiver", rust, go);
 }
 
 /// Does this data datagram carry a disconnect notification frame?
@@ -714,54 +645,43 @@ fn drop_first_disconnect(link: &Link, towards: Direction) {
     })));
 }
 
-/// Classifies how long a peer took to notice a close whose first notification was lost.
-fn classify_close(noticed: bool, elapsed: Duration) -> &'static str {
-    match elapsed {
-        _ if !noticed => "peer never noticed",
-        t if t < Duration::from_secs(2) => "peer noticed promptly",
-        // go-raknet closes a silent peer after 5 s, then drains for up to 5 s more.
-        t if t >= Duration::from_secs(5) => "peer noticed only by timeout",
-        _ => "peer noticed late",
-    }
-}
+/// How long a closer's peer may take to notice the close before it counts as timed out.
+const CLOSE_NOTICE: Duration = Duration::from_secs(2);
 
-/// A closer whose first disconnect notification is lost still closes its peer promptly.
+/// Whether a closer whose first disconnect notification is lost still closes its peer promptly.
 #[tokio::test(flavor = "multi_thread")]
 async fn lost_disconnect_notification() {
     let peer = require_peer!();
-    let mut outcomes = RoleOutcomes::default();
+    let (mut rust, mut go) = ([None; 2], [None; 2]);
     for role in ROLES {
-        // Go closes; its first notification towards Rust is lost.
-        let mut link = Link::connect(&peer, role, 19).await;
-        drop_first_disconnect(&link, link.towards_rust());
-        let started = Instant::now();
-        link.go.command("close").await;
-        let closed = timeout(Duration::from_secs(30), link.session.recv::<Box<[u8]>>()).await;
-        let elapsed = started.elapsed();
-        let outcome = classify_close(matches!(closed, Ok(Err(_))), elapsed);
-        outcomes.go(role, outcome, format!("rust noticed after {elapsed:?}"));
-
-        // Rust closes; its first notification towards Go is lost.
+        // Rust closes in this role; the Go peer observes.
         let link = Link::connect(&peer, role, 20).await;
         drop_first_disconnect(&link, link.rust_out);
         let Link {
             session,
-            mut go,
+            go: mut peer_go,
             shim: _shim,
             _client,
             _server,
             ..
         } = link;
-        let started = Instant::now();
         let _closing = session.close().expect("close");
-        let line = go.expect("closed", Duration::from_secs(30)).await;
-        let elapsed = started.elapsed();
-        let outcome = classify_close(line.is_some(), elapsed);
-        outcomes.rust(role, outcome, format!("go noticed after {elapsed:?}"));
+        let noticed = peer_go.expect_any(&["closed", "error"], CLOSE_NOTICE).await;
+        rust[role.index()] = Some(if noticed.is_some() { Closed } else { TimedOut });
+
+        // Go closes in this role, from the link where Rust plays the other one.
+        let mut link = Link::connect(&peer, role.opposite(), 19).await;
+        drop_first_disconnect(&link, link.towards_rust());
+        link.go.command("close").await;
+        go[role.index()] = Some(
+            match timeout(CLOSE_NOTICE, link.session.recv::<Box<[u8]>>()).await {
+                Ok(Err(_)) => Closed,
+                Ok(Ok(_)) => Delivered,
+                Err(_) => TimedOut,
+            },
+        );
     }
-    let mut verdicts = Verdicts::default();
-    outcomes.check(&mut verdicts, "lost_disconnect_closer");
-    verdicts.finish();
+    assert_expected("lost_disconnect_closer", rust, go);
 }
 
 /// Encodes one datagram carrying `frames`, numbered `seq`.
@@ -773,7 +693,7 @@ fn datagram(seq: u32, frames: Vec<Frame>) -> Vec<u8> {
     out
 }
 
-/// Injects crafted datagrams towards one side, then reports how that side received follow-up traffic.
+/// Injects crafted datagrams into the endpoint under test, then sends follow-up traffic only to it.
 ///
 /// `crafted` takes datagram numbers from the allocator it is given. Each is distinct and
 /// 100000 behind the newest number sent that way, so no receiver can treat it as a
@@ -781,10 +701,10 @@ fn datagram(seq: u32, frames: Vec<Frame>) -> Vec<u8> {
 /// before the follow-up traffic starts.
 async fn after_injection(
     link: &mut Link,
-    to_rust: bool,
+    rust_under_test: bool,
     crafted: &impl Fn(&mut dyn FnMut() -> u32) -> Vec<Vec<u8>>,
-) -> (&'static str, String) {
-    let towards = if to_rust {
+) -> Outcome {
+    let towards = if rust_under_test {
         link.towards_rust()
     } else {
         link.rust_out
@@ -799,7 +719,7 @@ async fn after_injection(
         Verdict::Forward
     })));
     let warm_up = link.exchange(100, 20, Duration::from_secs(10)).await;
-    assert!(warm_up.ok(), "warm-up traffic: {}", warm_up.detail());
+    warm_up.assert_ok("warm-up before injection");
     let mut next = (last.load(Ordering::Relaxed) as u32).wrapping_sub(100_000) & 0xff_ffff;
     let mut allocate = move || {
         next = next.wrapping_sub(1) & 0xff_ffff;
@@ -808,58 +728,54 @@ async fn after_injection(
     for bytes in crafted(&mut allocate) {
         link.shim.inject(towards, bytes).await;
     }
-    let exchange = link.exchange(100, 20, Duration::from_secs(10)).await;
-    let outcome = if to_rust {
-        exchange.rust()
+    if rust_under_test {
+        link.go.command("send 100 20").await;
+        let received = link.rust_receive(100, 20, Duration::from_secs(10)).await;
+        received.outcome(20)
     } else {
-        exchange.go()
-    };
-    (outcome, exchange.detail())
+        link.rust_send(100, 20).await;
+        let received = link.go.receive(100, 20, Duration::from_secs(10)).await;
+        received.outcome(20)
+    }
 }
 
-/// Injects the same crafted datagrams into Rust and into Go, in each role.
+/// Injects the same crafted datagrams into Rust and into Go playing the same role.
 async fn injection_case(
     peer: &PathBuf,
-    verdicts: &mut Verdicts,
     name: &str,
     seed: u64,
     crafted: impl Fn(&mut dyn FnMut() -> u32) -> Vec<Vec<u8>>,
 ) {
-    let mut outcomes = RoleOutcomes::default();
+    let (mut rust, mut go) = ([None; 2], [None; 2]);
     for role in ROLES {
         let mut link = Link::connect(peer, role, seed).await;
-        let (outcome, detail) = after_injection(&mut link, true, &crafted).await;
-        outcomes.rust(role, outcome, detail);
-        let mut link = Link::connect(peer, role, seed + 1).await;
-        let (outcome, detail) = after_injection(&mut link, false, &crafted).await;
-        outcomes.go(role, outcome, detail);
+        rust[role.index()] = Some(after_injection(&mut link, true, &crafted).await);
+        let mut link = Link::connect(peer, role.opposite(), seed + 1).await;
+        go[role.index()] = Some(after_injection(&mut link, false, &crafted).await);
     }
-    outcomes.check(verdicts, name);
+    assert_expected(name, rust, go);
 }
 
-/// A malformed connected datagram: a frame header announcing more payload than the
-/// datagram holds, and an ACK whose range ends before it starts.
+/// A frame header announcing more payload than the datagram holds.
 #[tokio::test(flavor = "multi_thread")]
-async fn malformed_online_datagram() {
+async fn truncated_frame_datagram() {
     let peer = require_peer!();
-    let mut verdicts = Verdicts::default();
-    injection_case(
-        &peer,
-        &mut verdicts,
-        "truncated_frame_datagram",
-        23,
-        |seq| {
-            let mut truncated = datagram(seq(), vec![]);
-            truncated.extend_from_slice(&[0x00, 0x40, 0x00, 0x01]);
-            vec![truncated]
-        },
-    )
+    injection_case(&peer, "truncated_frame_datagram", 23, |seq| {
+        let mut truncated = datagram(seq(), vec![]);
+        truncated.extend_from_slice(&[0x00, 0x40, 0x00, 0x01]);
+        vec![truncated]
+    })
     .await;
-    injection_case(&peer, &mut verdicts, "reversed_ack_range", 25, |_| {
+}
+
+/// An ACK whose range ends before it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn reversed_ack_range() {
+    let peer = require_peer!();
+    injection_case(&peer, "reversed_ack_range", 25, |_| {
         vec![vec![0xc0, 0x00, 0x01, 0x00, 9, 0, 0, 3, 0, 0]]
     })
     .await;
-    verdicts.finish();
 }
 
 fn split_frame(id: u16, count: u32, index: u32, payload: &[u8]) -> Frame {
@@ -870,80 +786,61 @@ fn split_frame(id: u16, count: u32, index: u32, payload: &[u8]) -> Frame {
     frame
 }
 
-/// Empty and count-mismatched split fragments.
+/// A split fragment with an empty payload.
 #[tokio::test(flavor = "multi_thread")]
-async fn bad_split_fragments() {
+async fn empty_split_fragment() {
     let peer = require_peer!();
-    let mut verdicts = Verdicts::default();
-    injection_case(&peer, &mut verdicts, "empty_split_fragment", 29, |seq| {
+    injection_case(&peer, "empty_split_fragment", 29, |seq| {
         vec![datagram(seq(), vec![split_frame(4001, 2, 0, &[])])]
     })
     .await;
-    injection_case(&peer, &mut verdicts, "mismatched_split_count", 31, |seq| {
+}
+
+/// Two fragments of one split that disagree on its fragment count.
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_split_count() {
+    let peer = require_peer!();
+    injection_case(&peer, "mismatched_split_count", 31, |seq| {
         vec![
             datagram(seq(), vec![split_frame(4002, 3, 0, &[1, 2, 3])]),
             datagram(seq(), vec![split_frame(4002, 4, 1, &[4, 5, 6])]),
         ]
     })
     .await;
-    verdicts.finish();
 }
 
-/// Each endpoint notices a silent peer no later than go-raknet does in the same role.
+/// How long an endpoint may take to close a silent peer before it counts as timed out:
+/// go-raknet's 5 s of silence plus up to 5 s of close drain, with margin.
+const DEAD_PEER_NOTICE: Duration = Duration::from_secs(12);
+
+/// Whether each endpoint closes a silent peer within go-raknet's bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn dead_peer_detection() {
     let peer = require_peer!();
-    let mut rust: [Option<Duration>; 2] = [None; 2];
-    let mut go: [Option<Duration>; 2] = [None; 2];
+    let (mut rust, mut go) = ([None; 2], [None; 2]);
     for role in ROLES {
+        // Neither endpoint gets any traffic, so both are observed in the same link.
         let mut link = Link::connect(&peer, role, 37).await;
         let blackhole = Impairment {
             loss_per_mille: 1000,
             ..Default::default()
         };
-        let started = Instant::now();
         link.shim.set(Direction::ToUpstream, blackhole);
         link.shim.set(Direction::ToClient, blackhole);
         let (go_closed, rust_closed) = tokio::join!(
-            async {
-                link.go
-                    .expect("closed", Duration::from_secs(40))
-                    .await
-                    .map(|_| started.elapsed())
-            },
-            async {
-                timeout(Duration::from_secs(40), link.session.recv::<Box<[u8]>>())
-                    .await
-                    .ok()
-                    .map(|_| started.elapsed())
-            },
+            link.go.expect_any(&["closed", "error"], DEAD_PEER_NOTICE),
+            timeout(DEAD_PEER_NOTICE, link.session.recv::<Box<[u8]>>()),
         );
-        rust[role.index()] = rust_closed;
-        go[role.opposite().index()] = go_closed;
+        rust[role.index()] = Some(match rust_closed {
+            Ok(Err(_)) => Closed,
+            Ok(Ok(_)) => Delivered,
+            Err(_) => TimedOut,
+        });
+        go[role.opposite().index()] = Some(if go_closed.is_some() {
+            Closed
+        } else {
+            TimedOut
+        });
     }
-    // Coarse buckets keep the observation stable; the detail keeps the exact times.
-    let secs = |t: Option<Duration>| match t.map(|t| t.as_secs()) {
-        None => "never".to_string(),
-        // go-raknet: 5 s of silence plus up to 5 s of close drain.
-        Some(9..=12) => "about 10 s".to_string(),
-        Some(t) => format!("{t}s"),
-    };
-    let mut verdicts = Verdicts::default();
-    for role in ROLES {
-        let (rust, go) = (rust[role.index()], go[role.index()]);
-        let go = go.expect("go-raknet must close a silent peer");
-        let observed = match rust {
-            Some(t) if (14..=17).contains(&t.as_secs()) => {
-                format!("rust closed at the 15 s timeout; go {}", secs(Some(go)))
-            }
-            other => format!("rust {}; go {}", secs(other), secs(Some(go))),
-        };
-        verdicts.check(
-            &case("dead_peer_detection", role),
-            rust.is_some_and(|t| t <= go + Duration::from_secs(1)),
-            &observed,
-            &format!("rust {rust:?}, go {go:?}"),
-        );
-    }
-    verdicts.finish();
+    assert_expected("dead_peer_detection", rust, go);
 }
