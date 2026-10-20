@@ -999,7 +999,7 @@ fn terminal_notification_precedes_stopping_an_exhausted_sender() {
 }
 
 #[test]
-fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
+fn receive_gap_deadline_and_reliable_splits_survive_snapshot_transfer() {
     for split in [false, true] {
         let mut receiver = session(0, 1);
         let start = domain_time();
@@ -1033,8 +1033,13 @@ fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
                 Some(RakDisconnectReason::Timeout)
             }
         );
-        assert!(receiver.inbound_spl_queue.is_empty());
-        assert_eq!(receiver.inbound_spl_bytes, 0);
+        if split {
+            assert_eq!(receiver.inbound_spl_queue[&1].len(), 1);
+            assert_eq!(receiver.inbound_spl_bytes, size_of::<Frame>() + 1);
+        } else {
+            assert!(receiver.inbound_spl_queue.is_empty());
+            assert_eq!(receiver.inbound_spl_bytes, 0);
+        }
     }
 }
 
@@ -2204,5 +2209,105 @@ fn disconnect_does_not_ack_unretained_reliable_frames() {
             disconnect_reason_of(&outputs),
             Some(RakDisconnectReason::Remote)
         );
+    }
+}
+
+/// Acknowledged split bytes remain available when the remaining fragments arrive after cleanup.
+#[test]
+fn acknowledged_reliable_split_survives_cleanup_and_delivers_once() {
+    for reliability in [RakReliability::Reliable, RakReliability::ReliableOrdered] {
+        for transfer in [false, true] {
+            let start = domain_time();
+            let mut sender = session(1, 1);
+            let mut receiver = session(2, 2);
+            let payload = vec![0xfe; 2048].into_boxed_slice();
+            sender
+                .handle(SessionInput::Send(
+                    payload.clone(),
+                    reliability,
+                    RakPriority::Immediate,
+                    start,
+                ))
+                .unwrap();
+            let first = datagrams_of(&drain_outputs(&mut sender));
+            assert_eq!(first.len(), 1);
+            let sequence = FrameSet::deserialize(&mut Cursor::new(first[0].as_ref()))
+                .unwrap()
+                .sequence;
+            receiver
+                .handle(SessionInput::Datagram(first[0].clone(), start))
+                .unwrap();
+            receiver.tick(start).unwrap();
+            deliver(&mut receiver, &mut sender, start);
+            assert!(
+                !sender.outbound_cache.contains_key(&sequence),
+                "the first fragment was acknowledged"
+            );
+            sender.tick(start + Duration::from_millis(1)).unwrap();
+            let delayed = datagrams_of(&drain_outputs(&mut sender));
+            assert!(!delayed.is_empty());
+            let retained = receiver.inbound_spl_bytes;
+            assert!(retained > 0);
+            let keepalive = start + SESSION_TIMEOUT / 2;
+            receiver
+                .handle(SessionInput::Datagram(
+                    Ack::new(vec![], false).serialized().unwrap(),
+                    keepalive,
+                ))
+                .unwrap();
+            let now = if transfer {
+                let snapshot = receiver.snapshot(keepalive);
+                let destination = start + Duration::from_secs(3600);
+                receiver = SessionEngine::restore(
+                    snapshot,
+                    destination,
+                    SESSION_TIMEOUT / 2 + Duration::from_millis(1),
+                )
+                .unwrap();
+                destination
+            } else {
+                start + SESSION_TIMEOUT + Duration::from_millis(1)
+            };
+            receiver.handle(SessionInput::Update(now)).unwrap();
+            assert_eq!(receiver.state, RakSessionState::Connected);
+            drain_outputs(&mut receiver);
+            for bytes in &delayed {
+                receiver
+                    .handle(SessionInput::Datagram(bytes.clone(), now))
+                    .unwrap();
+            }
+            receiver.tick(now).unwrap();
+            let outputs = drain_outputs(&mut receiver);
+            let delivered: Vec<_> = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    RakSessionOutput::Packet(bytes) => Some(bytes.clone()),
+                    _ => None,
+                })
+                .collect();
+            for bytes in datagrams_of(&outputs) {
+                sender.handle(SessionInput::Datagram(bytes, now)).unwrap();
+            }
+            assert_eq!(
+                sender.outbound_bytes(),
+                0,
+                "the remaining fragments were acknowledged too"
+            );
+            assert_eq!(delivered, vec![payload]);
+            assert_eq!(receiver.inbound_spl_bytes, 0);
+            assert!(receiver.inbound_spl_queue.is_empty());
+            for bytes in delayed {
+                receiver
+                    .handle(SessionInput::Datagram(
+                        bytes,
+                        now + Duration::from_millis(1),
+                    ))
+                    .unwrap();
+            }
+            assert!(
+                packets(&mut receiver).is_empty(),
+                "retries must not deliver the message twice"
+            );
+        }
     }
 }

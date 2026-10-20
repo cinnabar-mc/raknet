@@ -28,16 +28,19 @@ pub(super) fn frame_cost(frame: &Frame) -> usize {
 }
 
 impl SessionEngine {
-    /// Releases abandoned reassemblies without ending an otherwise active session.
+    /// Releases abandoned unreliable splits while preserving acknowledged reliable fragments.
     pub(super) fn evict_stale_splits(&mut self, now: Instant) {
         let last = &self.inbound_spl_last;
         let mut freed = 0;
         self.inbound_spl_queue.retain(|split_id, fragments| {
-            let fresh = now < split_deadline(last.get(split_id), now);
-            if !fresh {
+            let keep = now < split_deadline(last.get(split_id), now)
+                || fragments
+                    .values()
+                    .any(|frame| frame.reliability.is_reliable());
+            if !keep {
                 freed += fragments.values().map(frame_cost).sum::<usize>();
             }
-            fresh
+            keep
         });
         let queue = &self.inbound_spl_queue;
         self.inbound_spl_last
