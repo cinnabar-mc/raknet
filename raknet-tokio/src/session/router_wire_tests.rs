@@ -790,3 +790,6 @@ async fn final_receive_refusal_cannot_admit_a_successor_after_a_freed_prefix_slo
         "final delivery resumed after its refused front when an old prefix slot was freed"
     );
 }
+
+#[path = "final_receive_byte_tests.rs"]
+mod final_receive_byte_tests;
