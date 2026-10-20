@@ -499,7 +499,8 @@ impl SessionEngine {
             HashSet::new()
         };
 
-        let mut frames = Vec::new();
+        let queued = self.outbound_queue.iter().map(VecDeque::len).sum::<usize>();
+        let mut frames = Vec::with_capacity(queued.min(4));
         for queue in &mut self.outbound_queue {
             while let Some(frame) = queue.pop_front_if(|f| {
                 f.size_hint() <= bandwidth
@@ -523,9 +524,13 @@ impl SessionEngine {
             return Ok(());
         };
 
-        let sets = self.make_sets(frames);
-        for set in sets {
+        if frames.len() == 1 && frames[0].size_hint() <= (self.mtu - DGRAM_HEADER_SIZE) as usize {
+            let set = self.next_frame_set(frames);
             self.send_frame_set(set, false, true, now)?;
+        } else {
+            for set in self.make_sets(frames) {
+                self.send_frame_set(set, false, true, now)?;
+            }
         }
         Ok(())
     }
@@ -587,14 +592,7 @@ impl SessionEngine {
             }
 
             if size + frame_size > max {
-                sets.push(FrameSet {
-                    sequence: self.outbound_seq,
-                    frames: take(&mut batch),
-                    continuous_send: false,
-                    needs_b_and_as: false,
-                    is_pair: false,
-                });
-                self.outbound_seq = u24::add(self.outbound_seq, 1);
+                sets.push(self.next_frame_set(take(&mut batch)));
 
                 size = DGRAM_HEADER_SIZE as usize;
             }
@@ -604,17 +602,17 @@ impl SessionEngine {
         }
 
         if !batch.is_empty() {
-            sets.push(FrameSet {
-                sequence: self.outbound_seq,
-                frames: batch,
-                continuous_send: false,
-                needs_b_and_as: false,
-                is_pair: false,
-            });
-            self.outbound_seq = u24::add(self.outbound_seq, 1);
+            sets.push(self.next_frame_set(batch));
         }
 
         sets
+    }
+
+    /// Assigns one datagram sequence while retaining the caller's frame allocation.
+    fn next_frame_set(&mut self, frames: Vec<Frame>) -> FrameSet {
+        let set = FrameSet::new(self.outbound_seq, frames, false, false, false);
+        self.outbound_seq = u24::add(self.outbound_seq, 1);
+        set
     }
 
     /// Installs live feedback flags and charges retained reliable encapsulations once.
@@ -689,7 +687,8 @@ impl SessionEngine {
         let mut reliability = frame.reliability;
         let mut split_id = 0;
 
-        let payloads = if frame.size_hint() > max_size {
+        let split = frame.size_hint() > max_size;
+        let split_size = if split {
             reliability = match reliability {
                 RakReliability::Unreliable => RakReliability::Reliable,
                 RakReliability::UnreliableSequenced => RakReliability::ReliableSequenced,
@@ -698,19 +697,9 @@ impl SessionEngine {
             };
             split_id = self.outbound_spl;
             self.outbound_spl = self.outbound_spl.wrapping_add(1);
-
-            let split_size = frame.payload.len().div_ceil(max_size);
-
-            let mut payloads = Vec::with_capacity(split_size);
-            for i in 0..split_size {
-                let start = i * max_size;
-                let end = min(start + max_size, frame.payload.len());
-
-                payloads.push(frame.payload[start..end].into());
-            }
-            payloads
+            frame.payload.len().div_ceil(max_size)
         } else {
-            vec![frame.payload]
+            1
         };
 
         let mut ord_idx = 0;
@@ -739,28 +728,33 @@ impl SessionEngine {
             self.outbound_seq_idx[order_channel as usize] = 0;
         }
 
-        let split_size = payloads.len();
-        payloads
-            .into_iter()
+        let mut prepare = |(i, payload)| Frame {
+            reliability,
+            payload,
+            reliable_index: match reliability.is_reliable() {
+                true => {
+                    let val = self.outbound_rel;
+                    self.outbound_rel = u24::add(val, 1);
+                    val
+                }
+                false => 0,
+            },
+            sequence_index: seq_idx,
+            order_index: ord_idx,
+            order_channel,
+            split_size: if split_size > 1 { split_size as u32 } else { 0 },
+            split_id,
+            split_index: i as u32,
+        };
+        if !split {
+            return vec![prepare((0, frame.payload))];
+        }
+        frame
+            .payload
+            .chunks(max_size)
+            .map(Box::<[u8]>::from)
             .enumerate()
-            .map(|(i, payload)| Frame {
-                reliability,
-                payload,
-                reliable_index: match reliability.is_reliable() {
-                    true => {
-                        let val = self.outbound_rel;
-                        self.outbound_rel = u24::add(val, 1);
-                        val
-                    }
-                    false => 0,
-                },
-                sequence_index: seq_idx,
-                order_index: ord_idx,
-                order_channel,
-                split_size: if split_size > 1 { split_size as u32 } else { 0 },
-                split_id,
-                split_index: i as u32,
-            })
+            .map(prepare)
             .collect()
     }
 

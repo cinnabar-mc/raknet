@@ -4,12 +4,9 @@ use crate::server::bounded_delivery_tests::{
     PROGRESS_WATCHDOG, RECEIVE_BYTES, client, server, step,
 };
 
-/// Reads the original client socket without driving session timers.
-pub(crate) fn receive_datagram(
-    client: &super::RakClient,
-    buffer: &mut [u8],
-) -> std::io::Result<usize> {
-    client.socket.recv(buffer)
+/// Borrows the original client socket without driving session timers.
+pub(crate) fn socket(client: &super::RakClient) -> &std::net::UdpSocket {
+    &client.socket
 }
 
 #[test]
