@@ -28,18 +28,14 @@ pub(super) fn frame_cost(frame: &Frame) -> usize {
 }
 
 impl SessionEngine {
-    /// Releases expired reassemblies and reports lost acknowledged fragment state.
-    pub(super) fn evict_stale_splits(&mut self, now: Instant) -> bool {
+    /// Releases abandoned reassemblies without ending an otherwise active session.
+    pub(super) fn evict_stale_splits(&mut self, now: Instant) {
         let last = &self.inbound_spl_last;
         let mut freed = 0;
-        let mut stale = false;
         self.inbound_spl_queue.retain(|split_id, fragments| {
             let fresh = now < split_deadline(last.get(split_id), now);
             if !fresh {
                 freed += fragments.values().map(frame_cost).sum::<usize>();
-                stale |= fragments
-                    .values()
-                    .any(|frame| frame.reliability.is_reliable());
             }
             fresh
         });
@@ -54,7 +50,6 @@ impl SessionEngine {
                 freed, self.addr
             );
         }
-        stale
     }
 
     /// Acknowledges a datagram only when every reliable frame was retained or delivered.
@@ -143,18 +138,9 @@ impl SessionEngine {
             .map(|(since, _)| since + SESSION_TIMEOUT)
     }
 
-    /// Reports the same reliable-input expirations without evicting retained data.
-    pub(super) fn receive_deadline(&self, now: Instant) -> Option<Instant> {
-        self.inbound_spl_queue
-            .iter()
-            .filter(|(_, fragments)| {
-                fragments
-                    .values()
-                    .any(|frame| frame.reliability.is_reliable())
-            })
-            .map(|(id, _)| split_deadline(self.inbound_spl_last.get(id), now))
-            .chain(self.stall_deadline())
-            .min()
+    /// Reports the terminal reliable-gap deadline; split eviction does not terminate the session.
+    pub(super) fn receive_deadline(&self) -> Option<Instant> {
+        self.stall_deadline()
     }
 
     /// Reports a gap with no delivery progress for the session timeout.
@@ -398,8 +384,11 @@ impl SessionEngine {
         }
 
         if let Some(reason) = self.split_violation(&frame) {
-            debug!("closing session with {}, {}", self.addr, reason);
-            return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
+            if frame.split_size > MAX_SPLIT_COUNT {
+                return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
+            }
+            debug!("dropping fragment from {}, {}", self.addr, reason);
+            return Ok(());
         }
 
         let split_id = frame.split_id;
@@ -457,9 +446,6 @@ impl SessionEngine {
 
     /// Identifies invalid fragment metadata against an existing reassembly.
     pub(super) fn split_violation(&self, frame: &Frame) -> Option<&'static str> {
-        if frame.payload.is_empty() {
-            return Some("empty split fragment");
-        }
         if frame.split_size > MAX_SPLIT_COUNT {
             return Some("split count exceeds the maximum");
         }

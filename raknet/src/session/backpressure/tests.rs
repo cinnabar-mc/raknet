@@ -235,7 +235,7 @@ fn backpressure_retains_acknowledged_fragments_until_final_fragment_retry() {
 #[test]
 fn backpressure_preserves_canonical_invalid_ack_and_control_errors() {
     for backpressured in [false, true] {
-        let (mut sender, mut receiver, now) = connected_pair();
+        let (mut receiver, mut sender, now) = connected_pair();
         let invalid_ack = Box::from([flags::VALID | flags::ACK | flags::NACK]);
         let input = RakSessionInput::Datagram(invalid_ack, now);
         let error = if backpressured {
@@ -356,6 +356,9 @@ fn backpressure_keeps_ordered_disconnect_behind_the_refused_application() {
         receiver.poll(),
         Some(RakSessionOutput::Packet(bytes)) if bytes.as_ref() == [0xfe, 9]
     ));
+    assert!(
+        matches!(receiver.poll_control(), Some(RakSessionOutput::Datagram(bytes, _)) if bytes[0] & flags::ACK != 0)
+    );
     assert!(matches!(
         receiver.poll_control(),
         Some(RakSessionOutput::Disconnected(
@@ -418,6 +421,9 @@ fn control_poll_preserves_packet_fifo_and_terminal_capture_ownership() {
             .handle_backpressured(RakSessionInput::Datagram(bytes, now))
             .unwrap();
     }
+    assert!(
+        matches!(receiver.poll_control(), Some(RakSessionOutput::Datagram(bytes, _)) if bytes[0] & flags::ACK != 0)
+    );
     assert!(matches!(
         receiver.poll_control(),
         Some(RakSessionOutput::Disconnected(

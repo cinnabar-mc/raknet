@@ -320,7 +320,7 @@ fn disconnect_reason_matches_cause() {
     );
 
     session
-        .handle(SessionInput::Disconnect(domain_time()))
+        .handle(SessionInput::DisconnectNow(domain_time()))
         .unwrap();
 
     let reason = session
@@ -644,21 +644,21 @@ fn a_hundred_interleaved_splits_are_reassembled() {
 }
 
 #[test]
-fn empty_split_fragment_closes_the_session() {
+fn empty_split_fragment_keeps_the_session() {
     let mut session = session(0, 1);
-
+    let now = domain_time();
+    session.handle_frame(fragment(1, 2, 0, &[]), now).unwrap();
     session
-        .handle_frame(fragment(1, 2, 0, &[]), domain_time())
+        .handle_frame(fragment(1, 2, 1, &[0xFE]), now)
         .unwrap();
-
-    assert!(session.inbound_spl_queue.is_empty());
-    assert_closed_for_violation(&session);
+    assert_eq!(packets(&mut session), vec![Box::from([0xFE])]);
+    assert_eq!(session.state, RakSessionState::Connected);
+    assert_eq!(session.inbound_spl_bytes, 0);
 }
 
 #[test]
-fn split_size_mismatch_closes_the_session() {
+fn split_size_mismatch_preserves_the_original_reassembly() {
     let mut session = session(0, 1);
-
     let now = domain_time();
     session
         .handle_frame(fragment(1, 3, 0, &[0xFE]), now)
@@ -666,8 +666,11 @@ fn split_size_mismatch_closes_the_session() {
     session
         .handle_frame(fragment(1, 2, 1, &[0xFF]), now)
         .unwrap();
-
-    assert_closed_for_violation(&session);
+    session.handle_frame(fragment(1, 3, 1, &[1]), now).unwrap();
+    session.handle_frame(fragment(1, 3, 2, &[2]), now).unwrap();
+    assert_eq!(packets(&mut session), vec![Box::from([0xFE, 1, 2])]);
+    assert_eq!(session.state, RakSessionState::Connected);
+    assert_eq!(session.inbound_spl_bytes, 0);
 }
 
 #[test]
@@ -1024,8 +1027,14 @@ fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
         receiver.handle(SessionInput::Update(destination)).unwrap();
         assert_eq!(
             disconnect_reason(&receiver),
-            Some(RakDisconnectReason::Timeout)
+            if split {
+                None
+            } else {
+                Some(RakDisconnectReason::Timeout)
+            }
         );
+        assert!(receiver.inbound_spl_queue.is_empty());
+        assert_eq!(receiver.inbound_spl_bytes, 0);
     }
 }
 
@@ -1262,8 +1271,16 @@ fn close_sends_queued_data_and_waits_for_ack() {
             .any(|payload| payload.first() == Some(&0x15)),
         "disconnect notice was not sent"
     );
+    assert_eq!(disconnect_reason_of(&outputs), None);
+    for buf in datagrams_of(&outputs) {
+        b.handle(SessionInput::Datagram(buf, t0 + Duration::from_millis(20)))
+            .unwrap();
+    }
+    deliver(&mut b, &mut a, t0 + Duration::from_millis(20));
+    a.handle(SessionInput::Update(t0 + Duration::from_millis(30)))
+        .unwrap();
     assert_eq!(
-        disconnect_reason_of(&outputs),
+        disconnect_reason_of(&drain_outputs(&mut a)),
         Some(RakDisconnectReason::Requested)
     );
 }
@@ -2051,5 +2068,140 @@ fn admitted_retransmission_clears_a_transient_reliable_deferral() {
         receiver.state,
         RakSessionState::Connected,
         "a delivered deferred message must not retain a spurious stall obligation"
+    );
+}
+
+/// A local close must keep its reliable notification alive across repeated loss.
+#[test]
+fn close_retries_notification_until_acked() {
+    let mut sender = session(1, 1);
+    let start = domain_time();
+    sender.handle(SessionInput::Disconnect(start)).unwrap();
+    let initial = drain_outputs(&mut sender);
+    assert!(payloads_of(&initial).iter().any(|p| p.as_ref() == [0x15]));
+    assert_eq!(disconnect_reason_of(&initial), None);
+    let mut due = sender.outbound_resend.peek().unwrap().0.0;
+    let mut received_at = start;
+    for _ in 0..2 {
+        received_at = due;
+        sender.handle(SessionInput::Update(due)).unwrap();
+        let retried = drain_outputs(&mut sender);
+        assert!(payloads_of(&retried).iter().any(|p| p.as_ref() == [0x15]));
+        assert_eq!(disconnect_reason_of(&retried), None);
+        due = sender.outbound_resend.peek().unwrap().0.0;
+    }
+    let sequences = sender.outbound_cache.keys().copied().collect();
+    sender
+        .handle(SessionInput::Datagram(
+            Ack::new(sequences, false).serialized().unwrap(),
+            received_at,
+        ))
+        .unwrap();
+    sender.handle(SessionInput::Update(received_at)).unwrap();
+    assert_eq!(
+        disconnect_reason_of(&drain_outputs(&mut sender)),
+        Some(RakDisconnectReason::Requested)
+    );
+}
+
+/// Silence has a fixed ten-second cutoff, renewed by admitted traffic.
+#[test]
+fn peer_timeout_is_ten_seconds_after_last_input() {
+    let mut receiver = session(0, 1);
+    let start = domain_time();
+    receiver
+        .handle(SessionInput::Update(start + Duration::from_millis(9999)))
+        .unwrap();
+    assert_eq!(receiver.state, RakSessionState::Connected);
+    receiver
+        .handle(SessionInput::Update(start + Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        disconnect_reason(&receiver),
+        Some(RakDisconnectReason::Timeout)
+    );
+}
+
+/// Validation discards the whole datagram and preserves each endpoint's error policy.
+#[test]
+fn malformed_framing_respects_role_and_admission_after_transfer() {
+    let start = domain_time();
+    let valid = FrameSet::new(0, unreliable(0), false, false, false)
+        .serialized()
+        .unwrap();
+    for server in [false, true] {
+        for admit in [false, true] {
+            let mut receiver = session(0, 1);
+            receiver.reject_malformed = server;
+            let json = facet_json::to_string(&receiver.snapshot(start)).unwrap();
+            let mut receiver =
+                SessionEngine::restore(facet_json::from_str(&json).unwrap(), start, Duration::ZERO)
+                    .unwrap();
+            let mut malformed = valid.to_vec();
+            malformed.extend_from_slice(&[0, 0x40, 0, 1]);
+            assert!(
+                receiver
+                    .handle_datagram(malformed.into(), start, admit)
+                    .is_err()
+            );
+            let outputs = drain_outputs(&mut receiver);
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|out| matches!(out, RakSessionOutput::Packet(_)))
+            );
+            assert_eq!(
+                disconnect_reason_of(&outputs),
+                server.then_some(RakDisconnectReason::ProtocolViolation)
+            );
+        }
+    }
+}
+
+/// A transferred closer must retry the original notification without creating another ordered message.
+#[test]
+fn closing_snapshot_preserves_notification_retry() {
+    let start = domain_time();
+    let mut sender = session(1, 1);
+    sender.handle(SessionInput::Disconnect(start)).unwrap();
+    drain_outputs(&mut sender);
+    let reliable = sender.outbound_rel;
+    let json = facet_json::to_string(&sender.snapshot(start)).unwrap();
+    let mut sender =
+        SessionEngine::restore(facet_json::from_str(&json).unwrap(), start, Duration::ZERO)
+            .unwrap();
+    assert!(sender.disconnect_sent);
+    let due = sender.outbound_resend.peek().unwrap().0.0;
+    sender.handle(SessionInput::Update(due)).unwrap();
+    assert!(
+        payloads_of(&drain_outputs(&mut sender))
+            .iter()
+            .any(|p| p.as_ref() == [0x15])
+    );
+    assert_eq!(sender.outbound_rel, reliable);
+}
+
+/// A remote close cannot acknowledge reliable application input refused in the same datagram.
+#[test]
+fn disconnect_does_not_ack_a_refused_reliable_prefix() {
+    let mut receiver = session(0, 1);
+    let now = domain_time();
+    let input = datagram_at(
+        0,
+        vec![
+            Frame::new(RakReliability::Reliable, Box::from([0xfe])),
+            Frame::new(RakReliability::Unreliable, Box::from([0x15])),
+        ],
+        now,
+    );
+    let SessionInput::Datagram(bytes, _) = input else {
+        unreachable!()
+    };
+    receiver.handle_datagram(bytes, now, false).unwrap();
+    let outputs = drain_outputs(&mut receiver);
+    assert!(datagrams_of(&outputs).is_empty());
+    assert_eq!(
+        disconnect_reason_of(&outputs),
+        Some(RakDisconnectReason::Remote)
     );
 }

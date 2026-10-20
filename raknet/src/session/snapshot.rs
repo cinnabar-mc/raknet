@@ -28,6 +28,10 @@ pub(crate) struct SessionSnapshot {
     pub guid: u64,
     pub mtu: u16,
     pub config: RakSessionConfig,
+    #[facet(default)]
+    pub disconnect_sent: bool,
+    #[facet(default)]
+    pub reject_malformed: bool,
 
     /// Endpoint uptime when this snapshot was captured.
     pub captured_uptime_ms: u64,
@@ -90,6 +94,8 @@ impl SessionEngine {
             guid: self.guid,
             mtu: self.mtu,
             config: self.config.clone(),
+            disconnect_sent: self.disconnect_sent,
+            reject_malformed: self.reject_malformed,
 
             captured_uptime_ms: clock.timestamp(now),
             last_tick_ms: clock.timestamp(self.last_tick),
@@ -202,6 +208,8 @@ impl SessionEngine {
             guid: snapshot.guid,
             mtu: snapshot.mtu,
             config: snapshot.config,
+            disconnect_sent: snapshot.disconnect_sent,
+            reject_malformed: snapshot.reject_malformed,
             clock,
 
             last_tick: at(snapshot.last_tick_ms)?,

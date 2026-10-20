@@ -2,7 +2,7 @@
 
 use super::input::SessionInput;
 use super::lifecycle::RakSessionInput;
-use super::output::RakSessionOutput;
+use super::output::{RakDisconnectReason, RakSessionOutput};
 use super::ranges;
 use super::{Frame, ORDER_WINDOW, RakSessionError, RakSessionState, Sans, SessionEngine};
 use crate::util::{flags, packet_id, u24};
@@ -57,15 +57,21 @@ impl SessionEngine {
             return Ok(());
         };
         let mut cursor = Cursor::new(bytes.as_ref());
-        match header {
-            _ if header & flags::VALID == 0 => debug!(
-                "received unknown online packet {:#04X} from {}",
-                header, self.addr
-            ),
-            _ if header & (flags::ACK | flags::NACK) != 0 => self.handle_ack(&mut cursor, now)?,
-            _ => self.handle_frame_set(&mut cursor, now, admit_application)?,
+        let result = match header {
+            _ if header & flags::VALID == 0 => {
+                debug!(
+                    "received unknown online packet {:#04X} from {}",
+                    header, self.addr
+                );
+                Ok(())
+            }
+            _ if header & (flags::ACK | flags::NACK) != 0 => self.handle_ack(&mut cursor, now),
+            _ => self.handle_frame_set(&mut cursor, now, admit_application),
+        };
+        if result.is_err() && self.reject_malformed {
+            self.disconnect(true, RakDisconnectReason::ProtocolViolation, now)?;
         }
-        Ok(())
+        result
     }
 
     /// Skips only the already-seen application prefix, never rescanning it per tick.

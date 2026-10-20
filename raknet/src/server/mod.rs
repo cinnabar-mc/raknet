@@ -398,7 +398,7 @@ impl ServerEngine {
 
             let (_, session) = entry.get_mut();
 
-            session.handle(SessionInput::Datagram(buf, now))?;
+            let handled = session.handle(SessionInput::Datagram(buf, now));
 
             while let Some(msg) = session.poll() {
                 match msg {
@@ -447,6 +447,7 @@ impl ServerEngine {
                 return Ok(());
             }
 
+            handled?;
             if success {
                 let (_, session) = entry.remove();
 
@@ -631,7 +632,7 @@ impl ServerEngine {
         self.session_map.insert(addr, id);
         self.session_addr.insert(id, addr);
 
-        let session = SessionEngine::new(
+        let mut session = SessionEngine::new(
             id,
             addr,
             request.client,
@@ -641,6 +642,7 @@ impl ServerEngine {
             self.config.session.clone(),
         );
 
+        session.reject_malformed = true;
         self.session_pending.insert(addr, (now, session));
 
         Ok(())

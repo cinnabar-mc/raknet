@@ -69,16 +69,13 @@ impl RakCodec for FrameSet {
 
         let mut frames = Vec::new();
         loop {
-            match Frame::deserialize(reader) {
-                Ok(frame) => frames.push(frame),
-                Err(RakCodecError::IOError(e)) => {
-                    if matches!(e.kind(), ErrorKind::UnexpectedEof) {
-                        break;
-                    } else {
-                        return Err(RakCodecError::IOError(e));
-                    }
-                }
-                Err(e) => return Err(e),
+            let mut header = [0];
+            match reader.read_exact(&mut header) {
+                Ok(()) => frames.push(Frame::deserialize(
+                    &mut header.as_slice().chain(&mut *reader),
+                )?),
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
             }
         }
 
