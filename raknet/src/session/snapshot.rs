@@ -254,6 +254,7 @@ impl SessionEngine {
             inbound_seq_idx: snapshot.inbound_seq_idx,
 
             output: VecDeque::new(),
+            control_cursor: 0,
         })
     }
 }

@@ -1,4 +1,5 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
+mod backpressure;
 pub mod config;
 pub mod congestion_controller;
 pub mod error;
@@ -27,7 +28,10 @@ use crate::types::priority::RakPriority;
 use crate::types::reliability::RakReliability;
 use crate::util::constants::{DGRAM_HEADER_SIZE, DGRAM_MTU_OVERHEAD, UDP_HEADER_SIZE};
 use crate::util::socket_addr::get_overhead;
-use crate::util::{flags, packet_id, u24};
+use crate::util::u24;
+#[cfg(test)]
+use crate::util::{flags, packet_id};
+use backpressure::ConnectionControl;
 use config::RakSessionConfig;
 use state::RakSessionState;
 use std::cmp::{Reverse, min};
@@ -108,6 +112,7 @@ pub(crate) struct SessionEngine {
     inbound_stall: Option<(Instant, u64)>,
 
     output: VecDeque<RakSessionOutput>,
+    control_cursor: usize,
 }
 
 impl Sans for SessionEngine {
@@ -121,25 +126,7 @@ impl Sans for SessionEngine {
         }
 
         match msg {
-            SessionInput::Datagram(buf, now) => {
-                self.last_recv = now;
-
-                let Some(&b) = buf.first() else {
-                    return Ok(());
-                };
-
-                let mut cursor = Cursor::new(buf.as_ref());
-                match b {
-                    _ if b & flags::VALID == 0 => debug!(
-                        "received unknown online packet {:#04X} from {}",
-                        b, self.addr
-                    ),
-                    _ if b & (flags::ACK | flags::NACK) != 0 => {
-                        self.handle_ack(&mut cursor, now)?
-                    }
-                    _ => self.handle_frame_set(&mut cursor, now)?,
-                }
-            }
+            SessionInput::Datagram(buf, now) => self.handle_datagram(buf, now, true)?,
             SessionInput::Send(..) if self.state == RakSessionState::Closing => {
                 return Err(RakSessionError::Closed);
             }
@@ -170,7 +157,9 @@ impl Sans for SessionEngine {
     }
 
     fn poll(&mut self) -> Option<Self::Output> {
-        self.output.pop_front()
+        let output = self.output.pop_front()?;
+        self.control_cursor = self.control_cursor.saturating_sub(1);
+        Some(output)
     }
 }
 
@@ -241,6 +230,7 @@ impl SessionEngine {
             inbound_stall: None,
 
             output: VecDeque::new(),
+            control_cursor: 0,
         }
     }
 
@@ -815,19 +805,18 @@ impl SessionEngine {
         buf: &[u8],
         now: Instant,
     ) -> Result<bool, RakSessionError> {
-        let Some(&id) = buf.first() else {
+        let Some(control) = ConnectionControl::classify(buf) else {
             return Ok(false);
         };
         let mut cursor = Cursor::new(buf);
-        match id {
-            packet_id::CONNECTED_PING => self.handle_connected_ping(&mut cursor, now)?,
-            packet_id::CONNECTED_PONG => self.handle_connected_pong(&mut cursor, now)?,
-            packet_id::DETECT_LOST_CONNECTIONS if self.state == RakSessionState::Closing => {}
-            packet_id::DETECT_LOST_CONNECTIONS => {
+        match control {
+            ConnectionControl::Ping => self.handle_connected_ping(&mut cursor, now)?,
+            ConnectionControl::Pong => self.handle_connected_pong(&mut cursor, now)?,
+            ConnectionControl::DetectLost if self.state == RakSessionState::Closing => {}
+            ConnectionControl::DetectLost => {
                 self.send_connected_ping(now, RakReliability::ReliableOrdered)?
             }
-            packet_id::DISCONNECT => self.handle_disconnect(&mut cursor, now)?,
-            _ => return Ok(false),
+            ConnectionControl::Disconnect => self.handle_disconnect(&mut cursor, now)?,
         }
         Ok(true)
     }
