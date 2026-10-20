@@ -141,8 +141,13 @@ canceling an admitted reply wait does not retract its send. A body larger than
 that entire byte budget returns `MessageSizeExceeded` before commitment, even
 when the negotiated message limit is larger. Close bypasses a full command FIFO,
 seals new sends, and retains earlier committed work under the first close cutoff.
-Accepted-session and datagram channels still need separate bounds. These are
-per-stage storage bounds, not an aggregate byte or RSS limit.
+A server's original `max_connections` reservation follows its accepted handle,
+including unread retired data and terminal metadata, until final `finish` or
+whole-handle drop. Lowering the setting or setting it to zero changes only future
+admission. Network retirement removes the dead route promptly; its weak reservation
+does not retain the handle or its payload. Datagram channels and final receive
+byte accounting still need separate bounds. These are per-stage storage bounds,
+not an aggregate byte or RSS limit.
 
 Running Tokio server setters return `Result` with `TrySendError::Full(input)` or
 `Closed(input)` when the original FIFO cannot admit a control. Rejected

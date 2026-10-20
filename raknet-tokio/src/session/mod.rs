@@ -5,6 +5,7 @@ mod command;
 mod driver;
 
 use admission::{ActorAdmission, Admission};
+pub(crate) use admission::{SessionLifetime, SessionRetirement};
 use command::RakSessionMsg;
 use driver::Driver;
 use raknet::prelude::*;
@@ -208,6 +209,11 @@ fn spawn<S: SessionPhase>(
 }
 
 impl<S: SessionPhase> RakSession<S> {
+    /// Observes the original allocation without retaining its public or actor ownership.
+    pub(crate) fn lifetime(&self, retirement: &Arc<SessionRetirement>) -> SessionLifetime {
+        self.admission.lifetime(retirement)
+    }
+
     /// Receives complete messages, retaining the prefix before terminal failure.
     pub async fn recv<T>(&mut self) -> Result<T, RakSessionError>
     where
@@ -369,3 +375,6 @@ mod admission_tests;
 
 #[cfg(test)]
 mod accepted_lifetime_tests;
+
+#[cfg(test)]
+mod lifetime_tests;
