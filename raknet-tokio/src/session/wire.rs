@@ -41,6 +41,30 @@ impl Datagram {
     }
 }
 
+/// The one physical send head retains either its original route credit or core-owned bytes.
+pub(crate) enum SendDatagram {
+    Session(Datagram),
+    Socket(Box<[u8]>, SocketAddr),
+}
+
+impl SendDatagram {
+    /// Borrows the same encoded allocation while socket readiness or stop is pending.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Session(datagram) => datagram.bytes(),
+            Self::Socket(bytes, _) => bytes,
+        }
+    }
+
+    /// Keeps the original destination through route retirement and canceled send polls.
+    pub(crate) fn peer(&self) -> SocketAddr {
+        match self {
+            Self::Session(datagram) => datagram.peer(),
+            Self::Socket(_, peer) => *peer,
+        }
+    }
+}
+
 /// Constructs the single existing endpoint queue with its canonical message bound.
 pub(crate) fn datagrams() -> (Sender<Datagram>, Receiver<Datagram>) {
     channel(constants::MAX_RECEIVE_MESSAGES)
