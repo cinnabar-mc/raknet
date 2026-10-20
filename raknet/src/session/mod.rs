@@ -54,6 +54,8 @@ impl RakSessionId {
 }
 
 const DATAGRAM_WINDOW: usize = 2048;
+const MAX_DATAGRAM_GAP: i32 = 50_000;
+const MAX_DATAGRAM_SKIPS: i32 = 1000;
 const ORDER_WINDOW: usize = 2048;
 const MAX_SPLIT_COUNT: u32 = 8192;
 const MAX_OUTBOUND_SPLIT_COUNT: usize = 2048;

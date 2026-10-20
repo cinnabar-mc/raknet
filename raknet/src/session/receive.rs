@@ -4,8 +4,8 @@ use super::error::RakSessionError;
 use super::output::RakDisconnectReason;
 use super::state::RakSessionState;
 use super::{
-    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_SPLIT_COUNT, ORDER_WINDOW, SESSION_TIMEOUT,
-    SessionEngine, ranges,
+    DATAGRAM_WINDOW, MAX_CONCURRENT_SPLITS, MAX_DATAGRAM_GAP, MAX_DATAGRAM_SKIPS, MAX_SPLIT_COUNT,
+    ORDER_WINDOW, SESSION_TIMEOUT, SessionEngine, ranges,
 };
 use crate::protocol::codec::RakCodec;
 use crate::protocol::packets::frame_set::FrameSet;
@@ -67,7 +67,7 @@ impl SessionEngine {
         let set = FrameSet::deserialize(buf)?;
 
         let ahead = u24::distance(self.inbound_seq, set.sequence);
-        if ahead >= DATAGRAM_WINDOW as i32 {
+        if ahead > MAX_DATAGRAM_GAP {
             debug!(
                 "dropping FrameSet {} from {}, too far ahead of {}",
                 set.sequence, self.addr, self.inbound_seq
@@ -91,7 +91,8 @@ impl SessionEngine {
                 set.sequence, self.addr, self.inbound_seq
             );
         } else {
-            let mut missing = self.inbound_seq;
+            let skipped = ahead.min(MAX_DATAGRAM_SKIPS) as u32;
+            let mut missing = set.sequence.wrapping_sub(skipped) & u24::MASK;
             while missing != set.sequence && self.sequences_lost.len() < DATAGRAM_WINDOW {
                 self.sequences_lost.insert(missing);
                 missing = u24::add(missing, 1);

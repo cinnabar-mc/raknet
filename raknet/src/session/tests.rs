@@ -451,11 +451,26 @@ fn datagram_gap_preserves_forward_progress_and_recent_loss_feedback() {
 }
 
 #[test]
+fn datagram_gap_at_acceptance_limit_advances() {
+    let mut session = session(0, 1);
+    let sequence = MAX_DATAGRAM_GAP as u32;
+
+    session.handle(datagram(sequence, unreliable(0))).unwrap();
+
+    assert_eq!(session.inbound_seq, u24::add(sequence, 1));
+    assert_eq!(packets(&mut session), vec![Box::<[u8]>::from([0xFE, 0])]);
+    let expected = (1..=1000)
+        .map(|index| sequence - index)
+        .collect::<HashSet<_>>();
+    assert_eq!(session.sequences_lost, expected);
+}
+
+#[test]
 fn datagram_beyond_window_is_dropped() {
     let mut session = session(0, 1);
 
     session
-        .handle(datagram(DATAGRAM_WINDOW as u32 * 50, unreliable(0)))
+        .handle(datagram(MAX_DATAGRAM_GAP as u32 + 1, unreliable(0)))
         .unwrap();
 
     assert!(
