@@ -25,7 +25,7 @@ func parityRepoPath(tb testing.TB, parts ...string) string {
 	tb.Helper()
 	root := os.Getenv("RAKNET_REPO_ROOT")
 	if root == "" {
-		tb.Skip("missing fixture RAKNET_REPO_ROOT: run through `go run ./cmd/inpkg`")
+		tb.Fatal("missing fixture RAKNET_REPO_ROOT: run through `go run ./cmd/inpkg`")
 	}
 	return filepath.Join(append([]string{root}, parts...)...)
 }

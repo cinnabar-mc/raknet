@@ -220,6 +220,8 @@ func BenchmarkSplit(b *testing.B) {
 				if message, ok := conn.packets.Recv(ctx); !ok || len(message) != n*paritySplitFragment {
 					b.Fatalf("reassembled %d bytes", len(message))
 				}
+				// Acknowledge the run inline, as the Rust bench ticks its session.
+				conn.flushACKs()
 			}
 		})
 	}
