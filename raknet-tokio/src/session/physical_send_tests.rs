@@ -62,6 +62,13 @@ pub(crate) fn capture(stop: &Arc<StopState>) -> Option<Arc<SendGate>> {
         .ok()
 }
 
+/// Keeps the synchronous writer behind the same explicit physical-send hold.
+pub(crate) fn is_held(gate: &Option<Arc<SendGate>>) -> bool {
+    gate.as_ref().is_some_and(|gate| {
+        gate.armed.load(Ordering::Acquire) && !gate.released.load(Ordering::Acquire)
+    })
+}
+
 /// Pauses immediately before the original socket call; release still performs that real call.
 pub(crate) async fn before_send(gate: &Option<Arc<SendGate>>) {
     let Some(gate) = gate

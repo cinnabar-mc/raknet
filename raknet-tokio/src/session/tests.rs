@@ -1,6 +1,46 @@
 use super::*;
 use std::time::Duration;
 
+#[tokio::test(start_paused = true)]
+async fn public_send_drives_the_original_wire_before_yielding() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    let start = Instant::now();
+    let now = start.into_std();
+    let (local, mut peer) = crate::test_support::negotiated_pair(
+        "127.0.0.1:54321".parse().unwrap(),
+        "127.0.0.1:19132".parse().unwrap(),
+        now,
+        now,
+        Default::default(),
+    );
+    let (wire, mut output) = wire::datagrams();
+    let (disconnected, _) = unbounded_channel();
+    let (mut session, input) = spawn_established(local, wire, disconnected);
+    let expected = Box::<[u8]>::from(&b"\xfeinline reliable write"[..]);
+    let mut sending = Box::pin(session.send(
+        expected.clone(),
+        RakReliability::ReliableOrdered,
+        RakPriority::Normal,
+    ));
+    let result = poll_fn(|context| Poll::Ready(sending.as_mut().poll(context))).await;
+    drop(sending);
+    let datagram = output.try_recv().expect("same-call wire admission");
+    let (bytes, _, credit) = datagram.into_parts();
+    peer.handle(RakSessionInput::Datagram(bytes, now)).unwrap();
+    let received = std::iter::from_fn(|| peer.poll()).find_map(|output| match output {
+        RakSessionOutput::Packet(bytes) => Some(bytes),
+        _ => None,
+    });
+    assert!(matches!(result, Poll::Ready(Ok(()))));
+    assert_eq!(received, Some(expected));
+    assert_eq!(Instant::now(), start);
+    drop(credit);
+    let actor = session.actor.take().unwrap();
+    drop((session, input, output));
+    actor.await.unwrap();
+}
+
 /// Ordinary adapter writes must reach the real peer without a periodic timer update.
 #[test]
 fn normal_send_reaches_the_negotiated_peer_without_a_timer_tick() {

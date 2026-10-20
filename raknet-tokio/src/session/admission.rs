@@ -12,13 +12,21 @@ pub(super) struct Admission {
     close_timeout: Duration,
     state: Mutex<State>,
     changed: Notify,
+    closing_changed: Notify,
     retirement: OnceLock<Arc<SessionRetirement>>,
+    direct_wire: AtomicBool,
 }
 
 /// A weak observation cannot keep the original handle, actor or queued body alive.
 pub(crate) struct SessionLifetime(Weak<Admission>);
 
 impl SessionLifetime {
+    /// Mirrors this exact route's socket permission while its endpoint lock is held.
+    pub(crate) fn set_direct_wire(&self, allowed: bool) {
+        if let Some(admission) = self.0.upgrade() {
+            admission.direct_wire.store(allowed, Ordering::Release);
+        }
+    }
     /// Compares the original allocation without extending either route's lifetime.
     pub(super) fn matches(&self, admission: &Arc<Admission>) -> bool {
         self.0.ptr_eq(&Arc::downgrade(admission))
@@ -124,7 +132,9 @@ impl Admission {
                 close: None,
             }),
             changed: Notify::new(),
+            closing_changed: Notify::new(),
             retirement: OnceLock::new(),
+            direct_wire: AtomicBool::new(false),
         })
     }
 
@@ -182,25 +192,34 @@ impl Admission {
         if bytes > maximum {
             return Err(RakSessionError::MessageSizeExceeded(bytes));
         }
+        if let Some(credit) = self.try_wire(bytes, maximum) {
+            return Ok(credit);
+        }
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let mut state = self.state.lock().expect("session admission mutex poisoned");
-                if state.wire_messages < constants::MAX_RECEIVE_MESSAGES
-                    && bytes <= maximum - state.wire_bytes
-                {
-                    state.wire_bytes += bytes;
-                    state.wire_messages += 1;
-                    return Ok(WireCredit {
-                        admission: Arc::clone(self),
-                        bytes,
-                    });
-                }
+            if let Some(credit) = self.try_wire(bytes, maximum) {
+                return Ok(credit);
             }
             notified.await;
         }
+    }
+
+    /// Takes immediately available wire credit before allocating a capacity waiter.
+    fn try_wire(self: &Arc<Self>, bytes: usize, maximum: usize) -> Option<WireCredit> {
+        let mut state = self.state.lock().expect("session admission mutex poisoned");
+        if state.wire_messages >= constants::MAX_RECEIVE_MESSAGES
+            || bytes > maximum - state.wire_bytes
+        {
+            return None;
+        }
+        state.wire_bytes += bytes;
+        state.wire_messages += 1;
+        Some(WireCredit {
+            admission: Arc::clone(self),
+            bytes,
+        })
     }
 
     /// Reserves actual body bytes while leaving uncommitted bodies caller-owned.
@@ -209,35 +228,45 @@ impl Admission {
         bytes: usize,
         message_limit: usize,
     ) -> Result<SendCredit, RakSessionError> {
+        if let Some(credit) = self.try_reserve(bytes, message_limit)? {
+            return Ok(credit);
+        }
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let mut state = self.state.lock().expect("session admission mutex poisoned");
-                if !state.open {
-                    return Err(RakSessionError::Closed);
-                }
-                let maximum = self.maximum.ok_or(RakSessionError::InvalidConfig(
-                    "session byte capacities must be positive",
-                ))?;
-                if bytes > message_limit || bytes > maximum {
-                    return Err(RakSessionError::MessageSizeExceeded(bytes));
-                }
-                if bytes <= maximum - state.bytes {
-                    state.bytes = state
-                        .bytes
-                        .checked_add(bytes)
-                        .expect("reserved bytes fit their budget");
-                    return Ok(SendCredit {
-                        admission: Arc::clone(self),
-                        bytes,
-                        committed: false,
-                    });
-                }
+            if let Some(credit) = self.try_reserve(bytes, message_limit)? {
+                return Ok(credit);
             }
             notified.await;
         }
+    }
+
+    /// Takes available body credit under the same close fence before registering a waiter.
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        message_limit: usize,
+    ) -> Result<Option<SendCredit>, RakSessionError> {
+        let mut state = self.state.lock().expect("session admission mutex poisoned");
+        if !state.open {
+            return Err(RakSessionError::Closed);
+        }
+        let maximum = self.maximum.ok_or(RakSessionError::InvalidConfig(
+            "session byte capacities must be positive",
+        ))?;
+        if bytes > message_limit || bytes > maximum {
+            return Err(RakSessionError::MessageSizeExceeded(bytes));
+        }
+        if bytes > maximum - state.bytes {
+            return Ok(None);
+        }
+        state.bytes += bytes;
+        Ok(Some(SendCredit {
+            admission: Arc::clone(self),
+            bytes,
+            committed: false,
+        }))
     }
 
     /// Waits for sealing independently of available command or byte capacity.
@@ -275,13 +304,14 @@ impl Admission {
             });
         }
         self.changed.notify_waiters();
+        self.closing_changed.notify_one();
         Ok(())
     }
 
     /// Drains earlier committed sends under the original close duration.
     pub(super) async fn close_ready(&self) -> Close {
         loop {
-            let notified = self.changed.notified();
+            let notified = self.closing_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let remaining = {
@@ -343,7 +373,7 @@ impl SendCredit {
 
 impl Drop for SendCredit {
     fn drop(&mut self) {
-        {
+        let closing = {
             let mut state = self
                 .admission
                 .state
@@ -359,12 +389,20 @@ impl Drop for SendCredit {
                     .checked_sub(1)
                     .expect("each committed body leaves the FIFO once");
             }
-        }
+            state.close.is_some()
+        };
         self.admission.changed.notify_waiters();
+        if closing {
+            self.admission.closing_changed.notify_one();
+        }
     }
 }
 
 impl WireCredit {
+    /// Checks the original producer's permission, never another session with the same ID.
+    pub(super) fn direct_allowed(&self) -> bool {
+        self.admission.direct_wire.load(Ordering::Acquire)
+    }
     /// Rejects a reused numeric session ID belonging to a different original allocation.
     pub(super) fn belongs_to(&self, lifetime: &SessionLifetime) -> bool {
         lifetime.matches(&self.admission)

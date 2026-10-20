@@ -126,7 +126,9 @@ async fn established_session_commands_bound_actual_queued_payload_before_actor_p
             })
             .collect();
         let mut completed_before_actor = false;
+        let original_actor = sessions[0].task.upgrade().unwrap();
         tokio::task::unconstrained(poll_fn(|context| {
+            let _held = original_actor.hold();
             for command in &mut commands {
                 if Future::poll(command.as_mut(), context).is_ready() {
                     completed_before_actor = true;

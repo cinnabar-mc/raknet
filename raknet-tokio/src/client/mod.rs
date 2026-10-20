@@ -33,14 +33,17 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use tracing::debug;
 
 struct ClientSockets {
-    v4: UdpSocket,
-    v6: Option<UdpSocket>,
+    v4: Arc<UdpSocket>,
+    v6: Option<Arc<UdpSocket>>,
 }
 
 impl ClientSockets {
     async fn bind(port: u16) -> std::io::Result<Self> {
-        let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
-        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).await.ok();
+        let v4 = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await?);
+        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port))
+            .await
+            .ok()
+            .map(Arc::new);
 
         Ok(Self { v4, v6 })
     }
@@ -66,7 +69,7 @@ impl ClientSockets {
     /// Selects the socket matching the canonical endpoint family.
     fn socket(&self, addr: SocketAddr) -> std::io::Result<&UdpSocket> {
         if canonical_socket_addr(addr).is_ipv6() {
-            self.v6.as_ref().ok_or_else(|| {
+            self.v6.as_deref().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
                     "IPv6 client socket is unavailable",
@@ -86,6 +89,32 @@ impl ClientSockets {
         let addr = canonical_socket_addr(addr);
         self.socket(addr)?.send_to(buf, addr).await
     }
+
+    /// Shares a synchronous writer without extending either socket's physical lifetime.
+    fn writer(
+        &self,
+        stop: Arc<StopState>,
+        #[cfg(test)] gate: Option<Arc<crate::session::physical_send_tests::SendGate>>,
+    ) -> Arc<wire::SocketWriter> {
+        let v4 = Arc::downgrade(&self.v4);
+        let v6 = self.v6.as_ref().map(Arc::downgrade);
+        wire::SocketWriter::new(
+            stop,
+            move |bytes, peer| {
+                let peer = canonical_socket_addr(peer);
+                let socket = if peer.is_ipv6() {
+                    v6.as_ref().and_then(std::sync::Weak::upgrade)
+                } else {
+                    v4.upgrade()
+                };
+                socket
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?
+                    .try_send_to(bytes, peer)
+            },
+            #[cfg(test)]
+            gate,
+        )
+    }
 }
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,6 +129,20 @@ struct PendingSend {
 struct PendingPing {
     sent_ms: u64,
     sender: oneshot::Sender<PingResult>,
+}
+
+/// Withdraws the old allocation before granting a replacement route direct socket access.
+fn replace_session_route(
+    route: &mut Option<(RakSessionId, SessionLifetime)>,
+    replacement: Option<(RakSessionId, SessionLifetime)>,
+) {
+    if let Some((_, lifetime)) = route.take() {
+        lifetime.set_direct_wire(false);
+    }
+    if let Some((_, lifetime)) = &replacement {
+        lifetime.set_direct_wire(true);
+    }
+    *route = replacement;
 }
 
 /// Reclaims canceled discovery metadata and derives the count from its sole owning map.
@@ -213,13 +256,14 @@ impl RakClient<ConfiguredClient> {
         #[cfg(test)]
         let send_gate = crate::session::physical_send_tests::capture(&stop);
 
-        let handle = tokio::spawn({
+        let (handle, _) = crate::inline::Task::spawn(|endpoint| {
             let stop = stop.clone();
             let sockets = sockets;
             let mut msg_rx = msg_rx;
 
             async move {
                 let mut session_tx: Option<Sender<SessionEvent>> = None;
+                let mut session_task = std::sync::Weak::new();
                 let mut session_route: Option<(RakSessionId, SessionLifetime)> = None;
                 let mut pings: HashMap<SocketAddr, Vec<PendingPing>> = HashMap::new();
                 let mut connect: Option<
@@ -234,7 +278,13 @@ impl RakClient<ConfiguredClient> {
                 let mut adopting: Option<oneshot::Sender<Result<RestoredSession, RakClientError>>> =
                     None;
 
-                let (dgram_tx, mut dgram_rx) = wire::datagrams();
+                let writer = sockets.writer(
+                    Arc::clone(&stop),
+                    #[cfg(test)]
+                    send_gate.clone(),
+                );
+                let (dgram_tx, mut dgram_rx) =
+                    wire::datagrams_on(endpoint, Some(Arc::clone(&writer)));
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let timer = sleep(Duration::ZERO);
@@ -277,6 +327,7 @@ impl RakClient<ConfiguredClient> {
                             Err(_) => break,
                         }
                     }
+                    writer.set_pending(pending.is_some());
                     tokio::select! {
                         _ = stop.wait(), if stop_deadline.is_none() => continue,
                         result = async {
@@ -359,7 +410,7 @@ impl RakClient<ConfiguredClient> {
                                         });
                                     match result {
                                         Ok(()) => {
-                                            session_route = None;
+                                            replace_session_route(&mut session_route, None);
                                             connect = Some(sender);
                                         }
                                         Err(e) => {
@@ -378,7 +429,7 @@ impl RakClient<ConfiguredClient> {
                                     };
                                     match result {
                                         Ok(()) => {
-                                            session_route = None;
+                                            replace_session_route(&mut session_route, None);
                                             adopting = Some(reply);
                                         }
                                         Err(error) => { let _ = reply.send(Err(error)); }
@@ -423,7 +474,9 @@ impl RakClient<ConfiguredClient> {
 
                                     let input = RakSessionInput::Datagram(buf, now);
                                     if let Err(TrySendError::Full(_)) =
-                                        session.try_send(SessionEvent::Io(input))
+                                        crate::inline::Task::drive(&session_task, || {
+                                            session.try_send(SessionEvent::Io(input))
+                                        })
                                     {
                                         debug!("closing the session, its input queue is full");
                                         session_tx = None;
@@ -441,7 +494,11 @@ impl RakClient<ConfiguredClient> {
                                     dgram_tx.clone(),
                                     disconnect_tx.clone(),
                                 );
-                                session_route = Some((id, session.lifetime(None)));
+                                replace_session_route(
+                                    &mut session_route,
+                                    Some((id, session.lifetime(None))),
+                                );
+                                session_task = session.task();
 
                                 if stop_deadline.is_some() || stop.requested() {
                                     let _ =
@@ -462,7 +519,11 @@ impl RakClient<ConfiguredClient> {
                                 let id = session.id();
                                 let (session, tx) =
                                     spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
-                                session_route = Some((id, session.lifetime(None)));
+                                replace_session_route(
+                                    &mut session_route,
+                                    Some((id, session.lifetime(None))),
+                                );
+                                session_task = session.task();
                                 session_tx = Some(tx);
                                 if let Some(reply) = adopting.take() {
                                     let _ = reply.send(Ok(RestoredSession::Closing(session)));

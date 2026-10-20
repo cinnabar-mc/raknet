@@ -670,6 +670,34 @@ impl SessionEngine {
         now: Instant,
     ) -> Result<(), RakSessionError> {
         let frames = self.prepare_frames(frame);
+        if frames.len() == 1
+            && !frames[0].is_split()
+            && self.outbound_queue.iter().all(VecDeque::is_empty)
+            && frames[0].size_hint() <= self.congestion_controller.transmission_bandwidth()
+        {
+            let mut window = self.outbound_window.unwrap_or_else(|| OutboundWindow {
+                reliable: self.oldest_unacked_reliable(),
+                ordered: self.oldest_unacked_ordered(),
+            });
+            let frame = &frames[0];
+            if within_reliable_window(frame, window.reliable)
+                && within_ordered_window(frame, &window.ordered)
+            {
+                if frame.reliability.is_reliable() {
+                    window.reliable.get_or_insert(frame.reliable_index);
+                }
+                if frame.reliability.is_ordered() {
+                    window.ordered[frame.order_channel as usize].get_or_insert(frame.order_index);
+                }
+                self.outbound_window = Some(window);
+                self.wire_continuous = self.bandwidth_limited;
+                self.bandwidth_limited = false;
+                let set = self.next_frame_set(frames);
+                self.send_frame_set(set, false, true, now)?;
+                self.flush();
+                return Ok(());
+            }
+        }
         self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
         self.outbound_queue[priority as usize].extend(frames);
         self.wire_continuous = self.bandwidth_limited;

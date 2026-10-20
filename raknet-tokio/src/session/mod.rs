@@ -5,6 +5,7 @@ mod command;
 mod driver;
 pub(crate) mod wire;
 
+use crate::inline::Task;
 use admission::{ActorAdmission, Admission, ReceiveCredit};
 pub(crate) use admission::{SessionLifetime, SessionRetirement};
 use command::RakSessionMsg;
@@ -13,7 +14,7 @@ use raknet::prelude::*;
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::error::TrySendError;
 #[cfg(test)]
 use tokio::sync::mpsc::unbounded_channel;
@@ -44,6 +45,7 @@ pub(crate) enum SessionEvent {
 /// }
 /// ```
 pub struct RakSession<S: SessionPhase> {
+    task: Weak<Task>,
     msg_tx: Sender<RakSessionMsg>,
     admission: Arc<Admission>,
     buf_rx: Receiver<Received>,
@@ -67,7 +69,7 @@ impl<S: SessionPhase> fmt::Debug for RakSession<S> {
 /// Spawns the established actor only from the core's genuine owned handoff.
 pub(crate) fn spawn_established(
     session: raknet::prelude::RakSession<Established>,
-    datagrams: Sender<wire::Datagram>,
+    datagrams: wire::Route,
     disconnected: UnboundedSender<RakSessionId>,
 ) -> (RakSession<Established>, Sender<SessionEvent>) {
     let addr = session.addr();
@@ -88,7 +90,7 @@ pub(crate) fn spawn_established(
 /// Spawns a restored closing actor while withholding all application-send methods.
 pub(crate) fn spawn_closing(
     session: raknet::prelude::RakSession<Closing>,
-    datagrams: Sender<wire::Datagram>,
+    datagrams: wire::Route,
     disconnected: UnboundedSender<RakSessionId>,
 ) -> (RakSession<Closing>, Sender<SessionEvent>) {
     let addr = session.addr();
@@ -113,7 +115,7 @@ fn spawn<S: SessionPhase>(
     id: RakSessionId,
     max_message_len: usize,
     mtu: u16,
-    datagram_tx: Sender<wire::Datagram>,
+    datagram_tx: wire::Route,
     disconnect_tx: UnboundedSender<RakSessionId>,
 ) -> (RakSession<S>, Sender<SessionEvent>) {
     let receive_maximum = usize::try_from(driver.config().max_queued_bytes).unwrap_or(0);
@@ -127,7 +129,7 @@ fn spawn<S: SessionPhase>(
     let (buf_tx, buf_rx) = channel(SESSION_QUEUE_CAPACITY);
     let (tx, mut rx) = channel(SESSION_QUEUE_CAPACITY);
     let (terminal_tx, terminal_rx) = oneshot::channel();
-    let _actor = tokio::spawn(async move {
+    let (_actor, task) = Task::spawn(|_| async move {
         let admission_owner = actor_admission;
         let admission = &admission_owner.0;
         let timer = sleep(std::time::Duration::ZERO);
@@ -136,23 +138,29 @@ fn spawn<S: SessionPhase>(
         let mut application_open = true;
         let mut wire_open = true;
         let mut expiry = None;
+        let closing = admission.close_ready();
+        let application_closed = buf_tx.closed();
+        let wire_closed = datagram_tx.closed();
+        tokio::pin!(closing, application_closed, wire_closed);
+        let mut close_consumed = false;
         loop {
             let blocked = pending.is_some();
             let terminal = driver.state() == RakSessionState::Disconnected;
             tokio::select! {
                 biased;
-                close = admission.close_ready() => {
+                close = &mut closing, if !close_consumed => {
+                    close_consumed = true;
                     let result = driver.close(close.started.into_std(), false);
                     // Age the same close immediately; FIFO draining never rebases its cutoff.
                     let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std()));
                     expiry = None;
                     let _ = close.reply.send(result);
                 }
-                _ = buf_tx.closed(), if application_open => {
+                _ = &mut application_closed, if application_open => {
                     application_open = false;
                     let _ = driver.close(Instant::now().into_std(), true);
                 }
-                _ = datagram_tx.closed(), if wire_open => {
+                _ = &mut wire_closed, if wire_open => {
                     wire_open = false;
                     pending = None;
                     let _ = driver.close(Instant::now().into_std(), true);
@@ -289,6 +297,7 @@ fn spawn<S: SessionPhase>(
     });
     (
         RakSession {
+            task,
             msg_tx,
             admission,
             buf_rx,
@@ -305,6 +314,10 @@ fn spawn<S: SessionPhase>(
 }
 
 impl<S: SessionPhase> RakSession<S> {
+    /// Borrows the original actor's inline capability without retaining its lifetime.
+    pub(crate) fn task(&self) -> Weak<Task> {
+        self.task.clone()
+    }
     /// Observes the original allocation without retaining its public or actor ownership.
     pub(crate) fn lifetime(&self, retirement: Option<&Arc<SessionRetirement>>) -> SessionLifetime {
         self.admission.lifetime(retirement)
@@ -397,19 +410,22 @@ impl RakSession<Established> {
         };
         let (tx, rx) = oneshot::channel();
         credit.commit()?;
-        permit.send(RakSessionMsg::Send(
-            bytes,
-            reliability,
-            priority,
-            tx,
-            credit,
-        ));
+        Task::drive(&self.task, || {
+            permit.send(RakSessionMsg::Send(
+                bytes,
+                reliability,
+                priority,
+                tx,
+                credit,
+            ))
+        });
         rx.await.map_err(|_| RakSessionError::Closed)?
     }
     /// Synchronously consumes send permission before any cancellable close wait.
     pub fn close(self) -> Result<RakSession<Closing>, SessionCloseError> {
         let (tx, rx) = oneshot::channel();
         let closing = RakSession {
+            task: self.task,
             msg_tx: self.msg_tx,
             admission: self.admission,
             buf_rx: self.buf_rx,
@@ -424,7 +440,7 @@ impl RakSession<Established> {
         match closing.admission.request_close(tx) {
             Ok(()) => Ok(closing),
             Err(cause) => Err(SessionCloseError {
-                session: closing,
+                session: Box::new(closing),
                 cause,
             }),
         }
@@ -435,7 +451,7 @@ impl RakSession<Established> {
 #[derive(Debug, thiserror::Error)]
 #[error("session close failed: {cause}")]
 pub struct SessionCloseError {
-    session: RakSession<Closing>,
+    session: Box<RakSession<Closing>>,
     #[source]
     cause: RakSessionError,
 }
@@ -443,7 +459,7 @@ pub struct SessionCloseError {
 impl SessionCloseError {
     /// Recovers the closing owner and original command error.
     pub fn into_parts(self) -> (RakSession<Closing>, RakSessionError) {
-        (self.session, self.cause)
+        (*self.session, self.cause)
     }
 }
 
