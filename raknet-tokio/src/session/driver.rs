@@ -59,8 +59,9 @@ impl Driver {
     ) -> Result<(), RakSessionError> {
         match self.phase.as_mut().ok_or(RakSessionError::Closed)? {
             Phase::Established(session) => {
+                let flush = priority != RakPriority::Immediate;
                 session.send(bytes, reliability, priority, now)?;
-                if priority != RakPriority::Immediate {
+                if flush {
                     session.tick(now)?;
                 }
                 Ok(())
