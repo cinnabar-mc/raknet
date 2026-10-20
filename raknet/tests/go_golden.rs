@@ -38,11 +38,6 @@ const CODEC_DIVERGENCES: &[(&str, &str)] = &[
     ("ack/over_max_entries", "err"),
     // New: go-raknet reads an unknown record type as nothing; Rust reads it as a single.
     ("ack/unknown_record_type", "ok nack=0 seqs=9"),
-    // New: a truncated trailing frame ends the frame list instead of failing the datagram.
-    (
-        "datagram/trailing_garbage",
-        "ok flags=80 seq=2 frames=[rel=0 msg=0 seq=0 ord=0 split=0:0/0/0 payload=706172697479]",
-    ),
     // New: payload bit lengths round up to whole bytes; go-raknet truncates.
     (
         "frame/bit_length_not_byte_aligned",

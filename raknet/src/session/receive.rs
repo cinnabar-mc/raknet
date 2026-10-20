@@ -28,20 +28,19 @@ pub(super) fn frame_cost(frame: &Frame) -> usize {
 }
 
 impl SessionEngine {
-    /// Releases expired reassemblies and reports lost acknowledged fragment state.
-    pub(super) fn evict_stale_splits(&mut self, now: Instant) -> bool {
+    /// Releases abandoned unreliable splits while preserving acknowledged reliable fragments.
+    pub(super) fn evict_stale_splits(&mut self, now: Instant) {
         let last = &self.inbound_spl_last;
         let mut freed = 0;
-        let mut stale = false;
         self.inbound_spl_queue.retain(|split_id, fragments| {
-            let fresh = now < split_deadline(last.get(split_id), now);
-            if !fresh {
-                freed += fragments.values().map(frame_cost).sum::<usize>();
-                stale |= fragments
+            let keep = now < split_deadline(last.get(split_id), now)
+                || fragments
                     .values()
                     .any(|frame| frame.reliability.is_reliable());
+            if !keep {
+                freed += fragments.values().map(frame_cost).sum::<usize>();
             }
-            fresh
+            keep
         });
         let queue = &self.inbound_spl_queue;
         self.inbound_spl_last
@@ -54,7 +53,6 @@ impl SessionEngine {
                 freed, self.addr
             );
         }
-        stale
     }
 
     /// Acknowledges a datagram only when every reliable frame was retained or delivered.
@@ -102,8 +100,11 @@ impl SessionEngine {
 
         self.inbound_deferred = false;
         let mut result = Ok(());
-        for frame in set.frames {
+        let mut frames = set.frames.into_iter();
+        while let Some(frame) = frames.next() {
             if matches!(self.state, RakSessionState::Disconnected) {
+                self.inbound_deferred |= frame.reliability.is_reliable()
+                    || frames.any(|frame| frame.reliability.is_reliable());
                 break;
             }
             if !admit_application && self.defer_application(&frame) {
@@ -117,6 +118,20 @@ impl SessionEngine {
         }
         if self.inbound_deferred || result.is_err() {
             self.sequences_recv.remove(&set.sequence);
+        }
+        if matches!(
+            self.output.back(),
+            Some(super::output::RakSessionOutput::Disconnected(
+                _,
+                RakDisconnectReason::Remote
+            ))
+        ) {
+            // Receipt ACKs precede terminal output only after the full datagram is accounted for.
+            let terminal = self.output.pop_back();
+            let received = self.sequences_recv.drain().collect();
+            self.queue_acks(received, false)?;
+            self.flush();
+            self.output.extend(terminal);
         }
         self.refresh_stall(now);
         result
@@ -143,18 +158,9 @@ impl SessionEngine {
             .map(|(since, _)| since + SESSION_TIMEOUT)
     }
 
-    /// Reports the same reliable-input expirations without evicting retained data.
-    pub(super) fn receive_deadline(&self, now: Instant) -> Option<Instant> {
-        self.inbound_spl_queue
-            .iter()
-            .filter(|(_, fragments)| {
-                fragments
-                    .values()
-                    .any(|frame| frame.reliability.is_reliable())
-            })
-            .map(|(id, _)| split_deadline(self.inbound_spl_last.get(id), now))
-            .chain(self.stall_deadline())
-            .min()
+    /// Reports the terminal reliable-gap deadline; split eviction does not terminate the session.
+    pub(super) fn receive_deadline(&self) -> Option<Instant> {
+        self.stall_deadline()
     }
 
     /// Reports a gap with no delivery progress for the session timeout.
@@ -325,31 +331,26 @@ impl SessionEngine {
                 self.inbound_seq_idx[channel] = 0;
                 self.inbound_ord_idx[channel] = u24::add(frame.order_index, 1);
 
-                self.handle_packet(frame.payload, now)?;
-
-                let mut idx = self.inbound_ord_idx[channel];
-
-                let mut packets = Vec::new();
+                let mut result = self.handle_packet(frame.payload, now);
+                // Keep the accepted tail owned until dispatch reaches each frame.
+                while self.state != RakSessionState::Disconnected
+                    && (result.is_ok() || !self.reject_malformed)
                 {
-                    let unord_queue = self
+                    let idx = self.inbound_ord_idx[channel];
+                    let Some(next) = self
                         .inbound_ord_queue
-                        .entry(frame.order_channel)
-                        .or_default();
-                    while let Some(unord_frame) = unord_queue.remove(&idx) {
-                        self.inbound_ord_bytes = self
-                            .inbound_ord_bytes
-                            .saturating_sub(frame_cost(&unord_frame));
-                        packets.push(unord_frame.payload);
-
-                        idx = u24::add(idx, 1);
-                    }
+                        .get_mut(&frame.order_channel)
+                        .and_then(|queue| queue.remove(&idx))
+                    else {
+                        break;
+                    };
+                    self.inbound_ord_bytes =
+                        self.inbound_ord_bytes.saturating_sub(frame_cost(&next));
+                    self.inbound_ord_idx[channel] = u24::add(idx, 1);
+                    let dispatched = self.handle_packet(next.payload, now);
+                    result = result.and(dispatched);
                 }
-                self.inbound_ord_idx[channel] = idx;
-
-                for packet in packets {
-                    self.handle_packet(packet, now)?;
-                }
-                return Ok(());
+                return result;
             }
 
             if ahead >= ORDER_WINDOW as i32 {
@@ -398,8 +399,11 @@ impl SessionEngine {
         }
 
         if let Some(reason) = self.split_violation(&frame) {
-            debug!("closing session with {}, {}", self.addr, reason);
-            return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
+            if frame.split_size > MAX_SPLIT_COUNT {
+                return self.disconnect(true, RakDisconnectReason::ProtocolViolation, now);
+            }
+            debug!("dropping fragment from {}, {}", self.addr, reason);
+            return Ok(());
         }
 
         let split_id = frame.split_id;
@@ -457,9 +461,6 @@ impl SessionEngine {
 
     /// Identifies invalid fragment metadata against an existing reassembly.
     pub(super) fn split_violation(&self, frame: &Frame) -> Option<&'static str> {
-        if frame.payload.is_empty() {
-            return Some("empty split fragment");
-        }
         if frame.split_size > MAX_SPLIT_COUNT {
             return Some("split count exceeds the maximum");
         }

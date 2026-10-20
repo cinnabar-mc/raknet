@@ -62,7 +62,7 @@ const MAX_OUTBOUND_SPLIT_COUNT: usize = 2048;
 const MAX_CONCURRENT_SPLITS: usize = 256;
 const MAX_UNACKED_RELIABLE: i32 = 4096;
 const MAX_SPLITS_IN_FLIGHT: usize = 256;
-const SESSION_TIMEOUT: Duration = Duration::from_millis(15000);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionEngine {
@@ -79,6 +79,8 @@ pub(crate) struct SessionEngine {
     last_recv: Instant,
     last_pong: Instant,
     closing_since: Option<Instant>,
+    disconnect_sent: bool,
+    pub(crate) reject_malformed: bool,
 
     congestion_controller: RakCongestionController,
     bandwidth_limited: bool,
@@ -199,6 +201,8 @@ impl SessionEngine {
             last_recv: now,
             last_pong: now,
             closing_since: None,
+            disconnect_sent: false,
+            reject_malformed: false,
 
             state: RakSessionState::Connected,
             congestion_controller: RakCongestionController::new(mtu as usize),
@@ -268,7 +272,7 @@ impl SessionEngine {
     }
 
     /// Shares the original terminal deadlines with a backpressured delivery edge.
-    fn expiry_deadline(&self, now: Instant) -> Option<Instant> {
+    fn expiry_deadline(&self, _now: Instant) -> Option<Instant> {
         if self.state == RakSessionState::Disconnected {
             return None;
         }
@@ -278,7 +282,7 @@ impl SessionEngine {
         } else {
             None
         };
-        [self.peer_deadline(), self.receive_deadline(now), close]
+        [self.peer_deadline(), self.receive_deadline(), close]
             .into_iter()
             .flatten()
             .min()
@@ -305,7 +309,8 @@ impl SessionEngine {
             return Ok(());
         }
 
-        if self.evict_stale_splits(now) || self.inbound_stalled(now) {
+        self.evict_stale_splits(now);
+        if self.inbound_stalled(now) {
             return self.disconnect(true, RakDisconnectReason::Timeout, now);
         }
 
@@ -359,7 +364,7 @@ impl SessionEngine {
         self.tick(now)?;
 
         if self.nothing_left_to_send() {
-            return self.disconnect(true, RakDisconnectReason::Requested, now);
+            self.send_disconnect(now)?;
         }
 
         self.output
@@ -379,12 +384,17 @@ impl SessionEngine {
         self.tick(now)?;
         self.last_tick = now;
 
-        if self.nothing_left_to_send()
-            || self
-                .close_deadline(since)
-                .is_some_and(|deadline| now >= deadline)
+        if self
+            .close_deadline(since)
+            .is_some_and(|deadline| now >= deadline)
         {
-            return self.disconnect(true, RakDisconnectReason::Requested, now);
+            return self.disconnect(!self.disconnect_sent, RakDisconnectReason::Requested, now);
+        }
+        if self.nothing_left_to_send() {
+            if self.disconnect_sent {
+                return self.disconnect(false, RakDisconnectReason::Requested, now);
+            }
+            self.send_disconnect(now)?;
         }
 
         self.output
@@ -940,6 +950,16 @@ impl SessionEngine {
         Ok(())
     }
 
+    /// Keeps the close notification in the normal reliable resend cache until acknowledged.
+    fn send_disconnect(&mut self, now: Instant) -> Result<(), RakSessionError> {
+        if !self.disconnect_sent {
+            let frame = Frame::new(RakReliability::ReliableOrdered, Disconnect.serialized()?);
+            self.send_control(frame, now)?;
+            self.disconnect_sent = true;
+        }
+        Ok(())
+    }
+
     fn disconnect(
         &mut self,
         send: bool,
@@ -951,12 +971,7 @@ impl SessionEngine {
         }
 
         if send {
-            let disconnect = Disconnect;
-
-            let frame = Frame::new(RakReliability::ReliableOrdered, disconnect.serialized()?);
-
-            // Terminal control must leave before the adapter receives Disconnected.
-            self.send_control(frame, now)?;
+            self.send_disconnect(now)?;
         }
 
         self.state = RakSessionState::Disconnected;

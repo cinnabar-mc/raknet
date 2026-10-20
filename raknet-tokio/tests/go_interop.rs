@@ -43,25 +43,20 @@ use Outcome::{Closed, Delivered, TimedOut};
 const EXPECTED: &[(&str, Outcome, Outcome)] = &[
     ("loss_burst_receiver/client", Delivered, Delivered),
     ("loss_burst_receiver/server", Delivered, Delivered),
-    // Known: the disconnect notification is sent once, not until acknowledged (98dc6d1).
     // The outcome is whether the closer's peer saw the close within 2 s.
-    ("lost_disconnect_closer/client", TimedOut, Closed),
-    ("lost_disconnect_closer/server", TimedOut, Closed),
+    ("lost_disconnect_closer/client", Closed, Closed),
+    ("lost_disconnect_closer/server", Closed, Closed),
     ("truncated_frame_datagram/client", Delivered, Delivered),
-    // New: a go-raknet listener closes the connection when it rejects a datagram;
-    // the Rust server skips it and keeps the session.
-    ("truncated_frame_datagram/server", Delivered, Closed),
+    ("truncated_frame_datagram/server", Closed, Closed),
     ("reversed_ack_range/client", Delivered, Delivered),
-    ("reversed_ack_range/server", Delivered, Closed),
-    // Known: empty or count-mismatched split fragments end the session (250a0fc).
-    ("empty_split_fragment/client", Closed, Delivered),
-    ("empty_split_fragment/server", Closed, Delivered),
-    ("mismatched_split_count/client", Closed, Delivered),
-    ("mismatched_split_count/server", Closed, Delivered),
-    // Known: a 15 s silence timeout against go-raknet's 5 s plus two round trips.
+    ("reversed_ack_range/server", Closed, Closed),
+    ("empty_split_fragment/client", Delivered, Delivered),
+    ("empty_split_fragment/server", Delivered, Delivered),
+    ("mismatched_split_count/client", Delivered, Delivered),
+    ("mismatched_split_count/server", Delivered, Delivered),
     // The outcome is whether the endpoint closed a silent peer within 12 s.
-    ("dead_peer_detection/client", TimedOut, Closed),
-    ("dead_peer_detection/server", TimedOut, Closed),
+    ("dead_peer_detection/client", Closed, Closed),
+    ("dead_peer_detection/server", Closed, Closed),
 ];
 
 /// Checks one edge case's observed outcomes against `EXPECTED` for each role.

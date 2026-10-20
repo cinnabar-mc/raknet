@@ -369,7 +369,7 @@ fn disconnect_reason_matches_cause() {
     );
 
     session
-        .handle(SessionInput::Disconnect(domain_time()))
+        .handle(SessionInput::DisconnectNow(domain_time()))
         .unwrap();
 
     let reason = session
@@ -693,21 +693,21 @@ fn a_hundred_interleaved_splits_are_reassembled() {
 }
 
 #[test]
-fn empty_split_fragment_closes_the_session() {
+fn empty_split_fragment_keeps_the_session() {
     let mut session = session(0, 1);
-
+    let now = domain_time();
+    session.handle_frame(fragment(1, 2, 0, &[]), now).unwrap();
     session
-        .handle_frame(fragment(1, 2, 0, &[]), domain_time())
+        .handle_frame(fragment(1, 2, 1, &[0xFE]), now)
         .unwrap();
-
-    assert!(session.inbound_spl_queue.is_empty());
-    assert_closed_for_violation(&session);
+    assert_eq!(packets(&mut session), vec![Box::from([0xFE])]);
+    assert_eq!(session.state, RakSessionState::Connected);
+    assert_eq!(session.inbound_spl_bytes, 0);
 }
 
 #[test]
-fn split_size_mismatch_closes_the_session() {
+fn split_size_mismatch_preserves_the_original_reassembly() {
     let mut session = session(0, 1);
-
     let now = domain_time();
     session
         .handle_frame(fragment(1, 3, 0, &[0xFE]), now)
@@ -715,8 +715,11 @@ fn split_size_mismatch_closes_the_session() {
     session
         .handle_frame(fragment(1, 2, 1, &[0xFF]), now)
         .unwrap();
-
-    assert_closed_for_violation(&session);
+    session.handle_frame(fragment(1, 3, 1, &[1]), now).unwrap();
+    session.handle_frame(fragment(1, 3, 2, &[2]), now).unwrap();
+    assert_eq!(packets(&mut session), vec![Box::from([0xFE, 1, 2])]);
+    assert_eq!(session.state, RakSessionState::Connected);
+    assert_eq!(session.inbound_spl_bytes, 0);
 }
 
 #[test]
@@ -1045,7 +1048,7 @@ fn terminal_notification_precedes_stopping_an_exhausted_sender() {
 }
 
 #[test]
-fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
+fn receive_gap_deadline_and_reliable_splits_survive_snapshot_transfer() {
     for split in [false, true] {
         let mut receiver = session(0, 1);
         let start = domain_time();
@@ -1073,8 +1076,19 @@ fn receive_gap_and_split_deadlines_survive_snapshot_transfer() {
         receiver.handle(SessionInput::Update(destination)).unwrap();
         assert_eq!(
             disconnect_reason(&receiver),
-            Some(RakDisconnectReason::Timeout)
+            if split {
+                None
+            } else {
+                Some(RakDisconnectReason::Timeout)
+            }
         );
+        if split {
+            assert_eq!(receiver.inbound_spl_queue[&1].len(), 1);
+            assert_eq!(receiver.inbound_spl_bytes, size_of::<Frame>() + 1);
+        } else {
+            assert!(receiver.inbound_spl_queue.is_empty());
+            assert_eq!(receiver.inbound_spl_bytes, 0);
+        }
     }
 }
 
@@ -1311,8 +1325,16 @@ fn close_sends_queued_data_and_waits_for_ack() {
             .any(|payload| payload.first() == Some(&0x15)),
         "disconnect notice was not sent"
     );
+    assert_eq!(disconnect_reason_of(&outputs), None);
+    for buf in datagrams_of(&outputs) {
+        b.handle(SessionInput::Datagram(buf, t0 + Duration::from_millis(20)))
+            .unwrap();
+    }
+    deliver(&mut b, &mut a, t0 + Duration::from_millis(20));
+    a.handle(SessionInput::Update(t0 + Duration::from_millis(30)))
+        .unwrap();
     assert_eq!(
-        disconnect_reason_of(&outputs),
+        disconnect_reason_of(&drain_outputs(&mut a)),
         Some(RakDisconnectReason::Requested)
     );
 }
@@ -2104,4 +2126,308 @@ fn admitted_retransmission_clears_a_transient_reliable_deferral() {
         RakSessionState::Connected,
         "a delivered deferred message must not retain a spurious stall obligation"
     );
+}
+
+/// A local close must keep its reliable notification alive across repeated loss.
+#[test]
+fn close_retries_notification_until_acked() {
+    let mut sender = session(1, 1);
+    let start = domain_time();
+    sender.handle(SessionInput::Disconnect(start)).unwrap();
+    let initial = drain_outputs(&mut sender);
+    assert!(payloads_of(&initial).iter().any(|p| p.as_ref() == [0x15]));
+    assert_eq!(disconnect_reason_of(&initial), None);
+    let mut due = sender.outbound_resend.peek().unwrap().0.0;
+    let mut received_at = start;
+    for _ in 0..2 {
+        received_at = due;
+        sender.handle(SessionInput::Update(due)).unwrap();
+        let retried = drain_outputs(&mut sender);
+        assert!(payloads_of(&retried).iter().any(|p| p.as_ref() == [0x15]));
+        assert_eq!(disconnect_reason_of(&retried), None);
+        due = sender.outbound_resend.peek().unwrap().0.0;
+    }
+    let sequences = sender.outbound_cache.keys().copied().collect();
+    sender
+        .handle(SessionInput::Datagram(
+            Ack::new(sequences, false).serialized().unwrap(),
+            received_at,
+        ))
+        .unwrap();
+    sender.handle(SessionInput::Update(received_at)).unwrap();
+    assert_eq!(
+        disconnect_reason_of(&drain_outputs(&mut sender)),
+        Some(RakDisconnectReason::Requested)
+    );
+}
+
+/// Silence has a fixed ten-second cutoff, renewed by admitted traffic.
+#[test]
+fn peer_timeout_is_ten_seconds_after_last_input() {
+    let mut receiver = session(0, 1);
+    let start = domain_time();
+    receiver
+        .handle(SessionInput::Update(start + Duration::from_millis(9999)))
+        .unwrap();
+    assert_eq!(receiver.state, RakSessionState::Connected);
+    receiver
+        .handle(SessionInput::Update(start + Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        disconnect_reason(&receiver),
+        Some(RakDisconnectReason::Timeout)
+    );
+}
+
+/// Validation discards the whole datagram and preserves each endpoint's error policy.
+#[test]
+fn malformed_framing_respects_role_and_admission_after_transfer() {
+    let start = domain_time();
+    let valid = FrameSet::new(0, unreliable(0), false, false, false)
+        .serialized()
+        .unwrap();
+    for server in [false, true] {
+        for admit in [false, true] {
+            let mut receiver = session(0, 1);
+            receiver.reject_malformed = server;
+            let json = facet_json::to_string(&receiver.snapshot(start)).unwrap();
+            let mut receiver =
+                SessionEngine::restore(facet_json::from_str(&json).unwrap(), start, Duration::ZERO)
+                    .unwrap();
+            let mut malformed = valid.to_vec();
+            malformed.extend_from_slice(&[0, 0x40, 0, 1]);
+            assert!(
+                receiver
+                    .handle_datagram(malformed.into(), start, admit)
+                    .is_err()
+            );
+            let outputs = drain_outputs(&mut receiver);
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|out| matches!(out, RakSessionOutput::Packet(_)))
+            );
+            assert_eq!(
+                disconnect_reason_of(&outputs),
+                server.then_some(RakDisconnectReason::ProtocolViolation)
+            );
+        }
+    }
+}
+
+/// A transferred closer must retry the original notification without creating another ordered message.
+#[test]
+fn closing_snapshot_preserves_notification_retry() {
+    let start = domain_time();
+    let mut sender = session(1, 1);
+    sender.handle(SessionInput::Disconnect(start)).unwrap();
+    drain_outputs(&mut sender);
+    let reliable = sender.outbound_rel;
+    let json = facet_json::to_string(&sender.snapshot(start)).unwrap();
+    let mut sender =
+        SessionEngine::restore(facet_json::from_str(&json).unwrap(), start, Duration::ZERO)
+            .unwrap();
+    assert!(sender.disconnect_sent);
+    let due = sender.outbound_resend.peek().unwrap().0.0;
+    sender.handle(SessionInput::Update(due)).unwrap();
+    assert!(
+        payloads_of(&drain_outputs(&mut sender))
+            .iter()
+            .any(|p| p.as_ref() == [0x15])
+    );
+    assert_eq!(sender.outbound_rel, reliable);
+}
+
+/// A remote close cannot acknowledge reliable application input on either side of its frame.
+#[test]
+fn disconnect_does_not_ack_unretained_reliable_frames() {
+    for reverse in [false, true] {
+        let mut receiver = session(0, 1);
+        let now = domain_time();
+        let mut frames = vec![
+            Frame::new(RakReliability::Reliable, Box::from([0xfe])),
+            Frame::new(RakReliability::Unreliable, Box::from([0x15])),
+        ];
+        if reverse {
+            frames.reverse();
+        }
+        let SessionInput::Datagram(bytes, _) = datagram_at(0, frames, now) else {
+            unreachable!()
+        };
+        receiver.handle_datagram(bytes, now, false).unwrap();
+        let outputs = drain_outputs(&mut receiver);
+        assert!(datagrams_of(&outputs).is_empty());
+        assert_eq!(
+            disconnect_reason_of(&outputs),
+            Some(RakDisconnectReason::Remote)
+        );
+    }
+}
+
+/// Acknowledged split bytes remain available when the remaining fragments arrive after cleanup.
+#[test]
+fn acknowledged_reliable_split_survives_cleanup_and_delivers_once() {
+    for reliability in [RakReliability::Reliable, RakReliability::ReliableOrdered] {
+        for transfer in [false, true] {
+            let start = domain_time();
+            let mut sender = session(1, 1);
+            let mut receiver = session(2, 2);
+            let payload = vec![0xfe; 2048].into_boxed_slice();
+            sender
+                .handle(SessionInput::Send(
+                    payload.clone(),
+                    reliability,
+                    RakPriority::Immediate,
+                    start,
+                ))
+                .unwrap();
+            let first = datagrams_of(&drain_outputs(&mut sender));
+            assert_eq!(first.len(), 1);
+            let sequence = FrameSet::deserialize(&mut Cursor::new(first[0].as_ref()))
+                .unwrap()
+                .sequence;
+            receiver
+                .handle(SessionInput::Datagram(first[0].clone(), start))
+                .unwrap();
+            receiver.tick(start).unwrap();
+            deliver(&mut receiver, &mut sender, start);
+            assert!(
+                !sender.outbound_cache.contains_key(&sequence),
+                "the first fragment was acknowledged"
+            );
+            sender.tick(start + Duration::from_millis(1)).unwrap();
+            let delayed = datagrams_of(&drain_outputs(&mut sender));
+            assert!(!delayed.is_empty());
+            let retained = receiver.inbound_spl_bytes;
+            assert!(retained > 0);
+            let keepalive = start + SESSION_TIMEOUT / 2;
+            receiver
+                .handle(SessionInput::Datagram(
+                    Ack::new(vec![], false).serialized().unwrap(),
+                    keepalive,
+                ))
+                .unwrap();
+            let now = if transfer {
+                let snapshot = receiver.snapshot(keepalive);
+                let destination = start + Duration::from_secs(3600);
+                receiver = SessionEngine::restore(
+                    snapshot,
+                    destination,
+                    SESSION_TIMEOUT / 2 + Duration::from_millis(1),
+                )
+                .unwrap();
+                destination
+            } else {
+                start + SESSION_TIMEOUT + Duration::from_millis(1)
+            };
+            receiver.handle(SessionInput::Update(now)).unwrap();
+            assert_eq!(receiver.state, RakSessionState::Connected);
+            drain_outputs(&mut receiver);
+            for bytes in &delayed {
+                receiver
+                    .handle(SessionInput::Datagram(bytes.clone(), now))
+                    .unwrap();
+            }
+            receiver.tick(now).unwrap();
+            let outputs = drain_outputs(&mut receiver);
+            let delivered: Vec<_> = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    RakSessionOutput::Packet(bytes) => Some(bytes.clone()),
+                    _ => None,
+                })
+                .collect();
+            for bytes in datagrams_of(&outputs) {
+                sender.handle(SessionInput::Datagram(bytes, now)).unwrap();
+            }
+            assert_eq!(
+                sender.outbound_bytes(),
+                0,
+                "the remaining fragments were acknowledged too"
+            );
+            assert_eq!(delivered, vec![payload]);
+            assert_eq!(receiver.inbound_spl_bytes, 0);
+            assert!(receiver.inbound_spl_queue.is_empty());
+            for bytes in delayed {
+                receiver
+                    .handle(SessionInput::Datagram(
+                        bytes,
+                        now + Duration::from_millis(1),
+                    ))
+                    .unwrap();
+            }
+            assert!(
+                packets(&mut receiver).is_empty(),
+                "retries must not deliver the message twice"
+            );
+        }
+    }
+}
+
+/// A malformed queued control cannot discard a later message whose receipt was acknowledged.
+#[test]
+fn acknowledged_ordered_tail_survives_malformed_control() {
+    for transfer in [false, true] {
+        for backpressured in [false, true] {
+            for server in [false, true] {
+                let mut receiver = session(0, 1);
+                receiver.reject_malformed = server;
+                let mut now = domain_time();
+                for (sequence, frame) in [
+                    ordered_payload(1, &[packet_id::CONNECTED_PING]),
+                    ordered_payload(2, &[0xfe, 2]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    receiver
+                        .handle(datagram_at(sequence as u32, vec![frame], now))
+                        .unwrap();
+                }
+                receiver.tick(now).unwrap();
+                let acknowledged: Vec<_> = outbound_acks(&mut receiver)
+                    .into_iter()
+                    .map(|bytes| Ack::deserialize(&mut bytes.as_ref()).unwrap())
+                    .filter(|ack| !ack.is_nack)
+                    .flat_map(|ack| ack.sequences)
+                    .collect();
+                assert!(acknowledged.contains(&0) && acknowledged.contains(&1));
+                assert!(receiver.inbound_ord_bytes > 0);
+                if transfer {
+                    let saved = receiver.snapshot(now);
+                    now += Duration::from_secs(3600);
+                    receiver = SessionEngine::restore(saved, now, Duration::ZERO).unwrap();
+                }
+                let gap = FrameSet::new(
+                    2,
+                    vec![ordered_payload(0, &[packet_id::DETECT_LOST_CONNECTIONS])],
+                    false,
+                    false,
+                    false,
+                )
+                .serialized()
+                .unwrap();
+                assert!(receiver.handle_datagram(gap, now, !backpressured).is_err());
+                if server {
+                    assert_eq!(
+                        disconnect_reason(&receiver),
+                        Some(RakDisconnectReason::ProtocolViolation)
+                    );
+                    assert!(packets(&mut receiver).is_empty());
+                } else {
+                    assert_eq!(receiver.state, RakSessionState::Connected);
+                    assert_eq!(packets(&mut receiver), vec![Box::from([0xfe, 2])]);
+                    assert_eq!(receiver.inbound_ord_bytes, 0);
+                    receiver
+                        .handle(datagram_at(3, vec![ordered_payload(3, &[0xfe, 3])], now))
+                        .unwrap();
+                    assert_eq!(packets(&mut receiver), vec![Box::from([0xfe, 3])]);
+                    receiver
+                        .handle(datagram_at(4, vec![ordered_payload(2, &[0xfe, 2])], now))
+                        .unwrap();
+                    assert!(packets(&mut receiver).is_empty());
+                }
+            }
+        }
+    }
 }

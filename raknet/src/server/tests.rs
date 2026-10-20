@@ -1,4 +1,6 @@
 use super::*;
+use crate::protocol::packets::frame_set::FrameSet;
+use crate::protocol::types::frame::Frame;
 
 /// Exercises the explicitly configured online quota independently of serving defaults.
 fn online_limited_config() -> RakServerConfig {
@@ -1340,4 +1342,127 @@ fn idle_updates_preserve_the_original_online_window_boundary() {
         ))
         .unwrap();
     assert!(routed_session_ids(&mut server).is_empty());
+}
+
+/// Invalid online framing retires a pending route before its next maintenance pass.
+#[test]
+fn malformed_pending_datagram_releases_the_session_route() {
+    let now = crate::clock::test_now();
+    let server_addr = "127.0.0.1:19132".parse().unwrap();
+    let client_addr = "127.0.0.1:2".parse().unwrap();
+    let mut server = ServerEngine::new(
+        RakServerConfig::default(),
+        server_addr,
+        crate::clock::RakClock::new(now),
+        now,
+    );
+    server
+        .handle(RakServerInput::Datagram(
+            request_1(constants::PROTOCOL),
+            client_addr,
+            now,
+        ))
+        .unwrap();
+    let cookie = reply_cookie(&mut server);
+    server
+        .handle(RakServerInput::Datagram(
+            request_2(server_addr, 1, cookie),
+            client_addr,
+            now,
+        ))
+        .unwrap();
+    drain(&mut server);
+    assert!(server.session_pending.contains_key(&client_addr));
+    server
+        .handle(RakServerInput::Datagram(
+            Box::from([0x80, 0, 0, 0, 0]),
+            client_addr,
+            now,
+        ))
+        .unwrap();
+    assert!(!server.session_pending.contains_key(&client_addr));
+    assert!(!server.session_map.contains_key(&client_addr));
+    server.handle(RakServerInput::Update(now)).unwrap();
+}
+
+/// A queued handshake prefix cannot keep a terminated pending route alive or stop its neighbor.
+#[test]
+fn malformed_control_after_handshake_prefix_releases_pending_routes() {
+    let now = crate::clock::test_now();
+    let server_addr = "127.0.0.1:19132".parse().unwrap();
+    let client_addr = "127.0.0.1:2".parse().unwrap();
+    let neighbor = "127.0.0.1:3".parse().unwrap();
+    let mut server = ServerEngine::new(
+        RakServerConfig::default(),
+        server_addr,
+        crate::clock::RakClock::new(now),
+        now,
+    );
+    for addr in [client_addr, neighbor] {
+        server
+            .handle(RakServerInput::Datagram(
+                request_1(constants::PROTOCOL),
+                addr,
+                now,
+            ))
+            .unwrap();
+        let cookie = reply_cookie(&mut server);
+        server
+            .handle(RakServerInput::Datagram(
+                request_2(server_addr, 1, cookie),
+                addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+    }
+    let request = ConnectionRequest {
+        client_guid: 1,
+        client_timestamp: 0,
+        security: false,
+    }
+    .serialized()
+    .unwrap();
+    let bytes = FrameSet::new(
+        0,
+        vec![
+            Frame::new(RakReliability::Unreliable, request.clone()),
+            Frame::new(
+                RakReliability::Unreliable,
+                Box::from([packet_id::CONNECTED_PING]),
+            ),
+        ],
+        false,
+        false,
+        false,
+    )
+    .serialized()
+    .unwrap();
+    server
+        .handle(RakServerInput::Datagram(bytes, client_addr, now))
+        .unwrap();
+    assert!(!server.session_pending.contains_key(&client_addr));
+    assert!(!server.session_map.contains_key(&client_addr));
+    assert!(
+        !server
+            .session_addr
+            .values()
+            .any(|addr| *addr == client_addr)
+    );
+    assert!(server.session_pending.contains_key(&neighbor));
+    server.handle(RakServerInput::Update(now)).unwrap();
+    drain(&mut server);
+    let bytes = FrameSet::new(
+        0,
+        vec![Frame::new(RakReliability::Unreliable, request)],
+        false,
+        false,
+        false,
+    )
+    .serialized()
+    .unwrap();
+    server
+        .handle(RakServerInput::Datagram(bytes, neighbor, now))
+        .unwrap();
+    assert!(!drain(&mut server).is_empty());
 }
