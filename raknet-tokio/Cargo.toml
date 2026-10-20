@@ -12,5 +12,18 @@ raknet = { path = "../raknet" }
 tracing-subscriber = "0.3.23"
 thiserror = "2"
 
+[features]
+# Exposes the UDP impairment proxy and core codecs for interop tests and benchmarks.
+test-support = ["raknet/test-support"]
+
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1.52.3", features = ["full", "test-util"] }
+
+[[bench]]
+name = "loopback"
+harness = false
+
+[[test]]
+name = "go_interop"
+required-features = ["test-support"]

@@ -18,5 +18,24 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
+[features]
+# Exposes wire codecs and fixtures for benchmarks and cross-implementation tests.
+test-support = []
+
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 facet-json = "0.46"
+
+[[bench]]
+name = "codec"
+harness = false
+required-features = ["test-support"]
+
+[[bench]]
+name = "session"
+harness = false
+required-features = ["test-support"]
+
+[[test]]
+name = "go_golden"
+required-features = ["test-support"]

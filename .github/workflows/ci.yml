@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,6 +22,63 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/go-raknet/go.mod
+          cache-dependency-path: tools/go-raknet/go.sum
+      # The go-raknet interop tests run against this peer instead of skipping.
+      - name: Build go-raknet peer
+        shell: bash
+        working-directory: tools/go-raknet
+        run: |
+          peer="$RUNNER_TEMP/go-raknet-peer${{ runner.os == 'Windows' && '.exe' || '' }}"
+          go build -o "$peer" ./cmd/peer
+          echo "RAKNET_GO_PEER=$peer" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo test --locked --workspace --all-features
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  go:
+    name: Go helper
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/go-raknet
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/go-raknet/go.mod
+          cache-dependency-path: tools/go-raknet/go.sum
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      # Goldens and bench inputs under testdata/ must match what go-raknet produces.
+      - run: go run ./cmd/inpkg -run TestParityGolden -count=1
+
+  # Not required: known slower Rust paths exist until the follow-up fixes land.
+  bench:
+    name: Benchmarks (Go vs Rust)
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/go-raknet/go.mod
+          cache-dependency-path: tools/go-raknet/go.sum
+      - name: Go benchmarks
+        working-directory: tools/go-raknet
+        run: |
+          go run ./cmd/inpkg -run '^$' -bench . -benchmem -count 3 | tee "$RUNNER_TEMP/go-bench.txt"
+          go test -run '^$' -bench . -benchmem -count 3 . | tee -a "$RUNNER_TEMP/go-bench.txt"
+      - name: Rust benchmarks
+        run: |
+          cargo bench --locked -p raknet --features test-support --bench codec --bench session
+          cargo bench --locked -p raknet-tokio --bench loopback
+      - name: Compare
+        working-directory: tools/go-raknet
+        run: |
+          go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" | tee -a "$GITHUB_STEP_SUMMARY"

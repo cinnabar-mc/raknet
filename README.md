@@ -237,6 +237,9 @@ cargo doc --locked --workspace --no-deps
 Use the focused core command when working only on the protocol engine; workspace
 commands also build the Tokio and Bevy adapters.
 
+The `test-support` features enable golden, interop and benchmark comparisons
+against go-raknet; see [tools/go-raknet](tools/go-raknet/README.md).
+
 ## License and attribution
 
 The original Rust implementation and this fork use the
