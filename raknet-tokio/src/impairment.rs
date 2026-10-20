@@ -76,8 +76,8 @@ struct Shared {
 }
 
 enum Command {
-    Inject(Direction, Vec<u8>),
-    Outage(Duration),
+    Inject(Direction, Vec<u8>, tokio::sync::oneshot::Sender<()>),
+    Outage(Duration, tokio::sync::oneshot::Sender<()>),
 }
 
 /// A running proxy; dropping it stops forwarding.
@@ -152,16 +152,32 @@ impl UdpImpairment {
     }
 
     /// Sends raw bytes towards one side, as if the other side had sent them.
-    pub fn inject(&self, direction: Direction, bytes: Vec<u8>) {
-        let _ = self.commands.send(Command::Inject(direction, bytes));
+    ///
+    /// Returns once they are written, ahead of any datagram the proxy forwards later.
+    pub async fn inject(&self, direction: Direction, bytes: Vec<u8>) {
+        let (sent, wait) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(Command::Inject(direction, bytes, sent))
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
     }
 
-    /// Closes the proxy port for `duration`, then rebinds it.
+    /// Closes the proxy port for `duration`, returning once it is closed; it then rebinds.
     ///
     /// Peers sending meanwhile receive ICMP port-unreachable replies, which
     /// connected sockets report as transient send or receive errors.
-    pub fn outage(&self, duration: Duration) {
-        let _ = self.commands.send(Command::Outage(duration));
+    pub async fn outage(&self, duration: Duration) {
+        let (closed, wait) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(Command::Outage(duration, closed))
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
     }
 }
 
@@ -270,12 +286,19 @@ async fn run(
             }
             _ = async { sleep_until(next_due.unwrap()).await }, if next_due.is_some() => {}
             command = commands.recv() => match command {
-                Some(Command::Inject(direction, bytes)) => {
-                    order += 1;
-                    queue.push(Scheduled { due: Reverse(Instant::now()), order: Reverse(order), direction: direction.index(), bytes });
+                Some(Command::Inject(direction, bytes, sent)) => {
+                    let target = match direction {
+                        Direction::ToUpstream => Some(upstream),
+                        Direction::ToClient => shared.lock().unwrap().client,
+                    };
+                    if let Some(target) = target {
+                        let _ = socket.send_to(&bytes, target).await;
+                    }
+                    let _ = sent.send(());
                 }
-                Some(Command::Outage(duration)) => {
+                Some(Command::Outage(duration, closed)) => {
                     drop(socket);
+                    let _ = closed.send(());
                     sleep(duration).await;
                     socket = match UdpSocket::bind(addr).await {
                         Ok(socket) => socket,

@@ -18,53 +18,35 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-/// Codec cases whose Rust outcome is known to differ from go-raknet, with the reason.
+/// Codec cases known to differ from go-raknet, with the exact Rust decode outcome each must keep.
 const CODEC_DIVERGENCES: &[(&str, &str)] = &[
     // Known: system-address parsing rejects what go-raknet tolerates (e4fd2fe).
-    (
-        "addr/unknown_family",
-        "unknown address family aborts instead of parsing as IPv6",
-    ),
-    (
-        "cra/unknown_family_address",
-        "unknown address family aborts",
-    ),
-    (
-        "cra/twenty_one_addresses",
-        "more than 20 system addresses abort",
-    ),
-    (
-        "nic/twenty_one_addresses",
-        "more than 20 system addresses abort",
-    ),
+    ("addr/unknown_family", "err"),
+    ("cra/unknown_family_address", "err"),
+    ("cra/twenty_one_addresses", "err"),
+    ("nic/twenty_one_addresses", "err"),
     // Known: 26.30 BDS LAN-off pong without a length field (fbf9894/703ec90).
-    ("pong/bds_no_length_field", "requires the u16 data length"),
+    ("pong/bds_no_length_field", "err"),
     // Known: the pong must carry the offline magic, which go-raknet does not check.
-    ("pong/bad_magic", "rejects a pong with the wrong magic"),
+    ("pong/bad_magic", "err"),
     // Known: a split flag with count 0 is read as unsplit (403fe0a).
     (
         "frame/split_header_count_zero",
-        "split flag with count 0 treated as unsplit",
+        "ok n=26 rel=3 msg=0 seq=0 ord=0 split=0:0/2/0 payload=706172697479",
     ),
     // New: go-raknet's entry cap admits 8193 entries; Rust stops at 8192.
-    (
-        "ack/over_max_entries",
-        "rejects an ACK expanding to 8193 entries",
-    ),
+    ("ack/over_max_entries", "err"),
     // New: go-raknet reads an unknown record type as nothing; Rust reads it as a single.
-    (
-        "ack/unknown_record_type",
-        "unknown ACK record type read as a single sequence",
-    ),
+    ("ack/unknown_record_type", "ok nack=0 seqs=9"),
     // New: a truncated trailing frame ends the frame list instead of failing the datagram.
     (
         "datagram/trailing_garbage",
-        "truncated trailing frame silently ignored",
+        "ok flags=80 seq=2 frames=[rel=0 msg=0 seq=0 ord=0 split=0:0/0/0 payload=706172697479]",
     ),
     // New: payload bit lengths round up to whole bytes; go-raknet truncates.
     (
         "frame/bit_length_not_byte_aligned",
-        "bit length rounded up instead of down",
+        "ok n=12 rel=0 msg=0 seq=0 ord=0 split=0:0/0/0 payload=010203040506070809",
     ),
 ];
 
@@ -73,17 +55,19 @@ const HANDSHAKE_DIVERGENCES: &[(&str, &[&str])] = &[
     (
         "listen_plain",
         &[
-            // Known: Reply 1 is not padded to the granted MTU (1f3b495).
-            "offline[0] id=0x06: go 1464 bytes, rust 28 bytes",
-            // Known: accepted-connection system addresses differ (109968c).
-            "frame[0]: go rel=3 msg=0 ord=0 split=0 id=0x10 166 bytes, rust rel=3 msg=0 ord=0 split=0 id=0x10 96 bytes",
+            // Known: Reply 1 is not padded to the granted MTU (1f3b495); its bytes otherwise match.
+            "offline[0] id=0x06: go zero-pads to 1464 bytes, rust sends the same 28 bytes unpadded",
+            // Known: accepted-connection system addresses differ (109968c); the rest matches.
+            "frame[0] rel=3 msg=0 ord=0 split=0 system addresses: go [127.0.0.1:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0], rust [0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0]",
         ],
     ),
     (
         "listen_cookie",
         &[
-            "offline[0] id=0x06: go 1464 bytes, rust 32 bytes",
-            "frame[0]: go rel=3 msg=0 ord=0 split=0 id=0x10 166 bytes, rust rel=3 msg=0 ord=0 split=0 id=0x10 96 bytes",
+            // Known: Reply 1 is not padded to the granted MTU (1f3b495); its bytes otherwise match.
+            "offline[0] id=0x06: go zero-pads to 1464 bytes, rust sends the same 32 bytes unpadded",
+            // Known: accepted-connection system addresses differ (109968c); the rest matches.
+            "frame[0] rel=3 msg=0 ord=0 split=0 system addresses: go [127.0.0.1:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0], rust [0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0,0.0.0.0:0]",
         ],
     ),
 ];
@@ -289,7 +273,7 @@ fn codec_matches_go_raknet() {
             ));
         }
         if !diff.is_empty() {
-            mismatches.insert(id, diff.join("; "));
+            mismatches.insert(id, (rust, diff.join("; ")));
         }
     }
     let mut problems = Vec::new();
@@ -304,9 +288,13 @@ fn codec_matches_go_raknet() {
             ));
         }
     }
-    for (case, diff) in &mismatches {
-        if !CODEC_DIVERGENCES.iter().any(|(c, _)| c == case) {
-            problems.push(format!("{case}: {diff}"));
+    for (case, (rust, diff)) in &mismatches {
+        match CODEC_DIVERGENCES.iter().find(|(c, _)| c == case) {
+            Some((_, expected)) if expected == rust && !diff.contains("encode:") => {}
+            Some((_, expected)) => problems.push(format!(
+                "{case}: divergence changed; expected rust `{expected}`, now {diff}"
+            )),
+            None => problems.push(format!("{case}: {diff}")),
         }
     }
     assert!(
@@ -406,12 +394,8 @@ fn compare(go: &[Line], rust: &[(u64, Vec<u8>)], side_c2s: bool) -> Vec<String> 
         match (go_offline.get(i), rust_offline.get(i)) {
             (Some(g), Some((ms, bytes))) => {
                 let id = unhex(&g.hex)[0];
-                if !matches(&g.hex, bytes) {
-                    out.push(format!(
-                        "offline[{i}] id={id:#04x}: go {} bytes, rust {} bytes",
-                        g.hex.len() / 2,
-                        bytes.len()
-                    ));
+                if let Some(mismatch) = offline_mismatch(&g.hex, bytes) {
+                    out.push(format!("offline[{i}] {mismatch}"));
                 } else if g.ms != *ms {
                     out.push(format!(
                         "offline[{i}] id={id:#04x}: go at {}ms, rust at {ms}ms",
@@ -448,13 +432,10 @@ fn compare(go: &[Line], rust: &[(u64, Vec<u8>)], side_c2s: bool) -> Vec<String> 
         match (go_frames.get(i), rust_frames.get(i)) {
             (Some((gms, gh, gp)), Some((rms, rh, rp))) => {
                 let id = rp.first().copied().unwrap_or(0xff);
-                if gh != rh || !matches(gp, rp) {
-                    out.push(format!(
-                        "frame[{i}]: go {gh} id={:#04x} {} bytes, rust {rh} id={id:#04x} {} bytes",
-                        unhex(gp).first().copied().unwrap_or(0xff),
-                        gp.len() / 2,
-                        rp.len()
-                    ));
+                if gh != rh {
+                    out.push(format!("frame[{i}]: go {gh} {gp}, rust {rh} {}", hex(rp)));
+                } else if let Some(mismatch) = payload_mismatch(gp, rp) {
+                    out.push(format!("frame[{i}] {gh} {mismatch}"));
                 } else if gms != rms {
                     out.push(format!(
                         "frame[{i}] id={id:#04x}: go at {gms}ms, rust at {rms}ms"
@@ -473,6 +454,70 @@ fn compare(go: &[Line], rust: &[(u64, Vec<u8>)], side_c2s: bool) -> Vec<String> 
         }
     }
     out
+}
+
+/// Compares an offline datagram exactly, except for go-raknet's zero padding of Reply 1.
+fn offline_mismatch(pattern: &str, bytes: &[u8]) -> Option<String> {
+    if matches(pattern, bytes) {
+        return None;
+    }
+    let id = bytes.first().copied().unwrap_or(0xff);
+    let unpadded = pattern.get(..2 * bytes.len());
+    if id == 0x06
+        && unpadded.is_some_and(|head| matches(head, bytes))
+        && pattern[2 * bytes.len()..].bytes().all(|c| c == b'0')
+    {
+        return Some(format!(
+            "id=0x06: go zero-pads to {} bytes, rust sends the same {} bytes unpadded",
+            pattern.len() / 2,
+            bytes.len()
+        ));
+    }
+    Some(format!("id={id:#04x}: go {pattern}, rust {}", hex(bytes)))
+}
+
+/// Decodes a run of wire addresses, or reports where it stopped.
+fn render_address_run(mut bytes: &[u8]) -> String {
+    let mut addrs = Vec::new();
+    while !bytes.is_empty() {
+        match SocketAddr::deserialize(&mut bytes) {
+            Ok(addr) => addrs.push(addr.to_string()),
+            Err(_) => {
+                addrs.push(format!("undecodable {}", hex(bytes)));
+                break;
+            }
+        }
+    }
+    addrs.join(",")
+}
+
+/// Compares a connected payload exactly, except for a connection-accepted system-address list.
+///
+/// The client address, system index and trailing timestamps still compare byte for byte.
+fn payload_mismatch(pattern: &str, bytes: &[u8]) -> Option<String> {
+    if matches(pattern, bytes) {
+        return None;
+    }
+    let go = unhex(pattern);
+    let generic = || Some(format!("payload: go {pattern}, rust {}", hex(bytes)));
+    if go.first() != Some(&0x10) || bytes.first() != Some(&0x10) || bytes.len() < 2 {
+        return generic();
+    }
+    let address = if bytes[1] == 6 { 29 } else { 7 };
+    let head = 1 + address + 2;
+    let tail = 16;
+    if go.len() < head + tail || bytes.len() < head + tail || go[1] != bytes[1] {
+        return generic();
+    }
+    let (go_head, go_tail) = (&pattern[..2 * head], &pattern[pattern.len() - 2 * tail..]);
+    if !matches(go_head, &bytes[..head]) || !matches(go_tail, &bytes[bytes.len() - tail..]) {
+        return generic();
+    }
+    Some(format!(
+        "system addresses: go [{}], rust [{}]",
+        render_address_run(&go[head..go.len() - tail]),
+        render_address_run(&bytes[head..bytes.len() - tail])
+    ))
 }
 
 const CLIENT: &str = "10.0.0.2:50000";
