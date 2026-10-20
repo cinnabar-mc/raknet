@@ -42,9 +42,7 @@ use Outcome::{Closed, Delivered, TimedOut};
 /// Equal pairs are parity; unequal pairs are recorded divergences.
 const EXPECTED: &[(&str, Outcome, Outcome)] = &[
     ("loss_burst_receiver/client", Delivered, Delivered),
-    // New: the client recovers from a gap over 2048 datagrams since the 50000 gap
-    // fix (6fc4d7c), but a server session still delivers nothing after one.
-    ("loss_burst_receiver/server", TimedOut, Delivered),
+    ("loss_burst_receiver/server", Delivered, Delivered),
     // Known: the disconnect notification is sent once, not until acknowledged (98dc6d1).
     // The outcome is whether the closer's peer saw the close within 2 s.
     ("lost_disconnect_closer/client", TimedOut, Closed),
