@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-type Pair = (RakSession<Established>, RakSession<Established>, Instant);
+pub(crate) type Pair = (RakSession<Established>, RakSession<Established>, Instant);
 
 /// Drops one actual reliable control datagram, without manufacturing protocol input.
 fn drop_first_control(bytes: &[u8], wanted: u8, dropped: &mut bool) -> bool {
@@ -33,7 +33,7 @@ fn drop_first_control(bytes: &[u8], wanted: u8, dropped: &mut bool) -> bool {
 }
 
 /// Runs both public endpoints under one caller clock and drops only the selected wire control.
-fn negotiate_after_loss(autoflush: bool, lost_control: u8) -> Option<Pair> {
+pub(crate) fn negotiate_after_loss(autoflush: bool, lost_control: u8) -> Option<Pair> {
     let start = crate::clock::test_now();
     let local: SocketAddr = "127.0.0.1:54321".parse().unwrap();
     let remote: SocketAddr = "127.0.0.1:19132".parse().unwrap();

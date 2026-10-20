@@ -118,6 +118,29 @@ impl<S: SessionPhase> RakSession<S> {
     pub fn expiry_deadline(&self, now: Instant) -> Option<Instant> {
         self.engine.expiry_deadline(now)
     }
+    /// Services the same input while deferring new application payload admission.
+    ///
+    /// New reliable application frames are refused before receipt commitment, so
+    /// their datagram is not acknowledged and the peer can retry after pressure
+    /// clears. Already accepted payloads and fragments remain owned. Unreliable
+    /// payloads have no retry guarantee. Canonical framing and control handling
+    /// still run; ordered controls cannot overtake their preceding messages.
+    pub fn handle_backpressured(&mut self, input: RakSessionInput) -> Result<(), RakSessionError> {
+        self.engine.handle_backpressured(input)
+    }
+    /// Takes wire/control output without consuming retained application packets.
+    ///
+    /// Datagram, Wait and Disconnected outputs keep their relative order in the
+    /// original queue. Packet outputs remain in FIFO order for ordinary `poll`.
+    /// An adapter must retain that packet prefix before publishing the observed
+    /// terminal to its application; `finish` still refuses pending output.
+    pub fn poll_control(&mut self) -> Option<RakSessionOutput> {
+        let output = self.engine.poll_control()?;
+        if let RakSessionOutput::Disconnected(_, reason) = &output {
+            self.terminal = Some(*reason);
+        }
+        Some(output)
+    }
     /// Returns the congestion controller's current round-trip estimate.
     pub fn rtt(&self) -> Duration {
         self.engine.rtt()

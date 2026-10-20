@@ -62,6 +62,7 @@ impl SessionEngine {
         &mut self,
         buf: &mut Cursor<&[u8]>,
         now: Instant,
+        admit_application: bool,
     ) -> Result<(), RakSessionError> {
         let set = FrameSet::deserialize(buf)?;
 
@@ -103,6 +104,10 @@ impl SessionEngine {
         for frame in set.frames {
             if matches!(self.state, RakSessionState::Disconnected) {
                 break;
+            }
+            if !admit_application && self.defer_application(&frame) {
+                self.inbound_deferred |= frame.reliability.is_reliable();
+                continue;
             }
             result = self.handle_frame(frame, now);
             if result.is_err() {
@@ -221,14 +226,7 @@ impl SessionEngine {
 
         if frame.reliability.is_reliable() {
             let ahead = u24::distance(self.inbound_rel_base, frame.reliable_index);
-            let seen = ahead < 0
-                || (ahead > 0
-                    && ranges::contains(
-                        &self.inbound_rel_ahead,
-                        self.inbound_rel_base,
-                        frame.reliable_index,
-                    ));
-            if seen {
+            if self.reliable_seen(frame.reliable_index) {
                 return 0;
             }
             if ahead > 0 {
