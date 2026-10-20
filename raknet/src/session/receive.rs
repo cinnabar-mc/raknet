@@ -331,31 +331,26 @@ impl SessionEngine {
                 self.inbound_seq_idx[channel] = 0;
                 self.inbound_ord_idx[channel] = u24::add(frame.order_index, 1);
 
-                self.handle_packet(frame.payload, now)?;
-
-                let mut idx = self.inbound_ord_idx[channel];
-
-                let mut packets = Vec::new();
+                let mut result = self.handle_packet(frame.payload, now);
+                // Keep the accepted tail owned until dispatch reaches each frame.
+                while self.state != RakSessionState::Disconnected
+                    && (result.is_ok() || !self.reject_malformed)
                 {
-                    let unord_queue = self
+                    let idx = self.inbound_ord_idx[channel];
+                    let Some(next) = self
                         .inbound_ord_queue
-                        .entry(frame.order_channel)
-                        .or_default();
-                    while let Some(unord_frame) = unord_queue.remove(&idx) {
-                        self.inbound_ord_bytes = self
-                            .inbound_ord_bytes
-                            .saturating_sub(frame_cost(&unord_frame));
-                        packets.push(unord_frame.payload);
-
-                        idx = u24::add(idx, 1);
-                    }
+                        .get_mut(&frame.order_channel)
+                        .and_then(|queue| queue.remove(&idx))
+                    else {
+                        break;
+                    };
+                    self.inbound_ord_bytes =
+                        self.inbound_ord_bytes.saturating_sub(frame_cost(&next));
+                    self.inbound_ord_idx[channel] = u24::add(idx, 1);
+                    let dispatched = self.handle_packet(next.payload, now);
+                    result = result.and(dispatched);
                 }
-                self.inbound_ord_idx[channel] = idx;
-
-                for packet in packets {
-                    self.handle_packet(packet, now)?;
-                }
-                return Ok(());
+                return result;
             }
 
             if ahead >= ORDER_WINDOW as i32 {

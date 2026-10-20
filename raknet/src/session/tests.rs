@@ -2311,3 +2311,71 @@ fn acknowledged_reliable_split_survives_cleanup_and_delivers_once() {
         }
     }
 }
+
+/// A malformed queued control cannot discard a later message whose receipt was acknowledged.
+#[test]
+fn acknowledged_ordered_tail_survives_malformed_control() {
+    for transfer in [false, true] {
+        for backpressured in [false, true] {
+            for server in [false, true] {
+                let mut receiver = session(0, 1);
+                receiver.reject_malformed = server;
+                let mut now = domain_time();
+                for (sequence, frame) in [
+                    ordered_payload(1, &[packet_id::CONNECTED_PING]),
+                    ordered_payload(2, &[0xfe, 2]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    receiver
+                        .handle(datagram_at(sequence as u32, vec![frame], now))
+                        .unwrap();
+                }
+                receiver.tick(now).unwrap();
+                let acknowledged: Vec<_> = outbound_acks(&mut receiver)
+                    .into_iter()
+                    .map(|bytes| Ack::deserialize(&mut bytes.as_ref()).unwrap())
+                    .filter(|ack| !ack.is_nack)
+                    .flat_map(|ack| ack.sequences)
+                    .collect();
+                assert!(acknowledged.contains(&0) && acknowledged.contains(&1));
+                assert!(receiver.inbound_ord_bytes > 0);
+                if transfer {
+                    let saved = receiver.snapshot(now);
+                    now += Duration::from_secs(3600);
+                    receiver = SessionEngine::restore(saved, now, Duration::ZERO).unwrap();
+                }
+                let gap = FrameSet::new(
+                    2,
+                    vec![ordered_payload(0, &[packet_id::DETECT_LOST_CONNECTIONS])],
+                    false,
+                    false,
+                    false,
+                )
+                .serialized()
+                .unwrap();
+                assert!(receiver.handle_datagram(gap, now, !backpressured).is_err());
+                if server {
+                    assert_eq!(
+                        disconnect_reason(&receiver),
+                        Some(RakDisconnectReason::ProtocolViolation)
+                    );
+                    assert!(packets(&mut receiver).is_empty());
+                } else {
+                    assert_eq!(receiver.state, RakSessionState::Connected);
+                    assert_eq!(packets(&mut receiver), vec![Box::from([0xfe, 2])]);
+                    assert_eq!(receiver.inbound_ord_bytes, 0);
+                    receiver
+                        .handle(datagram_at(3, vec![ordered_payload(3, &[0xfe, 3])], now))
+                        .unwrap();
+                    assert_eq!(packets(&mut receiver), vec![Box::from([0xfe, 3])]);
+                    receiver
+                        .handle(datagram_at(4, vec![ordered_payload(2, &[0xfe, 2])], now))
+                        .unwrap();
+                    assert!(packets(&mut receiver).is_empty());
+                }
+            }
+        }
+    }
+}
