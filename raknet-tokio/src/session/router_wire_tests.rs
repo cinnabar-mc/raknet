@@ -561,11 +561,16 @@ async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() 
             before_stale,
             "the peer's own stale timer cannot explain retirement"
         );
-        assert!(
-            wire_frames > 0
-                && reason == Some(RakDisconnectReason::Remote)
-                && state == RakSessionState::Disconnected,
-            "dropped public owner did not forward its actual peer disconnect: closing_first={closing_first}, wire_frames={wire_frames}, reason={reason:?}, state={state:?}"
-        );
+        if wire_frames == 0
+            || reason != Some(RakDisconnectReason::Remote)
+            || state != RakSessionState::Disconnected
+        {
+            missing.push(format!("closing_first={closing_first}, wire_frames={wire_frames}, reason={reason:?}, state={state:?}"));
+        }
     }
+    assert!(
+        missing.is_empty(),
+        "dropped public owners did not forward their actual peer disconnect: {}",
+        missing.join("; ")
+    );
 }
