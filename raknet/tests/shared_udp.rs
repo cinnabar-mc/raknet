@@ -569,6 +569,12 @@ fn shared_udp_retains_the_real_session_deadline_across_a_blocked_datagram() {
     application.try_send(peer, message.clone(), now).unwrap();
     let update_at = now + STEP;
     let original_deadline = update_at + RakSessionConfig::default().autoflush_interval_ms;
+    // Generate the Wait behind the datagram already emitted by the application write.
+    let live = application.live.get_mut(&peer).unwrap();
+    live.input_at = update_at;
+    live.session
+        .handle(RakSessionInput::Update(update_at))
+        .unwrap();
     let mut blocked_writes = 0;
     application
         .step_with_send(update_at, |_, _, _| {

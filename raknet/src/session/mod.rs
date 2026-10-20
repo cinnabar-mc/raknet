@@ -94,6 +94,7 @@ pub(crate) struct SessionEngine {
     pub(crate) outbound_rel: u32,
     outbound_queue: [VecDeque<Frame>; 4],
     outbound_cache: HashMap<u32, FrameSet>,
+    outbound_window: Option<OutboundWindow>,
     outbound_bytes: usize,
     outbound_resend: BinaryHeap<(Reverse<Instant>, u32)>,
     outbound_ord_idx: [u32; 32],
@@ -115,6 +116,13 @@ pub(crate) struct SessionEngine {
 
     output: VecDeque<RakSessionOutput>,
     control_cursor: usize,
+}
+
+/// Oldest retained frame indices, rebuilt after acknowledgements release ownership.
+#[derive(Clone, Copy, Debug)]
+struct OutboundWindow {
+    reliable: Option<u32>,
+    ordered: [Option<u32>; 32],
 }
 
 impl Sans for SessionEngine {
@@ -212,6 +220,7 @@ impl SessionEngine {
                 VecDeque::new(),
             ],
             outbound_cache: HashMap::new(),
+            outbound_window: None,
             outbound_bytes: 0,
             outbound_resend: BinaryHeap::new(),
             outbound_ord_idx: [0; 32],
@@ -473,16 +482,29 @@ impl SessionEngine {
             self.bandwidth_limited = self.outbound_queue.iter().any(|queue| !queue.is_empty());
             return Ok(());
         }
-        let oldest_reliable = self.oldest_unacked_reliable();
-        let oldest_ordered = self.oldest_unacked_ordered();
-        let mut splits_in_flight = self.splits_in_flight();
+        let window = match self.outbound_window {
+            Some(window) => window,
+            None => {
+                let window = OutboundWindow {
+                    reliable: self.oldest_unacked_reliable(),
+                    ordered: self.oldest_unacked_ordered(),
+                };
+                self.outbound_window = Some(window);
+                window
+            }
+        };
+        let mut splits_in_flight = if self.outbound_queue.iter().flatten().any(Frame::is_split) {
+            self.splits_in_flight()
+        } else {
+            HashSet::new()
+        };
 
         let mut frames = Vec::new();
         for queue in &mut self.outbound_queue {
             while let Some(frame) = queue.pop_front_if(|f| {
                 f.size_hint() <= bandwidth
-                    && within_reliable_window(f, oldest_reliable)
-                    && within_ordered_window(f, &oldest_ordered)
+                    && within_reliable_window(f, window.reliable)
+                    && within_ordered_window(f, &window.ordered)
                     && (!f.is_split()
                         || splits_in_flight.contains(&f.split_id)
                         || splits_in_flight.len() < MAX_SPLITS_IN_FLIGHT)
@@ -693,6 +715,12 @@ impl SessionEngine {
 
         let mut ord_idx = 0;
         let mut seq_idx = 0;
+        if self.outbound_window.is_some_and(|window| {
+            (reliability.is_reliable() && window.reliable.is_none())
+                || (reliability.is_ordered() && window.ordered[order_channel as usize].is_none())
+        }) {
+            self.outbound_window = None;
+        }
         if frame.reliability.is_sequenced() {
             ord_idx = self.outbound_ord_idx[order_channel as usize];
             seq_idx = {
@@ -771,6 +799,7 @@ impl SessionEngine {
             let Some(set) = self.outbound_cache.remove(&seq) else {
                 continue;
             };
+            self.outbound_window = None;
             self.outbound_bytes = self.outbound_bytes.saturating_sub(set.size_hint());
             match ack.is_nack {
                 true => {

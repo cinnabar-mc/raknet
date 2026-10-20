@@ -227,6 +227,7 @@ impl SessionEngine {
             outbound_rel: snapshot.outbound_rel,
             outbound_queue,
             outbound_cache,
+            outbound_window: None,
             outbound_bytes,
             outbound_resend: snapshot
                 .outbound_resend

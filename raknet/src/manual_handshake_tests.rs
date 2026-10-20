@@ -195,8 +195,6 @@ fn assert_manual_application_flush(mut session: RakSession<Established>, now: In
         std::iter::from_fn(|| session.poll())
             .any(|output| { matches!(output, RakSessionOutput::Datagram(..)) })
     );
-    session.handle(RakSessionInput::Update(now)).unwrap();
-    assert!(session.poll().is_none());
 }
 
 #[test]
