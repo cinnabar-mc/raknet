@@ -453,3 +453,119 @@ async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
     assert!(matches!(terminal_read, Err(RakSessionError::Closed)));
     assert_eq!(reason, Some(RakDisconnectReason::Timeout));
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() {
+    let mut observations = Vec::new();
+    for closing_first in [false, true] {
+        let now = Instant::now();
+        let config = RakSessionConfig {
+            max_outbound_bytes: OUTBOUND_BYTES,
+            ..Default::default()
+        };
+        let (local, peer) = crate::test_support::negotiated_pair(
+            "127.0.0.1:54321".parse().unwrap(),
+            "127.0.0.1:19132".parse().unwrap(),
+            now.into_std(),
+            now.into_std(),
+            config.clone(),
+        );
+        let peer_expiry = Instant::from_std(peer.expiry_deadline(now.into_std()).unwrap());
+        let cutoff = now + config.close_timeout;
+        let mut original = Original::new(local, peer);
+        let mut actor = original.actor.take().unwrap();
+        let session = original.session.take().unwrap();
+        let close_admitted = if closing_first {
+            match session.close() {
+                Ok(closing) => {
+                    drop(closing);
+                    true
+                }
+                Err(error) => {
+                    drop(error.into_parts().0);
+                    false
+                }
+            }
+        } else {
+            drop(session);
+            true
+        };
+        // Keep the actual wire consumer and input route alive after the public owner drops.
+        let observed = tokio::time::timeout_at(cutoff, async {
+            let mut joined = false;
+            let mut wire_open = true;
+            let mut wire_frames = 0;
+            let mut remote_reason = None;
+            while !joined || wire_open {
+                tokio::select! {
+                    result = &mut actor, if !joined => {
+                        result.map_err(|error| format!("original dropped-owner join: {error}"))?;
+                        joined = true;
+                    }
+                    frame = original.datagrams.recv(), if wire_open => {
+                        let Some(frame) = frame else {
+                            wire_open = false;
+                            continue;
+                        };
+                        let (bytes, address, _credit) = frame.into_parts();
+                        if address != original.address {
+                            return Err("original dropped-owner wire destination changed".to_owned());
+                        }
+                        wire_frames += 1;
+                        let peer = original.peer.as_mut().unwrap();
+                        peer.handle(RakSessionInput::Datagram(bytes, Instant::now().into_std()))
+                            .map_err(|error| format!("original dropped-owner peer input: {error}"))?;
+                        while let Some(output) = peer.poll() {
+                            if let RakSessionOutput::Disconnected(_, reason) = output {
+                                remote_reason = Some(reason);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<_, String>((
+                wire_frames,
+                remote_reason,
+                original.peer.as_ref().unwrap().state(),
+                original.disconnected.try_recv(),
+                Instant::now() < peer_expiry && cutoff < peer_expiry,
+            ))
+        }).await;
+        if !actor.is_finished() {
+            actor.abort();
+            let _ = actor.await;
+        }
+        let peer = original.peer.take().unwrap();
+        let mut cleanup = match peer.abort(Instant::now().into_std()) {
+            Ok(closing) => closing,
+            Err(error) => error.into_parts().0,
+        };
+        while cleanup.poll().is_some() {}
+        let peer_finished = cleanup.finish().is_ok();
+        let id = original.id;
+        drop(original);
+        observations.push((closing_first, close_admitted, observed, peer_finished, id));
+    }
+    let mut missing = Vec::new();
+    for (closing_first, close_admitted, observed, peer_finished, id) in observations {
+        assert!(
+            peer_finished,
+            "original peer cleanup failed: closing_first={closing_first}"
+        );
+        assert!(close_admitted, "the original local close was not admitted");
+        let (wire_frames, reason, state, retired, before_stale) = observed
+            .expect("the original dropped actor and wire consumer retire before their cutoff")
+            .expect("original route and peer input remain valid");
+        assert_eq!(retired, Ok(id), "original route retirement changed");
+        assert!(
+            before_stale,
+            "the peer's own stale timer cannot explain retirement"
+        );
+        assert!(
+            wire_frames > 0
+                && reason == Some(RakDisconnectReason::Remote)
+                && state == RakSessionState::Disconnected,
+            "dropped public owner did not forward its actual peer disconnect: closing_first={closing_first}, wire_frames={wire_frames}, reason={reason:?}, state={state:?}"
+        );
+    }
+}
