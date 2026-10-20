@@ -34,6 +34,7 @@ jobs:
           peer="$RUNNER_TEMP/go-raknet-peer${{ runner.os == 'Windows' && '.exe' || '' }}"
           go build -o "$peer" ./cmd/peer
           echo "RAKNET_GO_PEER=$peer" >> "$GITHUB_ENV"
+          echo "RAKNET_REQUIRE_GO_PEER=1" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo test --locked --workspace --all-features
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -60,7 +61,9 @@ jobs:
     name: Benchmarks (Go vs Rust)
     if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -72,6 +75,7 @@ jobs:
       - name: Go benchmarks
         working-directory: tools/go-raknet
         run: |
+          set -o pipefail
           go run ./cmd/inpkg -run '^$' -bench . -benchmem -count 3 | tee "$RUNNER_TEMP/go-bench.txt"
           go test -run '^$' -bench . -benchmem -count 3 . | tee -a "$RUNNER_TEMP/go-bench.txt"
       - name: Rust benchmarks
@@ -80,5 +84,14 @@ jobs:
           cargo bench --locked -p raknet-tokio --bench loopback
       - name: Compare
         working-directory: tools/go-raknet
+        # Exit 1 means a Rust path is slower beyond the margin: a warning while known
+        # slower paths remain. 2 (unreadable input) and 3 (missing measurement) fail.
         run: |
+          set +e -o pipefail
           go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" | tee -a "$GITHUB_STEP_SUMMARY"
+          status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::warning title=Benchmarks::Rust is slower than go-raknet beyond the margin on some paths; see the job summary"
+            exit 0
+          fi
+          exit "$status"

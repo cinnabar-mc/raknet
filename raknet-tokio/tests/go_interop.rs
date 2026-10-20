@@ -1,7 +1,8 @@
 //! Rust and go-raknet endpoints exchanging traffic through the impairment proxy.
 //!
 //! The Go side is `tools/go-raknet/cmd/peer`. Set `RAKNET_GO_PEER` to a built peer,
-//! or put `go` on PATH to build it; otherwise every test skips with a named reason.
+//! or put `go` on PATH to build it; otherwise every test skips with a named reason,
+//! or fails when `RAKNET_REQUIRE_GO_PEER` is set.
 //! A case listed in `DIVERGENCES` must still fail its go-raknet parity check, so a
 //! fix forces removal of its entry.
 
@@ -25,14 +26,11 @@ use tokio::time::timeout;
 
 /// Cases where the Rust endpoint is known to behave differently from go-raknet.
 const DIVERGENCES: &[(&str, &str)] = &[
-    // Known: datagrams 2048 or more ahead are dropped without advancing the window (6fc4d7c).
-    (
-        "loss_burst_to_rust/rust_client",
-        "receive window stalls permanently",
-    ),
+    // New: the client recovers from a gap over 2048 datagrams since the 50000 gap
+    // fix (6fc4d7c), but a server session still delivers nothing after one.
     (
         "loss_burst_to_rust/rust_server",
-        "receive window stalls permanently",
+        "server session stalls after a datagram gap over 2048",
     ),
     // Known: the disconnect notification is sent once, not until acknowledged (98dc6d1).
     (
@@ -109,9 +107,10 @@ macro_rules! require_peer {
         match peer_binary() {
             Some(path) => path,
             None => {
-                eprintln!(
-                    "skipping: missing fixture go-raknet peer (set RAKNET_GO_PEER or install Go to build tools/go-raknet/cmd/peer)"
-                );
+                let reason = "missing fixture go-raknet peer (set RAKNET_GO_PEER or install Go to build tools/go-raknet/cmd/peer)";
+                // CI sets this so a broken peer build fails instead of skipping.
+                assert!(std::env::var_os("RAKNET_REQUIRE_GO_PEER").is_none(), "{reason}");
+                eprintln!("skipping: {reason}");
                 return;
             }
         }
