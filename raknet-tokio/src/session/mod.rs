@@ -126,6 +126,7 @@ fn spawn<S: SessionPhase>(
         let timer = sleep(std::time::Duration::ZERO);
         tokio::pin!(timer);
         let mut pending = None;
+        let mut application_open = true;
         let mut wire_open = true;
         let mut expiry = None;
         loop {
@@ -140,9 +141,8 @@ fn spawn<S: SessionPhase>(
                     expiry = None;
                     let _ = close.reply.send(result);
                 }
-                _ = buf_tx.closed(), if wire_open => {
-                    wire_open = false;
-                    pending = None;
+                _ = buf_tx.closed(), if application_open => {
+                    application_open = false;
                     let _ = driver.close(Instant::now().into_std(), true);
                 }
                 _ = datagram_tx.closed(), if wire_open => {
