@@ -1,5 +1,7 @@
 mod client;
 mod configuration;
+#[cfg(feature = "test-support")]
+pub mod impairment;
 mod server;
 mod session;
 mod stop;

@@ -1,0 +1,8 @@
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020105954-88ff04df79bc h1:hlFLURL9T6a1nnmVG4+0gt/FZn8sIU0qwtLm1SWw9FI=
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020105954-88ff04df79bc/go.mod h1:U1Dj5n/GY3/5MgJnvjpy1JZshcsw0SNr6zA6T1XjdJA=
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020125603-201e797a7d39 h1:fnWQg0Vy4Ee104uaEvFZh9mRsVY/XPRHc9kJ023254E=
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020125603-201e797a7d39/go.mod h1:U1Dj5n/GY3/5MgJnvjpy1JZshcsw0SNr6zA6T1XjdJA=
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020153447-909a3db59ce7 h1:OGGCoo+3Bgcoqz9ZuA9NZktVFPNjZjWPdb4rtlUZ5co=
+github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020153447-909a3db59ce7/go.mod h1:U1Dj5n/GY3/5MgJnvjpy1JZshcsw0SNr6zA6T1XjdJA=
+github.com/lunar-bedrock/go-raknet v1.15.1-0.20261011190141-6124f52657d4 h1:Ham7dkXarppelkXYXpqt2hwkBA0w+piQR63NgT4SdUY=
+github.com/lunar-bedrock/go-raknet v1.15.1-0.20261011190141-6124f52657d4/go.mod h1:/yysjwfCXm2+2OY8mBazLzcxJ3irnylKCyG3FLgUPVU=

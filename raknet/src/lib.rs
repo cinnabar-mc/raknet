@@ -2,10 +2,18 @@
 mod client;
 mod clock;
 mod lifecycle;
+#[cfg(not(feature = "test-support"))]
 mod protocol;
+/// Wire codecs, reachable only for benchmarks and cross-implementation tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod protocol;
 mod sans;
 mod server;
 mod session;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod types;
 mod util;
 
