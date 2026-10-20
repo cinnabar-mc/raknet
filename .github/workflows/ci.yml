@@ -65,6 +65,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # GOMAXPROCS for the Go benchmarks; the comparator needs the same value.
+      BENCH_GO_PROCS: 4
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -77,8 +80,8 @@ jobs:
         working-directory: tools/go-raknet
         run: |
           set -o pipefail
-          go run ./cmd/inpkg -run '^$' -bench . -benchmem -count 3 | tee "$RUNNER_TEMP/go-bench.txt"
-          go test -run '^$' -bench . -benchmem -count 3 . | tee -a "$RUNNER_TEMP/go-bench.txt"
+          go run ./cmd/inpkg -run '^$' -bench . -benchmem -count 3 -cpu "$BENCH_GO_PROCS" | tee "$RUNNER_TEMP/go-bench.txt"
+          go test -run '^$' -bench . -benchmem -count 3 -cpu "$BENCH_GO_PROCS" . | tee -a "$RUNNER_TEMP/go-bench.txt"
       - name: Rust benchmarks
         run: |
           cargo bench --locked -p raknet --features test-support --bench codec --bench session
@@ -89,7 +92,7 @@ jobs:
         # slower paths remain. 2 (unreadable input) and 3 (missing measurement) fail.
         run: |
           set +e -o pipefail
-          go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" | tee -a "$GITHUB_STEP_SUMMARY"
+          go tool bench-compare --go-procs "$BENCH_GO_PROCS" --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" | tee -a "$GITHUB_STEP_SUMMARY"
           status=$?
           if [ "$status" -eq 1 ]; then
             echo "::warning title=Benchmarks::Rust is slower than go-raknet beyond the margin on some paths; see the job summary"
