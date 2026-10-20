@@ -6,7 +6,9 @@ use std::time::Duration;
 #[derive(Clone, Debug, facet::Facet)]
 pub struct RakSessionConfig {
     pub ordering_channels: i32,
+    /// Runs ACK, resend and queued-send maintenance automatically on updates.
     pub autoflush: bool,
+    /// Maintenance cadence; application writes do not wait for this interval.
     pub autoflush_interval_ms: Duration,
     pub max_queued_bytes: i32,
     pub max_outbound_bytes: i32,

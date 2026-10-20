@@ -5,6 +5,27 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Sends a test peer's messages in one scheduling pass to exercise bundled reception.
+pub fn send_bundle(
+    session: &mut RakSession<Established>,
+    messages: impl IntoIterator<Item = Box<[u8]>>,
+    now: Instant,
+) {
+    for message in messages {
+        let frames = session
+            .engine
+            .prepare_frames(crate::protocol::types::frame::Frame::new(
+                RakReliability::ReliableOrdered,
+                message,
+            ));
+        session
+            .engine
+            .queue_frames(frames, RakPriority::Normal, now)
+            .unwrap();
+    }
+    session.tick(now).unwrap();
+}
+
 /// Returns the repository's committed `testdata` directory.
 pub fn testdata_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata")

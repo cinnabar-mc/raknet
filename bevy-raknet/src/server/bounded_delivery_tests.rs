@@ -79,6 +79,53 @@ fn established(
     }
 }
 
+/// Waits for local UDP delivery without updating either adapter or its protocol timers.
+fn received_datagram(socket: &UdpSocket) -> Box<[u8]> {
+    let mut buffer = [0; 1492];
+    for _ in 0..PROGRESS_WATCHDOG {
+        match socket.recv(&mut buffer) {
+            Ok(len) => return buffer[..len].into(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("original socket receive failed: {error}"),
+        }
+    }
+    panic!("normal send did not reach the original socket without an update");
+}
+
+#[test]
+fn normal_sends_reach_both_sockets_without_an_update() {
+    let (mut server, address) = server(1);
+    let mut client = client();
+    let id = established(&mut server, address, &mut client);
+    let marker = Box::<[u8]>::from(&b"\xfenormal send without a frame update"[..]);
+    client
+        .connected()
+        .unwrap()
+        .send(
+            marker.clone(),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+        )
+        .unwrap();
+    assert!(received_datagram(&server.socket).ends_with(&marker));
+
+    server
+        .connected(id)
+        .unwrap()
+        .send(
+            marker.clone(),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+        )
+        .unwrap();
+    assert!(
+        received_datagram(crate::client::bounded_delivery_tests::socket(&client))
+            .ends_with(&marker)
+    );
+}
+
 /// Sends through the live public capability with reliable wire ordering.
 fn send(client: &mut RakClient, bytes: &[u8]) {
     client

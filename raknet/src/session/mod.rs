@@ -94,6 +94,7 @@ pub(crate) struct SessionEngine {
     pub(crate) outbound_rel: u32,
     outbound_queue: [VecDeque<Frame>; 4],
     outbound_cache: HashMap<u32, FrameSet>,
+    outbound_window: Option<OutboundWindow>,
     outbound_bytes: usize,
     outbound_resend: BinaryHeap<(Reverse<Instant>, u32)>,
     outbound_ord_idx: [u32; 32],
@@ -115,6 +116,13 @@ pub(crate) struct SessionEngine {
 
     output: VecDeque<RakSessionOutput>,
     control_cursor: usize,
+}
+
+/// Oldest retained frame indices, rebuilt after acknowledgements release ownership.
+#[derive(Clone, Copy, Debug)]
+struct OutboundWindow {
+    reliable: Option<u32>,
+    ordered: [Option<u32>; 32],
 }
 
 impl Sans for SessionEngine {
@@ -212,6 +220,7 @@ impl SessionEngine {
                 VecDeque::new(),
             ],
             outbound_cache: HashMap::new(),
+            outbound_window: None,
             outbound_bytes: 0,
             outbound_resend: BinaryHeap::new(),
             outbound_ord_idx: [0; 32],
@@ -464,16 +473,39 @@ impl SessionEngine {
 
     fn send_queue(&mut self, now: Instant) -> Result<(), RakSessionError> {
         let mut bandwidth = self.congestion_controller.transmission_bandwidth();
-        let oldest_reliable = self.oldest_unacked_reliable();
-        let oldest_ordered = self.oldest_unacked_ordered();
-        let mut splits_in_flight = self.splits_in_flight();
+        if !self
+            .outbound_queue
+            .iter()
+            .filter_map(|queue| queue.front())
+            .any(|frame| frame.size_hint() <= bandwidth)
+        {
+            self.bandwidth_limited = self.outbound_queue.iter().any(|queue| !queue.is_empty());
+            return Ok(());
+        }
+        let window = match self.outbound_window {
+            Some(window) => window,
+            None => {
+                let window = OutboundWindow {
+                    reliable: self.oldest_unacked_reliable(),
+                    ordered: self.oldest_unacked_ordered(),
+                };
+                self.outbound_window = Some(window);
+                window
+            }
+        };
+        let mut splits_in_flight = if self.outbound_queue.iter().flatten().any(Frame::is_split) {
+            self.splits_in_flight()
+        } else {
+            HashSet::new()
+        };
 
-        let mut frames = Vec::new();
+        let queued = self.outbound_queue.iter().map(VecDeque::len).sum::<usize>();
+        let mut frames = Vec::with_capacity(queued.min(4));
         for queue in &mut self.outbound_queue {
             while let Some(frame) = queue.pop_front_if(|f| {
                 f.size_hint() <= bandwidth
-                    && within_reliable_window(f, oldest_reliable)
-                    && within_ordered_window(f, &oldest_ordered)
+                    && within_reliable_window(f, window.reliable)
+                    && within_ordered_window(f, &window.ordered)
                     && (!f.is_split()
                         || splits_in_flight.contains(&f.split_id)
                         || splits_in_flight.len() < MAX_SPLITS_IN_FLIGHT)
@@ -492,9 +524,13 @@ impl SessionEngine {
             return Ok(());
         };
 
-        let sets = self.make_sets(frames);
-        for set in sets {
+        if frames.len() == 1 && frames[0].size_hint() <= (self.mtu - DGRAM_HEADER_SIZE) as usize {
+            let set = self.next_frame_set(frames);
             self.send_frame_set(set, false, true, now)?;
+        } else {
+            for set in self.make_sets(frames) {
+                self.send_frame_set(set, false, true, now)?;
+            }
         }
         Ok(())
     }
@@ -556,14 +592,7 @@ impl SessionEngine {
             }
 
             if size + frame_size > max {
-                sets.push(FrameSet {
-                    sequence: self.outbound_seq,
-                    frames: take(&mut batch),
-                    continuous_send: false,
-                    needs_b_and_as: false,
-                    is_pair: false,
-                });
-                self.outbound_seq = u24::add(self.outbound_seq, 1);
+                sets.push(self.next_frame_set(take(&mut batch)));
 
                 size = DGRAM_HEADER_SIZE as usize;
             }
@@ -573,17 +602,17 @@ impl SessionEngine {
         }
 
         if !batch.is_empty() {
-            sets.push(FrameSet {
-                sequence: self.outbound_seq,
-                frames: batch,
-                continuous_send: false,
-                needs_b_and_as: false,
-                is_pair: false,
-            });
-            self.outbound_seq = u24::add(self.outbound_seq, 1);
+            sets.push(self.next_frame_set(batch));
         }
 
         sets
+    }
+
+    /// Assigns one datagram sequence while retaining the caller's frame allocation.
+    fn next_frame_set(&mut self, frames: Vec<Frame>) -> FrameSet {
+        let set = FrameSet::new(self.outbound_seq, frames, false, false, false);
+        self.outbound_seq = u24::add(self.outbound_seq, 1);
+        set
     }
 
     /// Installs live feedback flags and charges retained reliable encapsulations once.
@@ -633,7 +662,7 @@ impl SessionEngine {
         }
     }
 
-    /// Schedules application traffic while keeping Immediate sends inside flow limits.
+    /// Emits every admitted application write within the current flow limits.
     fn send_frame(
         &mut self,
         frame: Frame,
@@ -641,20 +670,16 @@ impl SessionEngine {
         now: Instant,
     ) -> Result<(), RakSessionError> {
         let frames = self.prepare_frames(frame);
-        if priority == RakPriority::Immediate {
-            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
-            self.outbound_queue[priority as usize].extend(frames);
-            self.wire_continuous = self.bandwidth_limited;
-            self.send_queue(now)?;
-            self.flush();
-        } else {
-            self.queue_frames(frames, priority, now)?;
-        }
+        self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
+        self.outbound_queue[priority as usize].extend(frames);
+        self.wire_continuous = self.bandwidth_limited;
+        self.send_queue(now)?;
+        self.flush();
         Ok(())
     }
 
     /// Assigns wire counters and fragments one payload independently from scheduling.
-    fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
+    pub(crate) fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
         let max_size = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
 
         let order_channel = frame.order_channel;
@@ -662,7 +687,8 @@ impl SessionEngine {
         let mut reliability = frame.reliability;
         let mut split_id = 0;
 
-        let payloads = if frame.size_hint() > max_size {
+        let split = frame.size_hint() > max_size;
+        let split_size = if split {
             reliability = match reliability {
                 RakReliability::Unreliable => RakReliability::Reliable,
                 RakReliability::UnreliableSequenced => RakReliability::ReliableSequenced,
@@ -671,23 +697,19 @@ impl SessionEngine {
             };
             split_id = self.outbound_spl;
             self.outbound_spl = self.outbound_spl.wrapping_add(1);
-
-            let split_size = frame.payload.len().div_ceil(max_size);
-
-            let mut payloads = Vec::with_capacity(split_size);
-            for i in 0..split_size {
-                let start = i * max_size;
-                let end = min(start + max_size, frame.payload.len());
-
-                payloads.push(frame.payload[start..end].into());
-            }
-            payloads
+            frame.payload.len().div_ceil(max_size)
         } else {
-            vec![frame.payload]
+            1
         };
 
         let mut ord_idx = 0;
         let mut seq_idx = 0;
+        if self.outbound_window.is_some_and(|window| {
+            (reliability.is_reliable() && window.reliable.is_none())
+                || (reliability.is_ordered() && window.ordered[order_channel as usize].is_none())
+        }) {
+            self.outbound_window = None;
+        }
         if frame.reliability.is_sequenced() {
             ord_idx = self.outbound_ord_idx[order_channel as usize];
             seq_idx = {
@@ -706,28 +728,33 @@ impl SessionEngine {
             self.outbound_seq_idx[order_channel as usize] = 0;
         }
 
-        let split_size = payloads.len();
-        payloads
-            .into_iter()
+        let mut prepare = |(i, payload)| Frame {
+            reliability,
+            payload,
+            reliable_index: match reliability.is_reliable() {
+                true => {
+                    let val = self.outbound_rel;
+                    self.outbound_rel = u24::add(val, 1);
+                    val
+                }
+                false => 0,
+            },
+            sequence_index: seq_idx,
+            order_index: ord_idx,
+            order_channel,
+            split_size: if split_size > 1 { split_size as u32 } else { 0 },
+            split_id,
+            split_index: i as u32,
+        };
+        if !split {
+            return vec![prepare((0, frame.payload))];
+        }
+        frame
+            .payload
+            .chunks(max_size)
+            .map(Box::<[u8]>::from)
             .enumerate()
-            .map(|(i, payload)| Frame {
-                reliability,
-                payload,
-                reliable_index: match reliability.is_reliable() {
-                    true => {
-                        let val = self.outbound_rel;
-                        self.outbound_rel = u24::add(val, 1);
-                        val
-                    }
-                    false => 0,
-                },
-                sequence_index: seq_idx,
-                order_index: ord_idx,
-                order_channel,
-                split_size: if split_size > 1 { split_size as u32 } else { 0 },
-                split_id,
-                split_index: i as u32,
-            })
+            .map(prepare)
             .collect()
     }
 
@@ -737,7 +764,8 @@ impl SessionEngine {
         self.queue_frames(frames, RakPriority::Immediate, now)
     }
 
-    fn queue_frames(
+    /// Queues prepared frames, or emits internal control at Immediate priority.
+    pub(crate) fn queue_frames(
         &mut self,
         frames: Vec<Frame>,
         priority: RakPriority,
@@ -765,6 +793,7 @@ impl SessionEngine {
             let Some(set) = self.outbound_cache.remove(&seq) else {
                 continue;
             };
+            self.outbound_window = None;
             self.outbound_bytes = self.outbound_bytes.saturating_sub(set.size_hint());
             match ack.is_nack {
                 true => {
@@ -784,6 +813,9 @@ impl SessionEngine {
                 }
             }
         }
+        self.wire_continuous = self.bandwidth_limited;
+        self.send_queue(now)?;
+        self.flush();
         Ok(())
     }
 

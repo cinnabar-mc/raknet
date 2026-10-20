@@ -223,17 +223,11 @@ async fn final_receive_byte_refusal_preserves_the_prefix_after_an_old_body_is_po
             original.forward(frame, false, false)?;
         }
         let peer = original.peer.as_mut().unwrap();
-        for sequence in prefix..prefix + 2 {
-            peer.send(
-                count_body(sequence),
-                RakReliability::ReliableOrdered,
-                RakPriority::Normal,
-                Instant::now().into_std(),
-            )
-            .map_err(|error| format!("original byte tail send: {error}"))?;
-        }
-        peer.tick(Instant::now().into_std())
-            .map_err(|error| format!("original byte tail flush: {error}"))?;
+        raknet::test_support::send_bundle(
+            peer,
+            (prefix..prefix + 2).map(count_body),
+            Instant::now().into_std(),
+        );
         if route_peer_output(&mut original).await? != 1 {
             return Err("the two original tail bodies did not share one datagram".to_owned());
         }
