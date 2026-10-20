@@ -13,8 +13,8 @@ use crate::session::{
 use crate::stop::StopState;
 use driver::Driver;
 use raknet::prelude::{
-    ClientGuid, Established, RakClientConfig, RakClientError, RakClientInput, RakClientOutput,
-    RakClock, RakSessionId, RakSessionInput, RakSessionSnapshot,
+    ClientGuid, Established, MtuProbeId, RakClientConfig, RakClientError, RakClientInput,
+    RakClientOutput, RakClock, RakSessionId, RakSessionInput, RakSessionSnapshot,
     RestoredSession as CoreRestoredSession, canonical_socket_addr, constants,
     is_mtu_probe_size_error,
 };
@@ -90,6 +90,12 @@ impl ClientSockets {
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 type PingResult = Result<(Box<[u8]>, Duration), RakClientError>;
+
+/// A single physical head preserves the first start and token of an actual MTU probe.
+struct PendingSend {
+    datagram: wire::SendDatagram,
+    probe: Option<(MtuProbeId, Instant)>,
+}
 
 struct PendingPing {
     sent_ms: u64,
@@ -204,6 +210,8 @@ impl RakClient<ConfiguredClient> {
         let config = self.state.config;
         let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
         let stop = Arc::new(StopState::default());
+        #[cfg(test)]
+        let send_gate = crate::session::physical_send_tests::capture(&stop);
 
         let handle = tokio::spawn({
             let stop = stop.clone();
@@ -233,6 +241,7 @@ impl RakClient<ConfiguredClient> {
                 tokio::pin!(timer);
 
                 let mut stop_deadline: Option<Instant> = None;
+                let mut pending: Option<PendingSend> = None;
 
                 loop {
                     if stop_deadline.is_none()
@@ -245,25 +254,63 @@ impl RakClient<ConfiguredClient> {
                         }
                         stop_deadline = Some(deadline);
                     }
-                    if let Some(deadline) = stop_deadline
-                        && ((session_tx.is_none() && msg_rx.is_empty())
-                            || Instant::now() >= deadline)
-                    {
+                    if stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
+                    }
+                    // Final draining uses the same physical owner and remaining stop allowance.
+                    let draining =
+                        stop_deadline.is_some() && session_tx.is_none() && msg_rx.is_empty();
+                    if draining && pending.is_none() {
+                        match dgram_rx.try_recv() {
+                            Ok(datagram) => {
+                                if session_route.as_ref().is_some_and(|(id, lifetime)| {
+                                    *id == datagram.id() && datagram.belongs_to(lifetime)
+                                }) {
+                                    pending = Some(PendingSend {
+                                        datagram: wire::SendDatagram::Session(datagram),
+                                        probe: None,
+                                    });
+                                } else {
+                                    continue;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                     tokio::select! {
                         _ = stop.wait(), if stop_deadline.is_none() => continue,
-                        Ok((datagram, addr)) = sockets.recv(&mut buf4, &mut buf6) => {
+                        result = async {
+                            let head = pending.as_ref().expect("one retained physical send");
+                            #[cfg(test)]
+                            crate::session::physical_send_tests::before_send(&send_gate).await;
+                            sockets.send_to(head.datagram.bytes(), head.datagram.peer()).await
+                        }, if pending.is_some() => {
+                            let head = pending.take().expect("same completed physical send");
+                            if let Some((id, started)) = head.probe {
+                                let input = RakClientInput::MtuProbeResult {
+                                    id,
+                                    now: Instant::now().into_std(),
+                                    elapsed: started.elapsed(),
+                                    too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
+                                };
+                                let result = client.handle(input);
+                                fail_pending_connect(&mut client, &mut connect, result);
+                            }
+                        }
+                        Ok((datagram, addr)) = sockets.recv(&mut buf4, &mut buf6), if pending.is_none() && !draining => {
                             let now = Instant::now().into_std();
 
                             let result = client.handle(RakClientInput::Datagram(datagram, addr, now));
                             fail_pending_connect(&mut client, &mut connect, result);
                         }
-                        Some(datagram) = dgram_rx.recv() => {
+                        Some(datagram) = dgram_rx.recv(), if pending.is_none() && !draining => {
                             if session_route.as_ref().is_some_and(|(id, lifetime)|
                                 *id == datagram.id() && datagram.belongs_to(lifetime))
                             {
-                                let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
+                                pending = Some(PendingSend {
+                                    datagram: wire::SendDatagram::Session(datagram),
+                                    probe: None,
+                                });
                             }
                         }
                         Some(id) = disconnect_rx.recv() => {
@@ -272,7 +319,7 @@ impl RakClient<ConfiguredClient> {
                                 client.reset();
                             }
                         }
-                        Some(msg) = msg_rx.recv() => {
+                        Some(msg) = msg_rx.recv(), if pending.is_none() && !draining => {
                             let now = Instant::now().into_std();
                             match msg {
                                 RakClientMsg::Ping(addr, sender) => {
@@ -339,7 +386,7 @@ impl RakClient<ConfiguredClient> {
                                 }
                             }
                         }
-                        _ = &mut timer => {
+                        _ = &mut timer, if pending.is_none() && !draining => {
                             reap_pings(&mut pings);
                             let result = client.handle(RakClientInput::Update(Instant::now().into_std()));
                             fail_pending_connect(&mut client, &mut connect, result);
@@ -352,23 +399,23 @@ impl RakClient<ConfiguredClient> {
                         } => {}
                     }
 
-                    while let Some(msg) = client.poll() {
+                    while pending.is_none()
+                        && !draining
+                        && stop_deadline.is_none_or(|deadline| Instant::now() < deadline)
+                        && let Some(msg) = client.poll()
+                    {
                         match msg {
                             RakClientOutput::MtuProbe { id, datagram, peer } => {
-                                let started = Instant::now();
-                                let result = sockets.send_to(&datagram, peer).await;
-                                let elapsed = started.elapsed();
-                                let input = RakClientInput::MtuProbeResult {
-                                    id,
-                                    now: Instant::now().into_std(),
-                                    elapsed,
-                                    too_large: result.as_ref().is_err_and(is_mtu_probe_size_error),
-                                };
-                                let result = client.handle(input);
-                                fail_pending_connect(&mut client, &mut connect, result);
+                                pending = Some(PendingSend {
+                                    datagram: wire::SendDatagram::Socket(datagram, peer),
+                                    probe: Some((id, Instant::now())),
+                                });
                             }
                             RakClientOutput::SocketDatagram(buf, addr) => {
-                                let _ = sockets.send_to(&buf, addr).await;
+                                pending = Some(PendingSend {
+                                    datagram: wire::SendDatagram::Socket(buf, addr),
+                                    probe: None,
+                                });
                             }
                             RakClientOutput::SessionDatagram(buf) => {
                                 if let Some(session) = &session_tx {
@@ -449,13 +496,8 @@ impl RakClient<ConfiguredClient> {
                     }
                 }
 
-                while let Ok(datagram) = dgram_rx.try_recv() {
-                    if session_route.as_ref().is_some_and(|(id, lifetime)| {
-                        *id == datagram.id() && datagram.belongs_to(lifetime)
-                    }) {
-                        let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
-                    }
-                }
+                #[cfg(test)]
+                crate::session::physical_send_tests::finished(&send_gate);
             }
         });
 

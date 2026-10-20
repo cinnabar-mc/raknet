@@ -93,6 +93,8 @@ impl RakServer<ConfiguredServer> {
         let (session_tx, session_rx) = unbounded_channel();
         let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
         let stop = Arc::new(StopState::default());
+        #[cfg(test)]
+        let send_gate = crate::session::physical_send_tests::capture(&stop);
 
         let handle = tokio::spawn({
             let stop = stop.clone();
@@ -118,6 +120,7 @@ impl RakServer<ConfiguredServer> {
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let mut stop_deadline: Option<Instant> = None;
+                let mut pending: Option<wire::SendDatagram> = None;
                 let mut adoptions: HashMap<
                     RakSessionId,
                     tokio::sync::oneshot::Sender<Result<RestoredSession, RakServerError>>,
@@ -148,21 +151,47 @@ impl RakServer<ConfiguredServer> {
                         }
                         stop_deadline = Some(deadline);
                     }
-                    if let Some(deadline) = stop_deadline
-                        && ((sessions.is_empty() && msg_rx.is_empty())
-                            || Instant::now() >= deadline)
-                    {
+                    if stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
+                    }
+                    // Retained session output drains under the same first stop cutoff.
+                    let draining =
+                        stop_deadline.is_some() && sessions.is_empty() && msg_rx.is_empty();
+                    if draining && pending.is_none() {
+                        match dgram_rx.try_recv() {
+                            Ok(datagram) => {
+                                if retention::owns_wire(&datagram, &sessions, &retained) {
+                                    pending = Some(wire::SendDatagram::Session(datagram));
+                                } else {
+                                    continue;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                     tokio::select! {
                         _ = stop.wait(), if stop_deadline.is_none() => continue,
+                        _ = async {
+                            match stop_deadline {
+                                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                None => std::future::pending().await,
+                            }
+                        } => {}
+                        _ = async {
+                            let head = pending.as_ref().expect("one retained physical send");
+                            #[cfg(test)]
+                            crate::session::physical_send_tests::before_send(&send_gate).await;
+                            socket.send_to(head.bytes(), head.peer()).await
+                        }, if pending.is_some() => {
+                            pending = None;
+                        }
                         _ = retirement.wait() => continue,
-                        _ = update_interval.tick() => {
+                        _ = update_interval.tick(), if pending.is_none() && !draining => {
                             let now = Instant::now().into_std();
 
                             let _ = server.handle(RakServerInput::Update(now));
                         }
-                        Ok((len, addr)) = socket.recv_from(&mut buf) => {
+                        Ok((len, addr)) = socket.recv_from(&mut buf), if pending.is_none() && !draining => {
                             let now = Instant::now().into_std();
 
                             if retirement.take() {
@@ -173,9 +202,9 @@ impl RakServer<ConfiguredServer> {
                                 Err(e) => debug!("server failed to handle inbound datagram: {e}")
                             }
                         }
-                        Some(datagram) = dgram_rx.recv() => {
+                        Some(datagram) = dgram_rx.recv(), if pending.is_none() && !draining => {
                             if retention::owns_wire(&datagram, &sessions, &retained) {
-                                let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
+                                pending = Some(wire::SendDatagram::Session(datagram));
                             }
                         }
                         Some(id) = disconnect_rx.recv() => {
@@ -184,7 +213,7 @@ impl RakServer<ConfiguredServer> {
                             retention::retire(id, &mut sessions, &mut retained, &mut server, now);
                             retention::reap(&mut sessions, &mut retained, &mut server, max_connections, now);
                         }
-                        Some(msg) = msg_rx.recv() => {
+                        Some(msg) = msg_rx.recv(), if pending.is_none() && !draining => {
                             match msg {
                                 #[cfg(test)]
                                 RakServerMsg::InspectCommands(reply) => {
@@ -229,10 +258,14 @@ impl RakServer<ConfiguredServer> {
                         }
                     }
 
-                    while let Some(msg) = server.poll() {
+                    while pending.is_none()
+                        && !draining
+                        && stop_deadline.is_none_or(|deadline| Instant::now() < deadline)
+                        && let Some(msg) = server.poll()
+                    {
                         match msg {
                             RakServerOutput::SocketDatagram(buf, addr) => {
-                                let _ = socket.send_to(&buf, addr).await;
+                                pending = Some(wire::SendDatagram::Socket(buf, addr));
                             }
                             RakServerOutput::SessionDatagram(buf, id) => {
                                 if let Some(session) = sessions.get_mut(&id) {
@@ -319,11 +352,8 @@ impl RakServer<ConfiguredServer> {
                     }
                 }
 
-                while let Ok(datagram) = dgram_rx.try_recv() {
-                    if retention::owns_wire(&datagram, &sessions, &retained) {
-                        let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
-                    }
-                }
+                #[cfg(test)]
+                crate::session::physical_send_tests::finished(&send_gate);
             }
         });
 

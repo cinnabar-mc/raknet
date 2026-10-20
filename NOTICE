@@ -10,6 +10,9 @@ reference. System-address codecs retain short-list support and reject excess
 entries with bounded input allocation. UDP error classification follows the
 reference's Unix and Winsock handshake read policies.
 
+Receive-window advancement and recent-loss selection also follow this reference.
+ACK/NACK emission remains caller-driven, with bounded pending loss records.
+
 That reference is MIT-licensed, copyright 2019 Sander ten Veldhuis.
 See LICENSE-MIT-go-raknet for the retained notice and license.
 The original RakNet project's Apache-2.0 license and notices remain in effect.
