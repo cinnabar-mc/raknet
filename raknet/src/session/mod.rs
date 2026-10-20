@@ -1,5 +1,6 @@
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
 mod backpressure;
+mod close;
 pub mod config;
 pub mod congestion_controller;
 pub mod error;
@@ -62,7 +63,8 @@ const MAX_OUTBOUND_SPLIT_COUNT: usize = 2048;
 const MAX_CONCURRENT_SPLITS: usize = 256;
 const MAX_UNACKED_RELIABLE: i32 = 4096;
 const MAX_SPLITS_IN_FLIGHT: usize = 256;
-const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+// Reliable receive obligations retain their original bounded progress window.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionEngine {
@@ -79,6 +81,7 @@ pub(crate) struct SessionEngine {
     last_recv: Instant,
     last_pong: Instant,
     closing_since: Option<Instant>,
+    closing_for_timeout: bool,
     disconnect_sent: bool,
     pub(crate) reject_malformed: bool,
 
@@ -158,7 +161,7 @@ impl Sans for SessionEngine {
                 self.send_frame(Frame::new(reliability, buf), priority, now)?
             }
             SessionInput::Update(now) => self.handle_timeout(now)?,
-            SessionInput::Disconnect(now) => self.close(now)?,
+            SessionInput::Disconnect(now) => self.close(RakDisconnectReason::Requested, now)?,
             SessionInput::DisconnectNow(now) => {
                 self.send_queue(now)?;
                 self.flush();
@@ -201,6 +204,7 @@ impl SessionEngine {
             last_recv: now,
             last_pong: now,
             closing_since: None,
+            closing_for_timeout: false,
             disconnect_sent: false,
             reject_malformed: false,
 
@@ -288,27 +292,7 @@ impl SessionEngine {
             .min()
     }
 
-    /// Uses the same last admitted input and timeout as ordinary maintenance.
-    fn peer_deadline(&self) -> Option<Instant> {
-        self.last_recv.checked_add(SESSION_TIMEOUT)
-    }
-
-    /// Retains the original first close origin and validated grace interval.
-    fn close_deadline(&self, since: Instant) -> Option<Instant> {
-        since.checked_add(self.config.close_timeout)
-    }
-
     fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        if self.peer_deadline().is_some_and(|deadline| now >= deadline) {
-            debug!(
-                "detected stale connection from {}, disconnecting...",
-                self.addr
-            );
-
-            self.disconnect(true, RakDisconnectReason::Timeout, now)?;
-            return Ok(());
-        }
-
         self.evict_stale_splits(now);
         if self.inbound_stalled(now) {
             return self.disconnect(true, RakDisconnectReason::Timeout, now);
@@ -316,6 +300,13 @@ impl SessionEngine {
 
         if self.state == RakSessionState::Closing {
             return self.update_closing(now);
+        }
+        if self.peer_deadline().is_some_and(|deadline| now >= deadline) {
+            debug!(
+                "detected stale connection from {}, draining close...",
+                self.addr
+            );
+            return self.close(RakDisconnectReason::Timeout, now);
         }
 
         if self.config.autoflush
@@ -340,7 +331,7 @@ impl SessionEngine {
 
         let mut duration = min(
             remaining(self.last_ping, ping_interval, now),
-            remaining(self.last_recv, SESSION_TIMEOUT, now),
+            remaining(self.last_recv, self.peer_timeout(), now),
         );
         if self.config.autoflush {
             duration = min(
@@ -351,70 +342,6 @@ impl SessionEngine {
 
         self.output.push_back(RakSessionOutput::Wait(duration));
         Ok(())
-    }
-
-    fn close(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        if self.state == RakSessionState::Closing {
-            return Ok(());
-        }
-
-        self.state = RakSessionState::Closing;
-        self.closing_since = Some(now);
-        self.last_tick = now;
-        self.tick(now)?;
-
-        if self.nothing_left_to_send() {
-            self.send_disconnect(now)?;
-        }
-
-        self.output
-            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
-        Ok(())
-    }
-
-    fn nothing_left_to_send(&self) -> bool {
-        self.queue.is_empty()
-            && self.outbound_cache.is_empty()
-            && self.outbound_queue.iter().all(VecDeque::is_empty)
-    }
-
-    fn update_closing(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        let since = self.closing_since.unwrap_or(now);
-
-        self.tick(now)?;
-        self.last_tick = now;
-
-        if self
-            .close_deadline(since)
-            .is_some_and(|deadline| now >= deadline)
-        {
-            return self.disconnect(!self.disconnect_sent, RakDisconnectReason::Requested, now);
-        }
-        if self.nothing_left_to_send() {
-            if self.disconnect_sent {
-                return self.disconnect(false, RakDisconnectReason::Requested, now);
-            }
-            self.send_disconnect(now)?;
-        }
-
-        self.output
-            .push_back(RakSessionOutput::Wait(self.closing_wait(now)));
-        Ok(())
-    }
-
-    /// Bounds both the first close wait and later updates by the original session policy.
-    fn closing_wait(&self, now: Instant) -> Duration {
-        min(
-            min(
-                remaining(
-                    self.closing_since.unwrap_or(now),
-                    self.config.close_timeout,
-                    now,
-                ),
-                remaining(self.last_recv, SESSION_TIMEOUT, now),
-            ),
-            self.config.autoflush_interval_ms,
-        )
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<(), RakSessionError> {

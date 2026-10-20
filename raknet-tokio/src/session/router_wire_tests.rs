@@ -256,31 +256,68 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
     let mut original = Original::new(local, peer);
     let mut healthy = Original::new(healthy_local, healthy_peer);
     let mut completed = 0;
-    let observed = async {
+    let observed = tokio::time::timeout(config.close_timeout, async {
         let before = b"\xfehealthy original neighbor before retained wire output";
         let before_echo = healthy
             .echo(before, Instant::now() + constants::CLOSE_TIMEOUT)
             .await?;
-        let production = tokio::time::timeout_at(Instant::now() + config.close_timeout, async {
-            for sequence in 0..attempts {
+        original
+            .session
+            .as_ref()
+            .unwrap()
+            .send(body(0), RakReliability::Unreliable, RakPriority::Immediate)
+            .await
+            .map_err(|error| format!("first held-consumer send: {error}"))?;
+        completed += 1;
+        let first = original
+            .datagrams
+            .recv()
+            .await
+            .ok_or_else(|| "first held-consumer output closed".to_owned())?;
+        let frame_bytes = first.bytes().len();
+        let slots = wire_budget / frame_bytes;
+        let mut held = vec![first];
+        for sequence in 1..slots {
+            original
+                .session
+                .as_ref()
+                .unwrap()
+                .send(
+                    body(sequence),
+                    RakReliability::Unreliable,
+                    RakPriority::Immediate,
+                )
+                .await
+                .map_err(|error| format!("original held-consumer send: {error}"))?;
+            completed += 1;
+            held.push(
                 original
-                    .session
-                    .as_ref()
-                    .ok_or_else(|| "original public handle was consumed".to_owned())?
-                    .send(
-                        body(sequence),
-                        RakReliability::Unreliable,
-                        RakPriority::Immediate,
-                    )
+                    .datagrams
+                    .recv()
                     .await
-                    .map_err(|error| format!("original held-consumer send: {error}"))?;
-                completed += 1;
-            }
-            Ok::<_, String>(())
-        })
-        .await;
-        if let Ok(result) = production {
-            result?;
+                    .ok_or_else(|| "held-consumer output closed".to_owned())?,
+            );
+        }
+        original
+            .session
+            .as_ref()
+            .unwrap()
+            .send(
+                body(slots),
+                RakReliability::Unreliable,
+                RakPriority::Immediate,
+            )
+            .await
+            .map_err(|error| format!("original blocked-output send: {error}"))?;
+        completed += 1;
+        // Dequeued original datagrams still own credit, so this actual next head cannot fit.
+        let retained: usize = held.iter().map(|frame| frame.bytes().len()).sum();
+        let next = original.datagrams.try_recv();
+        let refused = retained <= wire_budget
+            && retained + frame_bytes > wire_budget
+            && matches!(&next, Err(tokio::sync::mpsc::error::TryRecvError::Empty));
+        if let Ok(frame) = next {
+            held.push(frame);
         }
         let after = b"\xfehealthy original neighbor while the other wire consumer stays held";
         let after_echo = healthy
@@ -288,9 +325,14 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
             .await?;
 
         // Current-thread delivery cannot interleave actor work during this original drain.
-        let queued = original.datagrams.len();
+        let queued = held.len() + original.datagrams.len();
         let mut wire_bytes = 0_usize;
         let mut drained = 0_usize;
+        for frame in held {
+            wire_bytes += frame.bytes().len();
+            drained += 1;
+            original.forward(frame, false, false)?;
+        }
         while let Ok(frame) = original.datagrams.try_recv() {
             wire_bytes = wire_bytes
                 .checked_add(frame.bytes().len())
@@ -306,9 +348,11 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
             after_echo,
             before,
             after,
+            refused,
         ))
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| Err("original held-wire observation reached its cutoff".to_owned()));
 
     let original_cleanup = original.finish().await;
     let healthy_cleanup = healthy.finish().await;
@@ -320,12 +364,16 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
         healthy_cleanup.is_ok(),
         "healthy cleanup: {healthy_cleanup:?}"
     );
-    let (queued, drained, wire_bytes, before_echo, after_echo, before, after) =
+    let (queued, drained, wire_bytes, before_echo, after_echo, before, after, refused) =
         observed.expect("setup: original wire observation and independent traffic must complete");
     assert_eq!(before_echo.0.as_ref(), before);
     assert_eq!(before_echo.1.as_ref(), before);
     assert_eq!(after_echo.0.as_ref(), after);
     assert_eq!(after_echo.1.as_ref(), after);
+    assert!(
+        refused,
+        "the original retained credit must refuse its next actual wire head"
+    );
     assert_eq!(queued, drained);
     assert!(completed != 0 && completed <= original.received.len());
     assert!(original.received.len() <= attempts);
@@ -361,7 +409,9 @@ async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
     let mut original = Original::new(local, peer);
     let mut actor = original.actor.take().unwrap();
     let mut held = Vec::new();
-    let observed = tokio::time::timeout_at(expiry + constants::CLOSE_TIMEOUT, async {
+    let cutoff = expiry + config.close_timeout;
+    // This bounds only observation; the final completion timestamp must honor the first cutoff.
+    let observed = tokio::time::timeout_at(cutoff + constants::CLOSE_TIMEOUT, async {
         original
             .session
             .as_ref()
@@ -416,6 +466,7 @@ async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
         (&mut actor)
             .await
             .map_err(|error| format!("original expiry join: {error}"))?;
+        let completed_at = Instant::now();
         let terminal_read = original.session.as_mut().unwrap().recv::<Box<[u8]>>().await;
         let session = original.session.take().unwrap();
         let reason = match session.finish() {
@@ -431,6 +482,7 @@ async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
             frame_bytes,
             terminal_read,
             reason,
+            completed_at,
         ))
     })
     .await;
@@ -449,9 +501,13 @@ async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
     drop(original);
     drop(held);
     assert_eq!(peer_finished, Some(true), "original peer cleanup failed");
-    let (equal_frames, retained_bytes, frame_bytes, terminal_read, reason) = observed
+    let (equal_frames, retained_bytes, frame_bytes, terminal_read, reason, completed_at) = observed
         .expect("original blocked actor must retire under its unchanged peer deadline")
         .expect("original wire and terminal owners must complete");
+    assert!(
+        completed_at <= cutoff,
+        "the original peer close exceeded its first drain cutoff"
+    );
     assert!(equal_frames && retained_bytes <= budget && retained_bytes + frame_bytes > budget);
     assert!(matches!(terminal_read, Err(RakSessionError::Closed)));
     assert_eq!(reason, Some(RakDisconnectReason::Timeout));
@@ -499,6 +555,7 @@ async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() 
             let mut wire_open = true;
             let mut wire_frames = 0;
             let mut remote_reason = None;
+            let mut remote_before_stale = false;
             while !joined || wire_open {
                 tokio::select! {
                     result = &mut actor, if !joined => {
@@ -521,6 +578,8 @@ async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() 
                         while let Some(output) = peer.poll() {
                             if let RakSessionOutput::Disconnected(_, reason) = output {
                                 remote_reason = Some(reason);
+                                remote_before_stale |= reason == RakDisconnectReason::Remote
+                                    && Instant::now() < peer_expiry;
                             }
                         }
                     }
@@ -531,7 +590,7 @@ async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() 
                 remote_reason,
                 original.peer.as_ref().unwrap().state(),
                 original.disconnected.try_recv(),
-                Instant::now() < peer_expiry && cutoff < peer_expiry,
+                remote_before_stale,
             ))
         }).await;
         if !actor.is_finished() {

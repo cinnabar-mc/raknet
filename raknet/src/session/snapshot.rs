@@ -29,6 +29,8 @@ pub(crate) struct SessionSnapshot {
     pub mtu: u16,
     pub config: RakSessionConfig,
     #[facet(default)]
+    pub closing_for_timeout: bool,
+    #[facet(default)]
     pub disconnect_sent: bool,
     #[facet(default)]
     pub reject_malformed: bool,
@@ -94,6 +96,7 @@ impl SessionEngine {
             guid: self.guid,
             mtu: self.mtu,
             config: self.config.clone(),
+            closing_for_timeout: self.closing_for_timeout,
             disconnect_sent: self.disconnect_sent,
             reject_malformed: self.reject_malformed,
 
@@ -208,6 +211,7 @@ impl SessionEngine {
             guid: snapshot.guid,
             mtu: snapshot.mtu,
             config: snapshot.config,
+            closing_for_timeout: snapshot.closing_for_timeout,
             disconnect_sent: snapshot.disconnect_sent,
             reject_malformed: snapshot.reject_malformed,
             clock,
