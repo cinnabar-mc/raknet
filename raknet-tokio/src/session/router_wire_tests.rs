@@ -1,7 +1,7 @@
 //! The original actor's wire output remains bounded while its consumer is held.
 
 use super::*;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 const BODY_BYTES: usize = 128;
 const OUTBOUND_BYTES: i32 = 2048;
@@ -13,7 +13,7 @@ struct Original {
     session: Option<RakSession<Established>>,
     actor: Option<tokio::task::JoinHandle<()>>,
     input: Sender<SessionEvent>,
-    datagrams: UnboundedReceiver<(Box<[u8]>, SocketAddr)>,
+    datagrams: Receiver<wire::Datagram>,
     disconnected: UnboundedReceiver<RakSessionId>,
     peer: Option<raknet::prelude::RakSession<Established>>,
     address: SocketAddr,
@@ -29,7 +29,7 @@ impl Original {
     ) -> Self {
         let address = local.addr();
         let id = local.id();
-        let (datagram_tx, datagrams) = unbounded_channel();
+        let (datagram_tx, datagrams) = wire::datagrams();
         let (disconnect_tx, disconnected) = unbounded_channel();
         let (mut session, input) = spawn_established(local, datagram_tx, disconnect_tx);
         let actor = session.actor.take();
@@ -49,10 +49,11 @@ impl Original {
     /// Delivers the same frame once and returns the original peer's protocol output.
     fn forward(
         &mut self,
-        (bytes, address): (Box<[u8]>, SocketAddr),
+        datagram: wire::Datagram,
         echo: bool,
         closing: bool,
     ) -> Result<(), String> {
+        let (bytes, address, _credit) = datagram.into_parts();
         if address != self.address {
             return Err("original wire frame changed its destination".to_owned());
         }
@@ -289,7 +290,7 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
         let mut drained = 0_usize;
         while let Ok(frame) = original.datagrams.try_recv() {
             wire_bytes = wire_bytes
-                .checked_add(frame.0.len())
+                .checked_add(frame.bytes().len())
                 .ok_or_else(|| "actual wire byte sum overflowed".to_owned())?;
             drained += 1;
             original.forward(frame, false, false)?;
@@ -336,4 +337,119 @@ async fn retained_original_wire_consumer_bounds_actual_datagram_bytes() {
         queued <= constants::MAX_RECEIVE_MESSAGES && wire_bytes <= wire_budget,
         "retained original wire consumer exceeded finite route admission: queued={queued}, wire_bytes={wire_bytes}, wire_budget={wire_budget}, completed={completed}"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn original_peer_expiry_retires_an_actor_with_retained_wire_credit() {
+    let now = Instant::now();
+    let config = RakSessionConfig {
+        max_outbound_bytes: OUTBOUND_BYTES,
+        ..Default::default()
+    };
+    let (local, peer) = crate::test_support::negotiated_pair(
+        "127.0.0.1:54321".parse().unwrap(),
+        "127.0.0.1:19132".parse().unwrap(),
+        now.into_std(),
+        now.into_std(),
+        config.clone(),
+    );
+    let expiry = Instant::from_std(local.expiry_deadline(now.into_std()).unwrap());
+    let budget = (config.max_outbound_bytes as usize).max(usize::from(local.mtu()));
+    let mut original = Original::new(local, peer);
+    let mut actor = original.actor.take().unwrap();
+    let mut held = Vec::new();
+    let observed = tokio::time::timeout_at(expiry + constants::CLOSE_TIMEOUT, async {
+        original
+            .session
+            .as_ref()
+            .unwrap()
+            .send(body(0), RakReliability::Unreliable, RakPriority::Immediate)
+            .await
+            .map_err(|error| format!("first original send: {error}"))?;
+        let first = original
+            .datagrams
+            .recv()
+            .await
+            .ok_or_else(|| "first original wire output closed".to_owned())?;
+        let frame_bytes = first.bytes().len();
+        held.push(first);
+        let slots = budget / frame_bytes;
+        for sequence in 1..slots {
+            original
+                .session
+                .as_ref()
+                .unwrap()
+                .send(
+                    body(sequence),
+                    RakReliability::Unreliable,
+                    RakPriority::Immediate,
+                )
+                .await
+                .map_err(|error| format!("original held-credit send: {error}"))?;
+            held.push(
+                original
+                    .datagrams
+                    .recv()
+                    .await
+                    .ok_or_else(|| "original held-credit output closed".to_owned())?,
+            );
+        }
+        original
+            .session
+            .as_ref()
+            .unwrap()
+            .send(
+                body(slots),
+                RakReliability::Unreliable,
+                RakPriority::Immediate,
+            )
+            .await
+            .map_err(|error| format!("original blocked-output send: {error}"))?;
+        // Actual dequeued frames retain credit, as does the real socket-send head.
+        // The same-sized next encoded frame cannot fit that original route budget.
+        let equal_frames = held.iter().all(|frame| frame.bytes().len() == frame_bytes);
+        let retained_bytes: usize = held.iter().map(|frame| frame.bytes().len()).sum();
+        tokio::time::advance(expiry.saturating_duration_since(Instant::now())).await;
+        (&mut actor)
+            .await
+            .map_err(|error| format!("original expiry join: {error}"))?;
+        let terminal_read = original.session.as_mut().unwrap().recv::<Box<[u8]>>().await;
+        let session = original.session.take().unwrap();
+        let reason = match session.finish() {
+            Ok(terminal) => terminal.reason(),
+            Err(session) => {
+                drop(session);
+                return Err("original terminal ownership was not available".to_owned());
+            }
+        };
+        Ok::<_, String>((
+            equal_frames,
+            retained_bytes,
+            frame_bytes,
+            terminal_read,
+            reason,
+        ))
+    })
+    .await;
+    if !actor.is_finished() {
+        actor.abort();
+        let _ = actor.await;
+    }
+    let peer_finished = original.peer.take().map(|peer| {
+        let mut closing = match peer.abort(Instant::now().into_std()) {
+            Ok(closing) => closing,
+            Err(error) => error.into_parts().0,
+        };
+        while closing.poll().is_some() {}
+        closing.finish().is_ok()
+    });
+    drop(original);
+    drop(held);
+    assert_eq!(peer_finished, Some(true), "original peer cleanup failed");
+    let (equal_frames, retained_bytes, frame_bytes, terminal_read, reason) = observed
+        .expect("original blocked actor must retire under its unchanged peer deadline")
+        .expect("original wire and terminal owners must complete");
+    assert!(equal_frames && retained_bytes <= budget && retained_bytes + frame_bytes > budget);
+    assert!(matches!(terminal_read, Err(RakSessionError::Closed)));
+    assert_eq!(reason, Some(RakDisconnectReason::Timeout));
 }

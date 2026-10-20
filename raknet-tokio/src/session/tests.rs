@@ -14,7 +14,7 @@ async fn max_message_len_comes_from_the_session_config() {
             ..Default::default()
         },
     );
-    let (datagram_tx, _datagram_rx) = unbounded_channel();
+    let (datagram_tx, _datagram_rx) = wire::datagrams();
     let (disconnect_tx, _disconnect_rx) = unbounded_channel();
     let expected = session.max_message_len();
 
@@ -34,7 +34,7 @@ async fn a_session_whose_packets_are_never_read_is_closed() {
         Default::default(),
     );
     let expected_id = local.id();
-    let (datagram_tx, _datagram_rx) = unbounded_channel();
+    let (datagram_tx, _datagram_rx) = wire::datagrams();
     let (disconnect_tx, mut disconnect_rx) = unbounded_channel();
     let (_session, input_tx) = spawn_established(local, datagram_tx, disconnect_tx);
 
@@ -75,7 +75,7 @@ async fn rejected_close_after_actor_retirement_drains_prefix_and_stays_closed() 
         Default::default(),
     );
     let id = local.id();
-    let (datagram_tx, _datagram_rx) = unbounded_channel();
+    let (datagram_tx, _datagram_rx) = wire::datagrams();
     let (disconnect_tx, mut disconnect_rx) = unbounded_channel();
     let (session, input_tx) = spawn_established(local, datagram_tx, disconnect_tx);
     let prefix = Box::<[u8]>::from(&b"\xfeaccepted before retirement"[..]);

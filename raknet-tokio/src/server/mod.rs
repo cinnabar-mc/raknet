@@ -7,6 +7,7 @@ pub use phases::{ConfiguredServer, RunningServer};
 
 use crate::server::error::RakServerError;
 use crate::server::msg::RakServerMsg;
+use crate::session::wire;
 use crate::session::{
     RakSession, RestoredSession, SessionEvent, SessionRetirement, spawn_closing, spawn_established,
 };
@@ -113,7 +114,7 @@ impl RakServer<ConfiguredServer> {
                 )
                 .expect("session configuration was validated before binding");
 
-                let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
+                let (dgram_tx, mut dgram_rx) = wire::datagrams();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let mut stop_deadline: Option<Instant> = None;
@@ -172,8 +173,10 @@ impl RakServer<ConfiguredServer> {
                                 Err(e) => debug!("server failed to handle inbound datagram: {e}")
                             }
                         }
-                        Some((buf, addr)) = dgram_rx.recv() => {
-                            let _ = socket.send_to(buf.as_ref(), addr).await;
+                        Some(datagram) = dgram_rx.recv() => {
+                            if retention::owns_wire(&datagram, &sessions, &retained) {
+                                let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
+                            }
                         }
                         Some(id) = disconnect_rx.recv() => {
                             let now = Instant::now().into_std();
@@ -267,7 +270,7 @@ impl RakServer<ConfiguredServer> {
                                     id,
                                     Route {
                                         input: tx,
-                                        lifetime: session.lifetime(&retirement),
+                                        lifetime: session.lifetime(Some(&retirement)),
                                     },
                                 );
                                 if let Some(reply) = adoptions.remove(&id) {
@@ -292,7 +295,7 @@ impl RakServer<ConfiguredServer> {
                                         id,
                                         Route {
                                             input: tx,
-                                            lifetime: session.lifetime(&retirement),
+                                            lifetime: session.lifetime(Some(&retirement)),
                                         },
                                     );
                                     continue;
@@ -302,7 +305,7 @@ impl RakServer<ConfiguredServer> {
                                     id,
                                     Route {
                                         input: tx,
-                                        lifetime: session.lifetime(&retirement),
+                                        lifetime: session.lifetime(Some(&retirement)),
                                     },
                                 );
 
@@ -316,8 +319,10 @@ impl RakServer<ConfiguredServer> {
                     }
                 }
 
-                while let Ok((buf, addr)) = dgram_rx.try_recv() {
-                    let _ = socket.send_to(buf.as_ref(), addr).await;
+                while let Ok(datagram) = dgram_rx.try_recv() {
+                    if retention::owns_wire(&datagram, &sessions, &retained) {
+                        let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
+                    }
                 }
             }
         });

@@ -266,11 +266,35 @@ impl SessionEngine {
         payload_budget.min(split_limit).max(self.mtu as usize)
     }
 
+    /// Shares the original terminal deadlines with a backpressured delivery edge.
+    fn expiry_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.state == RakSessionState::Disconnected {
+            return None;
+        }
+        let close = if self.state == RakSessionState::Closing {
+            self.closing_since
+                .and_then(|since| self.close_deadline(since))
+        } else {
+            None
+        };
+        [self.peer_deadline(), self.receive_deadline(now), close]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Uses the same last admitted input and timeout as ordinary maintenance.
+    fn peer_deadline(&self) -> Option<Instant> {
+        self.last_recv.checked_add(SESSION_TIMEOUT)
+    }
+
+    /// Retains the original first close origin and validated grace interval.
+    fn close_deadline(&self, since: Instant) -> Option<Instant> {
+        since.checked_add(self.config.close_timeout)
+    }
+
     fn handle_timeout(&mut self, now: Instant) -> Result<(), RakSessionError> {
-        if now
-            .checked_duration_since(self.last_recv)
-            .is_some_and(|elapsed| elapsed >= SESSION_TIMEOUT)
-        {
+        if self.peer_deadline().is_some_and(|deadline| now >= deadline) {
             debug!(
                 "detected stale connection from {}, disconnecting...",
                 self.addr
@@ -355,9 +379,9 @@ impl SessionEngine {
         self.last_tick = now;
 
         if self.nothing_left_to_send()
-            || now
-                .checked_duration_since(since)
-                .is_some_and(|elapsed| elapsed >= self.config.close_timeout)
+            || self
+                .close_deadline(since)
+                .is_some_and(|deadline| now >= deadline)
         {
             return self.disconnect(true, RakDisconnectReason::Requested, now);
         }

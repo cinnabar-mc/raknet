@@ -110,6 +110,14 @@ impl<S: SessionPhase> RakSession<S> {
     pub fn state(&self) -> RakSessionState {
         self.engine.get_state()
     }
+    /// Returns the next terminal timeout while protocol output cannot drain.
+    ///
+    /// This observes the original peer, reliable-input and close deadlines. It
+    /// neither runs retransmissions nor rebases restored timestamps; drive
+    /// `Update` at the returned deadline to retain the protocol's first cause.
+    pub fn expiry_deadline(&self, now: Instant) -> Option<Instant> {
+        self.engine.expiry_deadline(now)
+    }
     /// Returns the congestion controller's current round-trip estimate.
     pub fn rtt(&self) -> Duration {
         self.engine.rtt()

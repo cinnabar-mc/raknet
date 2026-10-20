@@ -3,6 +3,7 @@
 mod admission;
 mod command;
 mod driver;
+pub(crate) mod wire;
 
 use admission::{ActorAdmission, Admission};
 pub(crate) use admission::{SessionLifetime, SessionRetirement};
@@ -60,17 +61,19 @@ impl<S: SessionPhase> fmt::Debug for RakSession<S> {
 /// Spawns the established actor only from the core's genuine owned handoff.
 pub(crate) fn spawn_established(
     session: raknet::prelude::RakSession<Established>,
-    datagrams: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    datagrams: Sender<wire::Datagram>,
     disconnected: UnboundedSender<RakSessionId>,
 ) -> (RakSession<Established>, Sender<SessionEvent>) {
     let addr = session.addr();
     let id = session.id();
     let limit = session.max_message_len();
+    let mtu = session.mtu();
     spawn(
         Driver::established(session),
         addr,
         id,
         limit,
+        mtu,
         datagrams,
         disconnected,
     )
@@ -79,17 +82,19 @@ pub(crate) fn spawn_established(
 /// Spawns a restored closing actor while withholding all application-send methods.
 pub(crate) fn spawn_closing(
     session: raknet::prelude::RakSession<Closing>,
-    datagrams: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    datagrams: Sender<wire::Datagram>,
     disconnected: UnboundedSender<RakSessionId>,
 ) -> (RakSession<Closing>, Sender<SessionEvent>) {
     let addr = session.addr();
     let id = session.id();
     let limit = session.max_message_len();
+    let mtu = session.mtu();
     spawn(
         Driver::closing(session),
         addr,
         id,
         limit,
+        mtu,
         datagrams,
         disconnected,
     )
@@ -101,7 +106,8 @@ fn spawn<S: SessionPhase>(
     addr: SocketAddr,
     id: RakSessionId,
     max_message_len: usize,
-    datagram_tx: UnboundedSender<(Box<[u8]>, SocketAddr)>,
+    mtu: u16,
+    datagram_tx: Sender<wire::Datagram>,
     disconnect_tx: UnboundedSender<RakSessionId>,
 ) -> (RakSession<S>, Sender<SessionEvent>) {
     let admission = Admission::new(
@@ -119,20 +125,63 @@ fn spawn<S: SessionPhase>(
         let admission = &admission_owner.0;
         let timer = sleep(std::time::Duration::ZERO);
         tokio::pin!(timer);
+        let mut pending = None;
+        let mut wire_open = true;
+        let mut expiry = None;
         loop {
+            let blocked = pending.is_some();
+            let terminal = driver.state() == RakSessionState::Disconnected;
             tokio::select! {
                 biased;
                 close = admission.close_ready() => {
                     let result = driver.close(close.started.into_std(), false);
                     // Age the same close immediately; FIFO draining never rebases its cutoff.
                     let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std()));
+                    expiry = None;
                     let _ = close.reply.send(result);
                 }
+                _ = buf_tx.closed(), if wire_open => {
+                    wire_open = false;
+                    pending = None;
+                    let _ = driver.close(Instant::now().into_std(), true);
+                }
+                _ = datagram_tx.closed(), if wire_open => {
+                    wire_open = false;
+                    pending = None;
+                    let _ = driver.close(Instant::now().into_std(), true);
+                }
+                result = wire::forward(&datagram_tx, admission, mtu, id, &mut pending),
+                    if pending.is_some() && wire_open => {
+                    if result.is_err() {
+                        wire_open = false;
+                        pending = None;
+                        let _ = driver.close(Instant::now().into_std(), true);
+                    }
+                }
+                // Try admitting the terminal wire prefix above first. A genuinely
+                // blocked route cannot withhold its already-produced local terminal.
+                _ = std::future::ready(()), if terminal && pending.is_some() => {
+                    wire_open = false;
+                    pending = None;
+                }
                 _ = async {
+                    if blocked {
+                        // Observe deadlines only after real wire admission is Pending.
+                        // Ordinary retransmits must not grow the core's blocked FIFO.
+                        expiry = driver.expiry_deadline(Instant::now().into_std()).map(Instant::from_std);
+                        match expiry {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                        let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std()));
+                        expiry = None;
+                        return;
+                    }
                     tokio::select! {
                         Some(message) = msg_rx.recv() => match message {
                             RakSessionMsg::Send(bytes, reliability, priority, reply, credit) => {
                                 let result = driver.send(bytes, reliability, priority, Instant::now().into_std());
+                                expiry = None;
                                 drop(credit);
                                 let _ = reply.send(result);
                             }
@@ -153,24 +202,42 @@ fn spawn<S: SessionPhase>(
                             }
                         },
                         event = rx.recv() => match event {
-                            Some(SessionEvent::Io(input)) => { let _ = driver.handle(input); }
-                            Some(SessionEvent::Close(now)) => { let _ = driver.close(now, false); }
+                            Some(SessionEvent::Io(input)) => {
+                                let _ = driver.handle(input);
+                                expiry = None;
+                            }
+                            Some(SessionEvent::Close(now)) => {
+                                let _ = driver.close(now, false);
+                                expiry = None;
+                            }
                             None => { let _ = driver.close(Instant::now().into_std(), true); }
                         },
-                        _ = buf_tx.closed() => { let _ = driver.close(Instant::now().into_std(), true); }
-                        _ = &mut timer => { let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std())); }
+                        _ = &mut timer => {
+                            let _ = driver.handle(RakSessionInput::Update(Instant::now().into_std()));
+                            expiry = None;
+                        }
                     }
                 } => {},
             }
             if driver.state() != RakSessionState::Connected {
                 admission.seal();
             }
-            while let Some(output) = driver.poll() {
+            // Drain the original output before accepting another mutation. A blocked
+            // wire front must not move growth back into the core's output FIFO.
+            while pending.is_none()
+                && let Some(output) = driver.poll()
+            {
                 match output {
-                    RakSessionOutput::Wait(after) => timer.as_mut().reset(Instant::now() + after),
-                    RakSessionOutput::Datagram(bytes, peer) => {
-                        let _ = datagram_tx.send((bytes, peer));
+                    RakSessionOutput::Wait(after) => {
+                        let deadline = Instant::now() + after;
+                        timer
+                            .as_mut()
+                            .reset(expiry.map_or(deadline, |expiry| expiry.min(deadline)));
                     }
+                    RakSessionOutput::Datagram(bytes, peer) if wire_open => {
+                        pending = Some((bytes, peer));
+                    }
+                    RakSessionOutput::Datagram(..) => {}
                     RakSessionOutput::Packet(bytes) => {
                         if bytes.is_empty() {
                             continue;
@@ -210,7 +277,7 @@ fn spawn<S: SessionPhase>(
 
 impl<S: SessionPhase> RakSession<S> {
     /// Observes the original allocation without retaining its public or actor ownership.
-    pub(crate) fn lifetime(&self, retirement: &Arc<SessionRetirement>) -> SessionLifetime {
+    pub(crate) fn lifetime(&self, retirement: Option<&Arc<SessionRetirement>>) -> SessionLifetime {
         self.admission.lifetime(retirement)
     }
 

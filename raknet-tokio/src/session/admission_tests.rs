@@ -12,7 +12,7 @@ struct ActorPair {
     session: RakSession<Established>,
     peer: raknet::prelude::RakSession<Established>,
     input: Sender<SessionEvent>,
-    datagrams: tokio::sync::mpsc::UnboundedReceiver<(Box<[u8]>, SocketAddr)>,
+    datagrams: tokio::sync::mpsc::Receiver<wire::Datagram>,
 }
 
 /// Starts the original actor only after both real core handshake directions complete.
@@ -28,7 +28,7 @@ fn actor() -> ActorPair {
             ..Default::default()
         },
     );
-    let (output, receive) = unbounded_channel();
+    let (output, receive) = wire::datagrams();
     let (disconnected, _) = unbounded_channel();
     let (session, input) = spawn_established(local, output, disconnected);
     ActorPair {
@@ -74,13 +74,14 @@ async fn cleanup<S: SessionPhase>(
 /// Reads actual original wire output through the other negotiated core owner.
 async fn received(
     peer: &mut raknet::prelude::RakSession<Established>,
-    datagrams: &mut tokio::sync::mpsc::UnboundedReceiver<(Box<[u8]>, SocketAddr)>,
+    datagrams: &mut tokio::sync::mpsc::Receiver<wire::Datagram>,
 ) -> Result<Box<[u8]>, String> {
     loop {
-        let (bytes, _) = datagrams
+        let datagram = datagrams
             .recv()
             .await
             .ok_or_else(|| "original actor output closed".to_owned())?;
+        let (bytes, _, _credit) = datagram.into_parts();
         peer.handle(RakSessionInput::Datagram(bytes, Instant::now().into_std()))
             .map_err(|error| format!("original peer input: {error}"))?;
         while let Some(output) = peer.poll() {
