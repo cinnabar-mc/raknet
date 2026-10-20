@@ -25,7 +25,8 @@ types. Import from the chosen crate's `prelude`.
 
 Application writes emit available datagrams immediately at every priority.
 Congestion and ordering windows can retain a write until capacity opens; an ACK
-drives those queued writes immediately. The automatic flush interval controls
+drives those queued writes immediately. Priority selects their scheduling order.
+The automatic flush interval controls
 maintenance such as acknowledgements and retransmissions, not application delay.
 
 Tokio and Bevy require `config.session.autoflush = true`, the default. They

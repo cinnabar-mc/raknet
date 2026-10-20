@@ -1,7 +1,7 @@
 #[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+/// Selects scheduling order when flow control retains application writes.
 pub enum RakPriority {
-    /// Sends directly, bypassing congestion and receive-window scheduling.
-    /// Use a queued priority for sustained reliable application traffic.
+    /// Highest scheduling priority, within congestion and receive-window limits.
     Immediate,
     High,
     Normal,
