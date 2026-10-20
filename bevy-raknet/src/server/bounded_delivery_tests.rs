@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::client::RakClient;
+use raknet::protocol::codec::RakCodec;
 
 pub(crate) const RECEIVE_BYTES: usize = 512;
 const BODY_BYTES: usize = RECEIVE_BYTES / 4;
@@ -77,6 +78,46 @@ fn established(
         Attempt::Connected(id) => id,
         Attempt::Refused | Attempt::Stalled => panic!("setup: original loopback handshake failed"),
     }
+}
+
+#[test]
+fn normal_sends_reach_both_sockets_without_an_update() {
+    let (mut server, address) = server(1);
+    let mut client = client();
+    let id = established(&mut server, address, &mut client);
+    let marker = Box::<[u8]>::from(&b"\xfenormal send without a frame update"[..]);
+    client
+        .connected()
+        .unwrap()
+        .send(
+            marker.clone(),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+        )
+        .unwrap();
+    let mut buffer = [0; 1492];
+    let (len, _) = server
+        .socket
+        .recv_from(&mut buffer)
+        .expect("client sent UDP");
+    let set =
+        raknet::protocol::packets::frame_set::FrameSet::deserialize(&mut &buffer[..len]).unwrap();
+    assert!(set.frames.iter().any(|frame| frame.payload == marker));
+
+    server
+        .connected(id)
+        .unwrap()
+        .send(
+            marker.clone(),
+            RakReliability::ReliableOrdered,
+            RakPriority::Normal,
+        )
+        .unwrap();
+    let len = crate::client::bounded_delivery_tests::receive_datagram(&client, &mut buffer)
+        .expect("server sent UDP");
+    let set =
+        raknet::protocol::packets::frame_set::FrameSet::deserialize(&mut &buffer[..len]).unwrap();
+    assert!(set.frames.iter().any(|frame| frame.payload == marker));
 }
 
 /// Sends through the live public capability with reliable wire ordering.

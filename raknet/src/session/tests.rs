@@ -7,6 +7,55 @@ fn domain_time() -> Instant {
 use crate::protocol::packets::ack::MAX_ACK_ENTRIES;
 
 #[test]
+fn every_priority_sends_without_advancing_time_or_running_maintenance() {
+    let now = domain_time();
+    for autoflush in [true, false] {
+        for priority in [
+            RakPriority::Immediate,
+            RakPriority::High,
+            RakPriority::Normal,
+            RakPriority::Low,
+        ] {
+            let mut sender = session(1, 1);
+            sender.config.autoflush = autoflush;
+            sender.sequences_recv.insert(123);
+            let expected = Box::<[u8]>::from(&b"\xfeordinary send"[..]);
+            sender
+                .handle(SessionInput::Send(
+                    expected.clone(),
+                    RakReliability::ReliableOrdered,
+                    priority,
+                    now,
+                ))
+                .unwrap();
+            assert_eq!(payloads_of(&drain_outputs(&mut sender)), [expected]);
+            assert!(sender.sequences_recv.contains(&123));
+            assert_eq!(sender.last_tick, now);
+        }
+    }
+}
+
+#[test]
+fn an_ack_releases_queued_sends_without_advancing_time() {
+    let now = domain_time();
+    let mut sender = session(1, 1);
+    for _ in 0..2 {
+        send(&mut sender, 1000, now).unwrap();
+    }
+    let first = drain_outputs(&mut sender);
+    assert_eq!(sequences_of(&first).len(), 1);
+    assert!(!sender.outbound_queue[RakPriority::Normal as usize].is_empty());
+    sender
+        .handle(SessionInput::Datagram(
+            Ack::new(sequences_of(&first), false).serialized().unwrap(),
+            now,
+        ))
+        .unwrap();
+    assert_eq!(payloads_of(&drain_outputs(&mut sender)).len(), 1);
+    assert!(sender.outbound_queue.iter().all(VecDeque::is_empty));
+}
+
+#[test]
 fn transferred_snapshot_preserves_wire_uptime_and_inflight_timers() {
     let origin = crate::clock::test_now();
     let start = origin + Duration::from_secs(5);
@@ -242,15 +291,15 @@ fn priority_routes_to_separate_queues() {
 
     let now = domain_time();
     session
-        .send_frame(
-            Frame::new(RakReliability::Unreliable, Box::new([1])),
+        .queue_frames(
+            vec![Frame::new(RakReliability::Unreliable, Box::new([1]))],
             RakPriority::Low,
             now,
         )
         .unwrap();
     session
-        .send_frame(
-            Frame::new(RakReliability::Unreliable, Box::new([2])),
+        .queue_frames(
+            vec![Frame::new(RakReliability::Unreliable, Box::new([2]))],
             RakPriority::High,
             now,
         )
@@ -1582,13 +1631,9 @@ fn congestion_reference_accounting_excludes_the_datagram_header_for_mixed_frames
     let now = domain_time();
     let mut sender = session(0, 1);
     for reliability in [RakReliability::Reliable, RakReliability::Unreliable] {
+        let frames = sender.prepare_frames(Frame::new(reliability, vec![0xfe; 100].into()));
         sender
-            .handle(SessionInput::Send(
-                vec![0xfe; 100].into_boxed_slice(),
-                reliability,
-                RakPriority::Normal,
-                now,
-            ))
+            .queue_frames(frames, RakPriority::Normal, now)
             .unwrap();
     }
     sender.tick(now).unwrap();
@@ -1632,7 +1677,13 @@ fn congestion_reference_feedback_bits_follow_the_actual_window_and_send_burst() 
     sender.congestion_controller =
         RakCongestionController::restore(snapshot, sender.clock).unwrap();
     for _ in 0..2 {
-        send(&mut sender, 1000, now).unwrap();
+        let frames = sender.prepare_frames(Frame::new(
+            RakReliability::ReliableOrdered,
+            vec![0xfe; 1000].into(),
+        ));
+        sender
+            .queue_frames(frames, RakPriority::Normal, now)
+            .unwrap();
     }
     sender.tick(now).unwrap();
     let sets: Vec<_> = datagrams_of(&drain_outputs(&mut sender))
@@ -1703,6 +1754,7 @@ fn congestion_reference_recovery_and_queued_demand_survive_json_transfer() {
         let after_ack = resumed.congestion_controller.snapshot(resumed.clock);
         assert!(after_ack.congestion_window > before.congestion_window);
         assert_eq!(after_ack.congestion_recovery_sequence, Some(boundary));
+        drain_outputs(&mut resumed);
         resumed
             .handle(SessionInput::Datagram(
                 Ack::new(vec![initial[1]], true).serialized().unwrap(),

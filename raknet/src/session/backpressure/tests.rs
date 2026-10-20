@@ -131,8 +131,15 @@ fn backpressure_services_control_but_never_acks_a_partly_refused_datagram() {
         payload.clone(),
         ConnectedPing { timestamp: 0 }.serialized().unwrap(),
     ] {
+        let frames = sender
+            .engine
+            .prepare_frames(crate::protocol::types::frame::Frame::new(
+                RakReliability::Reliable,
+                bytes,
+            ));
         sender
-            .send(bytes, RakReliability::Reliable, RakPriority::Normal, now)
+            .engine
+            .queue_frames(frames, RakPriority::Normal, now)
             .unwrap();
     }
     sender.tick(now).unwrap();

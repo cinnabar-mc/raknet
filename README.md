@@ -23,6 +23,11 @@ The adapters are separate crates, rather than features of `raknet`. Their
 `RakClient`, `RakServer` and `RakSession` names refer to different integration
 types. Import from the chosen crate's `prelude`.
 
+Application writes emit available datagrams immediately at every priority.
+Congestion and ordering windows can retain a write until capacity opens; an ACK
+drives those queued writes immediately. The automatic flush interval controls
+maintenance such as acknowledgements and retransmissions, not application delay.
+
 Tokio and Bevy require `config.session.autoflush = true`, the default. They
 reject manual flushing before opening a socket because their handles expose no
 caller `tick`. Tokio also rejects manual-flush snapshots before restoration or

@@ -697,17 +697,11 @@ async fn final_receive_refusal_cannot_admit_a_successor_after_a_freed_prefix_slo
             original.forward(frame, false, false)?;
         }
         let peer = original.peer.as_mut().unwrap();
-        for sequence in constants::MAX_RECEIVE_MESSAGES..constants::MAX_RECEIVE_MESSAGES + 2 {
-            peer.send(
-                count_body(sequence),
-                RakReliability::ReliableOrdered,
-                RakPriority::Normal,
-                Instant::now().into_std(),
-            )
-            .map_err(|error| format!("original coalesced send: {error}"))?;
-        }
-        peer.tick(Instant::now().into_std())
-            .map_err(|error| format!("original coalesced flush: {error}"))?;
+        raknet::test_support::send_bundle(
+            peer,
+            (constants::MAX_RECEIVE_MESSAGES..constants::MAX_RECEIVE_MESSAGES + 2).map(count_body),
+            Instant::now().into_std(),
+        );
         let mut pair = None;
         while let Some(output) = peer.poll() {
             if let RakSessionOutput::Datagram(bytes, _) = output

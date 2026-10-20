@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 #[cfg(test)]
-mod bounded_delivery_tests;
+pub(crate) mod bounded_delivery_tests;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 

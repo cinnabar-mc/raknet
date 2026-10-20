@@ -464,6 +464,15 @@ impl SessionEngine {
 
     fn send_queue(&mut self, now: Instant) -> Result<(), RakSessionError> {
         let mut bandwidth = self.congestion_controller.transmission_bandwidth();
+        if !self
+            .outbound_queue
+            .iter()
+            .filter_map(|queue| queue.front())
+            .any(|frame| frame.size_hint() <= bandwidth)
+        {
+            self.bandwidth_limited = self.outbound_queue.iter().any(|queue| !queue.is_empty());
+            return Ok(());
+        }
         let oldest_reliable = self.oldest_unacked_reliable();
         let oldest_ordered = self.oldest_unacked_ordered();
         let mut splits_in_flight = self.splits_in_flight();
@@ -633,7 +642,7 @@ impl SessionEngine {
         }
     }
 
-    /// Schedules application traffic while keeping Immediate sends inside flow limits.
+    /// Emits every admitted application write within the current flow limits.
     fn send_frame(
         &mut self,
         frame: Frame,
@@ -641,20 +650,16 @@ impl SessionEngine {
         now: Instant,
     ) -> Result<(), RakSessionError> {
         let frames = self.prepare_frames(frame);
-        if priority == RakPriority::Immediate {
-            self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
-            self.outbound_queue[priority as usize].extend(frames);
-            self.wire_continuous = self.bandwidth_limited;
-            self.send_queue(now)?;
-            self.flush();
-        } else {
-            self.queue_frames(frames, priority, now)?;
-        }
+        self.outbound_bytes += frames.iter().map(Frame::size_hint).sum::<usize>();
+        self.outbound_queue[priority as usize].extend(frames);
+        self.wire_continuous = self.bandwidth_limited;
+        self.send_queue(now)?;
+        self.flush();
         Ok(())
     }
 
     /// Assigns wire counters and fragments one payload independently from scheduling.
-    fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
+    pub(crate) fn prepare_frames(&mut self, frame: Frame) -> Vec<Frame> {
         let max_size = (self.mtu - DGRAM_MTU_OVERHEAD) as usize;
 
         let order_channel = frame.order_channel;
@@ -737,7 +742,8 @@ impl SessionEngine {
         self.queue_frames(frames, RakPriority::Immediate, now)
     }
 
-    fn queue_frames(
+    /// Queues prepared frames, or emits internal control at Immediate priority.
+    pub(crate) fn queue_frames(
         &mut self,
         frames: Vec<Frame>,
         priority: RakPriority,
@@ -784,6 +790,9 @@ impl SessionEngine {
                 }
             }
         }
+        self.wire_continuous = self.bandwidth_limited;
+        self.send_queue(now)?;
+        self.flush();
         Ok(())
     }
 

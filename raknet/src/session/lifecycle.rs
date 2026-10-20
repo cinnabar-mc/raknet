@@ -226,6 +226,7 @@ mod tests;
 
 impl RakSession<Established> {
     /// Submits one complete message; success does not acknowledge peer delivery.
+    /// Available datagrams are emitted immediately, regardless of priority or autoflush.
     ///
     /// # Errors
     /// Returns closed, message-size or protocol errors. Inspect terminal outputs too.

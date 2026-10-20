@@ -180,7 +180,7 @@ pub(crate) fn negotiate_after_loss(autoflush: bool, lost_control: u8) -> Option<
     None
 }
 
-/// Confirms manual application delivery still needs the real handed-off tick capability.
+/// Confirms manual maintenance does not delay a handed-off application write.
 fn assert_manual_application_flush(mut session: RakSession<Established>, now: Instant) {
     assert!(!session.snapshot(now).unwrap().config().autoflush);
     session
@@ -191,15 +191,12 @@ fn assert_manual_application_flush(mut session: RakSession<Established>, now: In
             now,
         )
         .unwrap();
-    session.handle(RakSessionInput::Update(now)).unwrap();
-    while let Some(output) = session.poll() {
-        assert!(!matches!(output, RakSessionOutput::Datagram(..)));
-    }
-    session.tick(now).unwrap();
     assert!(
         std::iter::from_fn(|| session.poll())
             .any(|output| { matches!(output, RakSessionOutput::Datagram(..)) })
     );
+    session.handle(RakSessionInput::Update(now)).unwrap();
+    assert!(session.poll().is_none());
 }
 
 #[test]

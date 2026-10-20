@@ -4,6 +4,14 @@ use crate::server::bounded_delivery_tests::{
     PROGRESS_WATCHDOG, RECEIVE_BYTES, client, server, step,
 };
 
+/// Reads the original client socket without driving session timers.
+pub(crate) fn receive_datagram(
+    client: &super::RakClient,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    client.socket.recv(buffer)
+}
+
 #[test]
 fn unread_bevy_discovery_pongs_keep_only_the_bounded_accepted_prefix() {
     let (mut server, address) = server(1);

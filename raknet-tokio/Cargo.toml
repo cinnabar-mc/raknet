@@ -17,6 +17,7 @@ thiserror = "2"
 test-support = ["raknet/test-support"]
 
 [dev-dependencies]
+raknet = { path = "../raknet", features = ["test-support"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1.52.3", features = ["full", "test-util"] }
 
