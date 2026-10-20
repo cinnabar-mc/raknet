@@ -88,8 +88,11 @@ configuration and returns `RakClient<RunningClient>`. Call `connect(remote).awai
 on that owner, then use the returned `RakSession<Established>`'s `send` and `recv`. Keep the
 client owner running while using its session. `recv::<Box<[u8]>>()` returns one
 complete application message. A successful `send` is not a remote delivery
-receipt. `session.close()` synchronously consumes send permission and returns a
-`RakSession<Closing>` that can drain the received prefix. Keep the socket owner
+receipt. `session.close()` synchronously consumes send permission and returns
+`Result<RakSession<Closing>, SessionCloseError>`. Both outcomes retain the closing
+handle and its received prefix; use the error's `into_parts()` to recover that
+handle and the cause. Drain its `recv` results, then use `finish()` for terminal
+metadata; a not-yet-finished result returns the same handle. Keep the socket owner
 running until terminal completion; `client.stop().await` or `server.stop().await`
 consumes that running owner and awaits its shutdown.
 
