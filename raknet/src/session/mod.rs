@@ -487,7 +487,11 @@ impl SessionEngine {
             .outbound_queue
             .iter()
             .filter_map(|queue| queue.front())
-            .any(|frame| frame.size_hint() <= bandwidth)
+            .any(|frame| {
+                #[cfg(test)]
+                tests::record_scheduler_frame_visit();
+                frame.size_hint() <= bandwidth
+            })
         {
             self.bandwidth_limited = self.outbound_queue.iter().any(|queue| !queue.is_empty());
             return Ok(());
@@ -503,25 +507,29 @@ impl SessionEngine {
                 window
             }
         };
-        let mut splits_in_flight = if self.outbound_queue.iter().flatten().any(Frame::is_split) {
-            self.splits_in_flight()
-        } else {
-            HashSet::new()
-        };
+        let mut splits_in_flight = None;
+        let outbound_cache = &self.outbound_cache;
 
         let queued = self.outbound_queue.iter().map(VecDeque::len).sum::<usize>();
         let mut frames = Vec::with_capacity(queued.min(4));
         for queue in &mut self.outbound_queue {
             while let Some(frame) = queue.pop_front_if(|f| {
+                #[cfg(test)]
+                tests::record_scheduler_frame_visit();
                 f.size_hint() <= bandwidth
                     && within_reliable_window(f, window.reliable)
                     && within_ordered_window(f, &window.ordered)
-                    && (!f.is_split()
-                        || splits_in_flight.contains(&f.split_id)
-                        || splits_in_flight.len() < MAX_SPLITS_IN_FLIGHT)
+                    && (!f.is_split() || {
+                        let splits = splits_in_flight
+                            .get_or_insert_with(|| Self::splits_in_flight(outbound_cache));
+                        splits.contains(&f.split_id) || splits.len() < MAX_SPLITS_IN_FLIGHT
+                    })
             }) {
                 if frame.is_split() {
-                    splits_in_flight.insert(frame.split_id);
+                    splits_in_flight
+                        .as_mut()
+                        .expect("eligible fragments initialize split ownership")
+                        .insert(frame.split_id);
                 }
                 bandwidth -= frame.size_hint();
                 self.outbound_bytes = self.outbound_bytes.saturating_sub(frame.size_hint());
@@ -548,8 +556,10 @@ impl SessionEngine {
     fn oldest_unacked_reliable(&self) -> Option<u32> {
         let cached = self.outbound_cache.values().flat_map(|set| &set.frames);
         let queued = self.outbound_queue.iter().flatten();
-        cached
-            .chain(queued)
+        let frames = cached.chain(queued);
+        #[cfg(test)]
+        let frames = frames.inspect(|_| tests::record_scheduler_frame_visit());
+        frames
             .filter(|f| f.reliability.is_reliable())
             .map(|f| f.reliable_index)
             .max_by_key(|&index| u24::distance(index, self.outbound_rel))
@@ -560,7 +570,10 @@ impl SessionEngine {
         let mut oldest = [None; 32];
         let cached = self.outbound_cache.values().flat_map(|set| &set.frames);
         let queued = self.outbound_queue.iter().flatten();
-        for frame in cached.chain(queued).filter(|f| f.reliability.is_ordered()) {
+        let frames = cached.chain(queued);
+        #[cfg(test)]
+        let frames = frames.inspect(|_| tests::record_scheduler_frame_visit());
+        for frame in frames.filter(|f| f.reliability.is_ordered()) {
             let channel = frame.order_channel as usize;
             let next = self.outbound_ord_idx[channel];
             if oldest[channel].is_none_or(|index| {
@@ -572,10 +585,12 @@ impl SessionEngine {
         oldest
     }
 
-    fn splits_in_flight(&self) -> HashSet<u16> {
-        self.outbound_cache
-            .values()
-            .flat_map(|set| &set.frames)
+    /// Reads retained split ownership only when an otherwise eligible fragment needs it.
+    fn splits_in_flight(outbound_cache: &HashMap<u32, FrameSet>) -> HashSet<u16> {
+        let frames = outbound_cache.values().flat_map(|set| &set.frames);
+        #[cfg(test)]
+        let frames = frames.inspect(|_| tests::record_scheduler_frame_visit());
+        frames
             .filter(|f| f.is_split())
             .map(|f| f.split_id)
             .collect()
