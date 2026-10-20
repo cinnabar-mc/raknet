@@ -204,6 +204,8 @@ impl RakClient<ConfiguredClient> {
         let config = self.state.config;
         let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
         let stop = Arc::new(StopState::default());
+        #[cfg(test)]
+        let send_gate = crate::session::physical_send_tests::capture(&stop);
 
         let handle = tokio::spawn({
             let stop = stop.clone();
@@ -263,6 +265,8 @@ impl RakClient<ConfiguredClient> {
                             if session_route.as_ref().is_some_and(|(id, lifetime)|
                                 *id == datagram.id() && datagram.belongs_to(lifetime))
                             {
+                                #[cfg(test)]
+                                crate::session::physical_send_tests::before_send(&send_gate).await;
                                 let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
                             }
                         }
@@ -356,6 +360,8 @@ impl RakClient<ConfiguredClient> {
                         match msg {
                             RakClientOutput::MtuProbe { id, datagram, peer } => {
                                 let started = Instant::now();
+                                #[cfg(test)]
+                                crate::session::physical_send_tests::before_send(&send_gate).await;
                                 let result = sockets.send_to(&datagram, peer).await;
                                 let elapsed = started.elapsed();
                                 let input = RakClientInput::MtuProbeResult {
@@ -368,6 +374,8 @@ impl RakClient<ConfiguredClient> {
                                 fail_pending_connect(&mut client, &mut connect, result);
                             }
                             RakClientOutput::SocketDatagram(buf, addr) => {
+                                #[cfg(test)]
+                                crate::session::physical_send_tests::before_send(&send_gate).await;
                                 let _ = sockets.send_to(&buf, addr).await;
                             }
                             RakClientOutput::SessionDatagram(buf) => {
@@ -453,9 +461,13 @@ impl RakClient<ConfiguredClient> {
                     if session_route.as_ref().is_some_and(|(id, lifetime)| {
                         *id == datagram.id() && datagram.belongs_to(lifetime)
                     }) {
+                        #[cfg(test)]
+                        crate::session::physical_send_tests::before_send(&send_gate).await;
                         let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
                     }
                 }
+                #[cfg(test)]
+                crate::session::physical_send_tests::finished(&send_gate);
             }
         });
 

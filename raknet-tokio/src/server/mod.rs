@@ -93,6 +93,8 @@ impl RakServer<ConfiguredServer> {
         let (session_tx, session_rx) = unbounded_channel();
         let (msg_tx, msg_rx) = channel(constants::MAX_RECEIVE_MESSAGES);
         let stop = Arc::new(StopState::default());
+        #[cfg(test)]
+        let send_gate = crate::session::physical_send_tests::capture(&stop);
 
         let handle = tokio::spawn({
             let stop = stop.clone();
@@ -175,6 +177,8 @@ impl RakServer<ConfiguredServer> {
                         }
                         Some(datagram) = dgram_rx.recv() => {
                             if retention::owns_wire(&datagram, &sessions, &retained) {
+                                #[cfg(test)]
+                                crate::session::physical_send_tests::before_send(&send_gate).await;
                                 let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
                             }
                         }
@@ -232,6 +236,8 @@ impl RakServer<ConfiguredServer> {
                     while let Some(msg) = server.poll() {
                         match msg {
                             RakServerOutput::SocketDatagram(buf, addr) => {
+                                #[cfg(test)]
+                                crate::session::physical_send_tests::before_send(&send_gate).await;
                                 let _ = socket.send_to(&buf, addr).await;
                             }
                             RakServerOutput::SessionDatagram(buf, id) => {
@@ -321,9 +327,13 @@ impl RakServer<ConfiguredServer> {
 
                 while let Ok(datagram) = dgram_rx.try_recv() {
                     if retention::owns_wire(&datagram, &sessions, &retained) {
+                        #[cfg(test)]
+                        crate::session::physical_send_tests::before_send(&send_gate).await;
                         let _ = socket.send_to(datagram.bytes(), datagram.peer()).await;
                     }
                 }
+                #[cfg(test)]
+                crate::session::physical_send_tests::finished(&send_gate);
             }
         });
 
