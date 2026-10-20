@@ -392,6 +392,64 @@ fn datagram_gap_within_window_is_nacked() {
     assert_eq!(session.inbound_seq, 4);
 }
 
+/// A normal forward gap must not prevent the next body and bounded loss feedback.
+#[test]
+fn datagram_gap_preserves_forward_progress_and_recent_loss_feedback() {
+    let mut observations = Vec::new();
+    for first in [0, u24::MASK - DATAGRAM_WINDOW as u32] {
+        let mut session = session(0, 1);
+        session.inbound_seq = first;
+        let jumped = u24::add(first, DATAGRAM_WINDOW as u32 + 1);
+        let following = u24::add(jumped, 1);
+        for (sequence, body) in [(first, 0), (jumped, 1), (following, 2)] {
+            session
+                .handle(datagram(sequence, unreliable(body)))
+                .unwrap();
+        }
+        let delivered = packets(&mut session);
+        session.tick(domain_time()).unwrap();
+        let mut acked = HashSet::new();
+        let mut nacked = HashSet::new();
+        for bytes in outbound_acks(&mut session) {
+            assert!(bytes.len() <= session.mtu as usize);
+            let ack = Ack::deserialize(&mut bytes.as_ref()).unwrap();
+            if ack.is_nack {
+                nacked.extend(ack.sequences);
+            } else {
+                acked.extend(ack.sequences);
+            }
+        }
+        observations.push((
+            first,
+            jumped,
+            following,
+            session.inbound_seq,
+            delivered,
+            acked,
+            nacked,
+        ));
+    }
+
+    for (first, jumped, following, next, delivered, acked, nacked) in observations {
+        assert_eq!(
+            delivered,
+            vec![
+                Box::<[u8]>::from([0xFE, 0]),
+                Box::<[u8]>::from([0xFE, 1]),
+                Box::<[u8]>::from([0xFE, 2])
+            ],
+            "an ordinary datagram gap stranded its healthy followup"
+        );
+        assert_eq!(next, u24::add(following, 1));
+        assert_eq!(acked, HashSet::from([first, jumped, following]));
+        // The compatibility reference reports at most the latest thousand skipped indices.
+        let expected = (1..=1000)
+            .map(|index| jumped.wrapping_sub(index) & u24::MASK)
+            .collect::<HashSet<_>>();
+        assert_eq!(nacked, expected);
+    }
+}
+
 #[test]
 fn datagram_beyond_window_is_dropped() {
     let mut session = session(0, 1);
