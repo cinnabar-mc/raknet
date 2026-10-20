@@ -3,7 +3,6 @@ use crate::protocol::error::RakCodecError;
 use crate::util::flags::{ACK, NACK, VALID};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Error, Read, Write};
-use std::mem::take;
 
 pub const MAX_ACK_ENTRIES: usize = 8192;
 
@@ -19,51 +18,56 @@ pub struct Ack {
 
 impl Ack {
     pub fn new(mut sequences: Vec<u32>, is_nack: bool) -> Self {
-        sequences.sort_unstable();
-        sequences.dedup();
+        if !sequences.windows(2).all(|pair| pair[0] < pair[1]) {
+            sequences.sort_unstable();
+            sequences.dedup();
+        }
         Self { is_nack, sequences }
     }
 
     pub fn split(sequences: Vec<u32>, is_nack: bool, max_size: usize) -> Vec<Self> {
         let sequences = Self::new(sequences, is_nack).sequences;
 
-        let mut acks = Vec::new();
-        let mut current: Vec<u32> = Vec::new();
+        let mut boundaries = Vec::new();
+        let mut begin = 0;
         let mut size = HEADER_SIZE;
         let mut range_start = 0;
 
-        for seq in sequences {
-            let extends = current.last().is_some_and(|&last| seq == last + 1);
-            let growth = match (extends, current.last() == Some(&range_start)) {
+        for (index, &seq) in sequences.iter().enumerate() {
+            let extends = index > begin && seq == sequences[index - 1] + 1;
+            let growth = match (extends, index == range_start + 1) {
                 (false, _) => SINGLE_SIZE,
                 (true, true) => RANGE_SIZE - SINGLE_SIZE,
                 (true, false) => 0,
             };
-
-            if !current.is_empty() && (current.len() == MAX_ACK_ENTRIES || size + growth > max_size)
-            {
-                acks.push(Self {
-                    is_nack,
-                    sequences: take(&mut current),
-                });
-                size = HEADER_SIZE;
-            }
-
-            match current.is_empty() || !extends {
-                true => {
-                    range_start = seq;
-                    size += SINGLE_SIZE;
+            if index > begin && (index - begin == MAX_ACK_ENTRIES || size + growth > max_size) {
+                boundaries.push(index);
+                begin = index;
+                range_start = index;
+                size = HEADER_SIZE + SINGLE_SIZE;
+            } else {
+                if !extends {
+                    range_start = index;
                 }
-                false => size += growth,
+                size += growth;
             }
-            current.push(seq);
         }
 
-        if !current.is_empty() {
+        if sequences.is_empty() {
+            return Vec::new();
+        }
+        if boundaries.is_empty() {
+            return vec![Self { is_nack, sequences }];
+        }
+        boundaries.push(sequences.len());
+        let mut acks = Vec::with_capacity(boundaries.len());
+        let mut begin = 0;
+        for end in boundaries {
             acks.push(Self {
                 is_nack,
-                sequences: current,
+                sequences: sequences[begin..end].to_vec(),
             });
+            begin = end;
         }
         acks
     }
@@ -106,27 +110,24 @@ impl RakCodec for Ack {
             }
         };
 
-        // in worst case each sequence is written as a 4 byte single-value range
-        let mut buf: Vec<u8> = Vec::with_capacity(self.sequences.len() * 4);
-        let mut count: u16 = 0;
-
-        let mut start: u32 = first;
-        let mut end: u32 = start;
-        for &i in rest {
-            if i == end + 1 {
-                end = i
+        let count = 1 + self
+            .sequences
+            .windows(2)
+            .filter(|pair| pair[1] != pair[0] + 1)
+            .count();
+        writer.write_u16::<BigEndian>(count as u16)?;
+        let mut start = first;
+        let mut end = first;
+        for &sequence in rest {
+            if sequence == end + 1 {
+                end = sequence;
             } else {
-                Self::serialize_range(start, end, &mut buf)?;
-                count += 1;
-                start = i;
-                end = i;
+                Self::serialize_range(start, end, writer)?;
+                start = sequence;
+                end = sequence;
             }
         }
-        Self::serialize_range(start, end, &mut buf)?;
-        count += 1;
-
-        writer.write_u16::<BigEndian>(count)?;
-        writer.write_all(&buf)?;
+        Self::serialize_range(start, end, writer)?;
 
         Ok(())
     }
@@ -276,6 +277,30 @@ mod tests {
             ack.serialize(&mut buf).unwrap();
             assert!(buf.len() <= 100, "ACK of {} bytes", buf.len());
             assert_eq!(buf.len(), ack.size_hint());
+        }
+    }
+
+    #[test]
+    fn splitting_preserves_sorted_unique_sequences_at_size_and_entry_boundaries() {
+        for max_size in [7, 10, 18, 100, 1464] {
+            for is_nack in [false, true] {
+                let input: Vec<u32> = (0..MAX_ACK_ENTRIES as u32 + 17)
+                    .rev()
+                    .flat_map(|sequence| [sequence * 2, sequence * 2, sequence * 2 + 1])
+                    .collect();
+                let expected = Ack::new(input.clone(), is_nack).sequences;
+                let mut actual = Vec::new();
+                for ack in Ack::split(input, is_nack, max_size) {
+                    assert!(ack.sequences.len() <= MAX_ACK_ENTRIES);
+                    let bytes = ack.serialized().unwrap();
+                    assert!(bytes.len() <= max_size);
+                    assert_eq!(bytes.len(), ack.size_hint());
+                    let decoded = Ack::deserialize(&mut bytes.as_ref()).unwrap();
+                    assert_eq!(decoded, ack);
+                    actual.extend(ack.sequences);
+                }
+                assert_eq!(actual, expected);
+            }
         }
     }
 }
