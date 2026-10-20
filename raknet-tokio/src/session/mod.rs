@@ -5,7 +5,7 @@ mod command;
 mod driver;
 pub(crate) mod wire;
 
-use admission::{ActorAdmission, Admission};
+use admission::{ActorAdmission, Admission, ReceiveCredit};
 pub(crate) use admission::{SessionLifetime, SessionRetirement};
 use command::RakSessionMsg;
 use driver::Driver;
@@ -24,6 +24,12 @@ use tracing::debug;
 
 const SESSION_QUEUE_CAPACITY: usize = constants::MAX_RECEIVE_MESSAGES;
 
+/// Drops rejected or unread body storage before returning its queue credit.
+struct Received {
+    bytes: Box<[u8]>,
+    credit: ReceiveCredit,
+}
+
 pub(crate) enum SessionEvent {
     Io(RakSessionInput),
     Close(std::time::Instant),
@@ -40,7 +46,7 @@ pub(crate) enum SessionEvent {
 pub struct RakSession<S: SessionPhase> {
     msg_tx: Sender<RakSessionMsg>,
     admission: Arc<Admission>,
-    buf_rx: Receiver<Box<[u8]>>,
+    buf_rx: Receiver<Received>,
     terminal_rx: oneshot::Receiver<ClosedSession>,
     close_ack: Option<oneshot::Receiver<Result<(), RakSessionError>>>,
     addr: SocketAddr,
@@ -110,6 +116,7 @@ fn spawn<S: SessionPhase>(
     datagram_tx: Sender<wire::Datagram>,
     disconnect_tx: UnboundedSender<RakSessionId>,
 ) -> (RakSession<S>, Sender<SessionEvent>) {
+    let receive_maximum = usize::try_from(driver.config().max_queued_bytes).unwrap_or(0);
     let admission = Admission::new(
         driver.config().max_outbound_bytes,
         driver.config().close_timeout,
@@ -242,7 +249,17 @@ fn spawn<S: SessionPhase>(
                         if bytes.is_empty() || !application_open {
                             continue;
                         }
-                        if let Err(TrySendError::Full(_)) = buf_tx.try_send(bytes) {
+                        let full = match admission.try_receive(bytes.len(), receive_maximum) {
+                            Some(credit) => matches!(
+                                buf_tx.try_send(Received { bytes, credit }),
+                                Err(TrySendError::Full(_))
+                            ),
+                            None => {
+                                drop(bytes);
+                                true
+                            }
+                        };
+                        if full {
                             application_open = false;
                             debug!("closing session with {addr}, its packets are not being read");
                             let _ = driver.close(Instant::now().into_std(), true);
@@ -294,11 +311,13 @@ impl<S: SessionPhase> RakSession<S> {
     }
 
     /// Receives complete messages, retaining the prefix before terminal failure.
+    /// Queue byte credit ends at this pop, before conversion to caller-owned `T`.
     pub async fn recv<T>(&mut self) -> Result<T, RakSessionError>
     where
         Box<[u8]>: Into<T>,
     {
-        if let Some(bytes) = self.buf_rx.recv().await {
+        if let Some(Received { bytes, credit }) = self.buf_rx.recv().await {
+            drop(credit);
             return Ok(bytes.into());
         }
         if let Some(ack) = &mut self.close_ack {

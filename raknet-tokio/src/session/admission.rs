@@ -74,6 +74,7 @@ struct State {
     committed: usize,
     wire_bytes: usize,
     wire_messages: usize,
+    received_bytes: usize,
     close: Option<Close>,
 }
 
@@ -91,6 +92,12 @@ pub(super) struct SendCredit {
 
 /// Keeps the encoded datagram and original route charged through router send or drop.
 pub(super) struct WireCredit {
+    admission: Arc<Admission>,
+    bytes: usize,
+}
+
+/// Charges only the original final receive FIFO, until pop or disposal.
+pub(super) struct ReceiveCredit {
     admission: Arc<Admission>,
     bytes: usize,
 }
@@ -113,10 +120,30 @@ impl Admission {
                 committed: 0,
                 wire_bytes: 0,
                 wire_messages: 0,
+                received_bytes: 0,
                 close: None,
             }),
             changed: Notify::new(),
             retirement: OnceLock::new(),
+        })
+    }
+
+    /// Admits an aggregate prefix or one already-valid body alone, without waiting.
+    pub(super) fn try_receive(
+        self: &Arc<Self>,
+        bytes: usize,
+        maximum: usize,
+    ) -> Option<ReceiveCredit> {
+        let mut state = self.state.lock().expect("session admission mutex poisoned");
+        if state.received_bytes != 0
+            && (state.received_bytes > maximum || bytes > maximum - state.received_bytes)
+        {
+            return None;
+        }
+        state.received_bytes = state.received_bytes.checked_add(bytes)?;
+        Some(ReceiveCredit {
+            admission: Arc::clone(self),
+            bytes,
         })
     }
 
@@ -362,6 +389,20 @@ impl Drop for WireCredit {
                 .expect("each original datagram returns its message credit once");
         }
         self.admission.changed.notify_waiters();
+    }
+}
+
+impl Drop for ReceiveCredit {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("session admission mutex poisoned");
+        state.received_bytes = state
+            .received_bytes
+            .checked_sub(self.bytes)
+            .expect("each final received body returns its byte credit once");
     }
 }
 
