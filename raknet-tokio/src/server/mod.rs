@@ -2,24 +2,28 @@
 pub mod error;
 mod msg;
 mod phases;
+mod retention;
 pub use phases::{ConfiguredServer, RunningServer};
 
 use crate::server::error::RakServerError;
 use crate::server::msg::RakServerMsg;
-use crate::session::{RakSession, RestoredSession, SessionEvent, spawn_closing, spawn_established};
+use crate::session::{
+    RakSession, RestoredSession, SessionEvent, SessionRetirement, spawn_closing, spawn_established,
+};
 use crate::stop::StopState;
 use raknet::prelude::{
     Established, RakClock, RakServer as RakServerIntl, RakServerConfig, RakServerInput,
     RakServerOutput, RakSessionId, RakSessionInput, RakSessionSnapshot,
     RestoredSession as CoreRestoredSession, Sans, constants,
 };
+use retention::Route;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
+use tokio::sync::mpsc::{channel, unbounded_channel};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::debug;
 
@@ -95,7 +99,10 @@ impl RakServer<ConfiguredServer> {
             let mut msg_rx = msg_rx;
 
             async move {
-                let mut sessions: HashMap<RakSessionId, Sender<SessionEvent>> = HashMap::new();
+                let mut sessions: HashMap<RakSessionId, Route> = HashMap::new();
+                let mut retained = HashMap::new();
+                let retirement = Arc::new(SessionRetirement::default());
+                let mut max_connections = config.max_connections;
 
                 let mut buf = vec![0u8; config.max_mtu_size as usize].into_boxed_slice();
                 let mut server = RakServerIntl::new(
@@ -121,13 +128,22 @@ impl RakServer<ConfiguredServer> {
                 update_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
                 loop {
+                    if retirement.take() {
+                        retention::reap(
+                            &mut sessions,
+                            &mut retained,
+                            &mut server,
+                            max_connections,
+                            Instant::now().into_std(),
+                        );
+                    }
                     if stop_deadline.is_none()
                         && let Some(deadline) = stop.deadline()
                     {
                         msg_rx.close();
                         let now = Instant::now().into_std();
                         for session in sessions.values() {
-                            let _ = session.try_send(SessionEvent::Close(now));
+                            let _ = session.input.try_send(SessionEvent::Close(now));
                         }
                         stop_deadline = Some(deadline);
                     }
@@ -139,6 +155,7 @@ impl RakServer<ConfiguredServer> {
                     }
                     tokio::select! {
                         _ = stop.wait(), if stop_deadline.is_none() => continue,
+                        _ = retirement.wait() => continue,
                         _ = update_interval.tick() => {
                             let now = Instant::now().into_std();
 
@@ -147,6 +164,9 @@ impl RakServer<ConfiguredServer> {
                         Ok((len, addr)) = socket.recv_from(&mut buf) => {
                             let now = Instant::now().into_std();
 
+                            if retirement.take() {
+                                retention::reap(&mut sessions, &mut retained, &mut server, max_connections, now);
+                            }
                             match server.handle(RakServerInput::Datagram(buf[..len].into(), addr, now)) {
                                 Ok(_) => {},
                                 Err(e) => debug!("server failed to handle inbound datagram: {e}")
@@ -158,8 +178,8 @@ impl RakServer<ConfiguredServer> {
                         Some(id) = disconnect_rx.recv() => {
                             let now = Instant::now().into_std();
 
-                            let _ = server.handle(RakServerInput::RemoveSession(id, now));
-                            sessions.remove(&id);
+                            retention::retire(id, &mut sessions, &mut retained, &mut server, now);
+                            retention::reap(&mut sessions, &mut retained, &mut server, max_connections, now);
                         }
                         Some(msg) = msg_rx.recv() => {
                             match msg {
@@ -170,11 +190,16 @@ impl RakServer<ConfiguredServer> {
                                         address: socket.local_addr().ok(),
                                     });
                                 }
+                                #[cfg(test)]
+                                RakServerMsg::InspectRoutes(reply) => {
+                                    let _ = reply.send(sessions.len());
+                                }
                                 RakServerMsg::SetMessage(msg) => {
                                     let _ = server.handle(RakServerInput::SetMessage(msg));
                                 },
                                 RakServerMsg::SetMaxConnections(n) => {
-                                    let _ = server.handle(RakServerInput::SetMaxConnections(n));
+                                    max_connections = n;
+                                    retention::reap(&mut sessions, &mut retained, &mut server, max_connections, Instant::now().into_std());
                                 }
                                 RakServerMsg::Block(ip, duration) => {
                                     let _ = server.handle(RakServerInput::Block(ip, duration, Instant::now().into_std()));
@@ -183,6 +208,7 @@ impl RakServer<ConfiguredServer> {
                                     let _ = server.handle(RakServerInput::Unblock(ip));
                                 }
                                 RakServerMsg::Adopt(session, reply) => {
+                                    retention::reap(&mut sessions, &mut retained, &mut server, max_connections, Instant::now().into_std());
                                     let id = match session {
                                         CoreRestoredSession::Established(session) => server.adopt(session).map_err(|error| error.into_parts().1),
                                         CoreRestoredSession::Closing(session) => server.adopt(session).map_err(|error| error.into_parts().1),
@@ -211,10 +237,23 @@ impl RakServer<ConfiguredServer> {
 
                                     let input = RakSessionInput::Datagram(buf, now);
                                     if let Err(TrySendError::Full(_)) =
-                                        session.try_send(SessionEvent::Io(input))
+                                        session.input.try_send(SessionEvent::Io(input))
                                     {
                                         debug!("closing session {id:?}, its input queue is full");
-                                        sessions.remove(&id);
+                                        retention::retire(
+                                            id,
+                                            &mut sessions,
+                                            &mut retained,
+                                            &mut server,
+                                            now,
+                                        );
+                                        retention::reap(
+                                            &mut sessions,
+                                            &mut retained,
+                                            &mut server,
+                                            max_connections,
+                                            now,
+                                        );
                                     }
                                 } else {
                                     debug!("no session found with id {id:?}");
@@ -224,7 +263,13 @@ impl RakServer<ConfiguredServer> {
                                 let id = session.id();
                                 let (session, tx) =
                                     spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
-                                sessions.insert(id, tx);
+                                sessions.insert(
+                                    id,
+                                    Route {
+                                        input: tx,
+                                        lifetime: session.lifetime(&retirement),
+                                    },
+                                );
                                 if let Some(reply) = adoptions.remove(&id) {
                                     let _ = reply.send(Ok(RestoredSession::Closing(session)));
                                 }
@@ -243,11 +288,23 @@ impl RakServer<ConfiguredServer> {
                                 if stop_deadline.is_some() || stop.requested() {
                                     let _ =
                                         tx.try_send(SessionEvent::Close(Instant::now().into_std()));
-                                    sessions.insert(id, tx);
+                                    sessions.insert(
+                                        id,
+                                        Route {
+                                            input: tx,
+                                            lifetime: session.lifetime(&retirement),
+                                        },
+                                    );
                                     continue;
                                 }
 
-                                sessions.insert(id, tx);
+                                sessions.insert(
+                                    id,
+                                    Route {
+                                        input: tx,
+                                        lifetime: session.lifetime(&retirement),
+                                    },
+                                );
 
                                 if let Some(reply) = adoptions.remove(&id) {
                                     let _ = reply.send(Ok(RestoredSession::Established(session)));
@@ -277,6 +334,23 @@ impl RakServer<ConfiguredServer> {
 }
 
 impl RakServer<RunningServer> {
+    /// Reads the actual route map after earlier endpoint work without modifying it.
+    #[cfg(test)]
+    pub(crate) fn route_count_probe(&self) -> tokio::sync::oneshot::Receiver<usize> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let _ = self
+            .state
+            .msg_tx
+            .try_send(RakServerMsg::InspectRoutes(send));
+        receive
+    }
+
+    /// Reads the original accepted FIFO without taking or acknowledging a handle.
+    #[cfg(test)]
+    pub(crate) fn unaccepted_count(&self) -> usize {
+        self.state.session_rx.len()
+    }
+
     /// Reads only the original queue at this probe's FIFO position and the same bound socket.
     #[cfg(test)]
     pub(crate) fn command_queue_probe(

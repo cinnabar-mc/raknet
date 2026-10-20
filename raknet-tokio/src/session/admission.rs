@@ -1,7 +1,8 @@
-//! Admission metadata for the original bounded command FIFO and its first close.
+//! Original session admission, first close and metadata-only lifetime observation.
 
 use raknet::prelude::RakSessionError;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
@@ -11,6 +12,54 @@ pub(super) struct Admission {
     close_timeout: Duration,
     state: Mutex<State>,
     changed: Notify,
+    retirement: OnceLock<Arc<SessionRetirement>>,
+}
+
+/// A weak observation cannot keep the original handle, actor or queued body alive.
+pub(crate) struct SessionLifetime(Weak<Admission>);
+
+impl SessionLifetime {
+    /// Observes the actual actor guard even before its receiver finishes dropping.
+    pub(crate) fn actor_retired(&self) -> bool {
+        let Some(admission) = self.0.upgrade() else {
+            return true;
+        };
+        admission
+            .state
+            .lock()
+            .expect("session admission mutex poisoned")
+            .retired
+    }
+
+    /// Completion/drop of every original owner releases this exact admission lifetime.
+    pub(crate) fn released(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
+/// Coalesces only retirement/release notifications for one original server endpoint.
+#[derive(Default)]
+pub(crate) struct SessionRetirement {
+    changed: AtomicBool,
+    wake: Notify,
+}
+
+impl SessionRetirement {
+    /// Marks a finite ownership transition without adding another lifecycle queue.
+    fn notify(&self) {
+        self.changed.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// Tests the ownership changes before actual protocol admission.
+    pub(crate) fn take(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Waits outside the payload queues; notify_one retains a pre-registration wake.
+    pub(crate) async fn wait(&self) {
+        self.wake.notified().await;
+    }
 }
 
 struct State {
@@ -52,7 +101,25 @@ impl Admission {
                 close: None,
             }),
             changed: Notify::new(),
+            retirement: OnceLock::new(),
         })
+    }
+
+    /// Links a weak lifetime observation to the endpoint's single retirement wake.
+    pub(super) fn lifetime(
+        self: &Arc<Self>,
+        retirement: &Arc<SessionRetirement>,
+    ) -> SessionLifetime {
+        let retirement = self.retirement.get_or_init(|| Arc::clone(retirement));
+        let retired = self
+            .state
+            .lock()
+            .expect("session admission mutex poisoned")
+            .retired;
+        if retired {
+            retirement.notify();
+        }
+        SessionLifetime(Arc::downgrade(self))
     }
 
     /// Reserves actual body bytes while leaving uncommitted bodies caller-owned.
@@ -229,6 +296,17 @@ impl Drop for ActorAdmission {
             state.close.take()
         };
         self.0.changed.notify_waiters();
+        if let Some(retirement) = self.0.retirement.get() {
+            retirement.notify();
+        }
         drop(close);
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Some(retirement) = self.retirement.get() {
+            retirement.notify();
+        }
     }
 }

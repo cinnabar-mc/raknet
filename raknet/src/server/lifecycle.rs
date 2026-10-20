@@ -45,6 +45,7 @@ impl RakServer {
     }
 
     /// Consumes an already established or closing phase and assigns a local ID.
+    /// Capacity and duplicate-route refusals return the unchanged original owner.
     pub fn adopt<S: SessionPhase>(
         &mut self,
         session: RakSession<S>,
@@ -53,6 +54,18 @@ impl RakServer {
             return Err(ServerAdoptError {
                 session,
                 cause: crate::session::error::RakSessionError::Closed.into(),
+            });
+        }
+        if self.engine.session_map.len() >= self.engine.config.max_connections {
+            return Err(ServerAdoptError {
+                session,
+                cause: RakServerError::RefusingConnection("maximum connections reached".into()),
+            });
+        }
+        if self.engine.session_map.contains_key(&session.addr()) {
+            return Err(ServerAdoptError {
+                session,
+                cause: RakServerError::RefusingConnection("the remote route already exists".into()),
             });
         }
         let (engine, _) = session.into_engine();
