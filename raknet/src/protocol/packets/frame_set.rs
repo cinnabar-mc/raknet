@@ -67,7 +67,8 @@ impl RakCodec for FrameSet {
 
         let sequence = reader.read_u24::<LittleEndian>()?;
 
-        let mut frames = Vec::new();
+        // A bundled datagram commonly holds several small frames.
+        let mut frames = Vec::with_capacity(16);
         loop {
             match Frame::deserialize(reader) {
                 Ok(frame) => frames.push(frame),
