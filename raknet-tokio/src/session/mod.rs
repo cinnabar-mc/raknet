@@ -246,6 +246,17 @@ fn spawn<S: SessionPhase>(
                             debug!("closing session with {addr}, its packets are not being read");
                             let _ = driver.close(Instant::now().into_std(), true);
                         }
+                        #[cfg(test)]
+                        {
+                            let state = driver.state();
+                            if let Some(gate) = &mut driver.receive_gate {
+                                gate.after_attempt(
+                                    buf_tx.max_capacity() - buf_tx.capacity(),
+                                    state,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     RakSessionOutput::Disconnected(..) => {
                         let _ = disconnect_tx.send(id);

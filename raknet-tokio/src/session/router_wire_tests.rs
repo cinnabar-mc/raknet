@@ -574,3 +574,219 @@ async fn dropping_public_session_owners_forwards_the_original_peer_disconnect() 
         missing.join("; ")
     );
 }
+
+/// Holds only this actor after one completed final delivery attempt and its original failure path.
+pub(super) struct ReceiveGate {
+    remaining: usize,
+    entered: Option<oneshot::Sender<(usize, RakSessionState)>>,
+    release: Option<oneshot::Receiver<()>>,
+}
+
+impl ReceiveGate {
+    /// Observes no payload; the original try_send result and failed body have already been disposed.
+    pub(super) async fn after_attempt(&mut self, queued: usize, state: RakSessionState) {
+        if self.entered.is_none() {
+            return;
+        }
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            let _ = self.entered.take().unwrap().send((queued, state));
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+        }
+    }
+}
+
+/// Gives every legal short message a distinct identity through the full canonical receive count.
+fn count_body(sequence: usize) -> Box<[u8]> {
+    let mut bytes = vec![0x41; BODY_BYTES];
+    bytes[0] = 0xfe;
+    bytes[1..5].copy_from_slice(&u32::try_from(sequence).unwrap().to_le_bytes());
+    bytes.into_boxed_slice()
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn final_receive_refusal_cannot_admit_a_successor_after_a_freed_prefix_slot() {
+    let now = Instant::now().into_std();
+    let (local, peer) = crate::test_support::negotiated_pair(
+        "127.0.0.1:54321".parse().unwrap(),
+        "127.0.0.1:19132".parse().unwrap(),
+        now,
+        now,
+        Default::default(),
+    );
+    let (healthy_local, healthy_peer) = crate::test_support::negotiated_pair(
+        "127.0.0.1:54322".parse().unwrap(),
+        "127.0.0.1:19133".parse().unwrap(),
+        now,
+        now,
+        Default::default(),
+    );
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let mut release = Some(release);
+    let address = local.addr();
+    let id = local.id();
+    let limit = local.max_message_len();
+    let mtu = local.mtu();
+    let mut driver = Driver::established(local);
+    driver.receive_gate = Some(ReceiveGate {
+        remaining: constants::MAX_RECEIVE_MESSAGES + 1,
+        entered: Some(entered),
+        release: Some(release_rx),
+    });
+    let (datagram_tx, datagrams) = wire::datagrams();
+    let (disconnect_tx, disconnected) = unbounded_channel();
+    let (mut session, input) = spawn(driver, address, id, limit, mtu, datagram_tx, disconnect_tx);
+    let actor = session.actor.take();
+    let mut original = Original {
+        session: Some(session),
+        actor,
+        input,
+        datagrams,
+        disconnected,
+        peer: Some(peer),
+        address,
+        id,
+        received: Vec::new(),
+    };
+    let mut healthy = Original::new(healthy_local, healthy_peer);
+    let cutoff = Instant::now() + constants::CLOSE_TIMEOUT + constants::CLOSE_TIMEOUT;
+    let observed = tokio::time::timeout_at(cutoff, async {
+        let before = b"\xfehealthy neighbor before held final receive";
+        let before_echo = healthy.echo(before, cutoff).await?;
+        for sequence in 0..constants::MAX_RECEIVE_MESSAGES {
+            original
+                .peer
+                .as_mut()
+                .unwrap()
+                .send(
+                    count_body(sequence),
+                    RakReliability::ReliableOrdered,
+                    RakPriority::Normal,
+                    Instant::now().into_std(),
+                )
+                .map_err(|error| format!("original prefix send: {error}"))?;
+        }
+        original
+            .peer
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now().into_std())
+            .map_err(|error| format!("original prefix flush: {error}"))?;
+        while let Some(output) = original.peer.as_mut().unwrap().poll() {
+            if let RakSessionOutput::Datagram(bytes, _) = output {
+                original
+                    .input
+                    .send(SessionEvent::Io(RakSessionInput::Datagram(
+                        bytes,
+                        Instant::now().into_std(),
+                    )))
+                    .await
+                    .map_err(|error| format!("original prefix route: {error}"))?;
+            }
+        }
+        // Real acknowledgements advance the original reliable window without reading the final FIFO.
+        while original.peer.as_ref().unwrap().outbound_bytes() != 0 {
+            let frame = original
+                .datagrams
+                .recv()
+                .await
+                .ok_or_else(|| "original prefix acknowledgement route closed".to_owned())?;
+            original.forward(frame, false, false)?;
+        }
+        let peer = original.peer.as_mut().unwrap();
+        for sequence in constants::MAX_RECEIVE_MESSAGES..constants::MAX_RECEIVE_MESSAGES + 2 {
+            peer.send(
+                count_body(sequence),
+                RakReliability::ReliableOrdered,
+                RakPriority::Normal,
+                Instant::now().into_std(),
+            )
+            .map_err(|error| format!("original coalesced send: {error}"))?;
+        }
+        peer.tick(Instant::now().into_std())
+            .map_err(|error| format!("original coalesced flush: {error}"))?;
+        let mut pair = None;
+        while let Some(output) = peer.poll() {
+            if let RakSessionOutput::Datagram(bytes, _) = output
+                && pair.replace(bytes).is_some()
+            {
+                return Err("the original two-message tail used more than one datagram".to_owned());
+            }
+        }
+        original
+            .input
+            .send(SessionEvent::Io(RakSessionInput::Datagram(
+                pair.ok_or_else(|| "the original two-message datagram was not emitted".to_owned())?,
+                Instant::now().into_std(),
+            )))
+            .await
+            .map_err(|error| format!("original coalesced route: {error}"))?;
+        let full = entered_rx
+            .await
+            .map_err(|_| "the original final delivery gate was not reached".to_owned())?;
+        let first = original
+            .session
+            .as_mut()
+            .unwrap()
+            .recv::<Box<[u8]>>()
+            .await
+            .map_err(|error| format!("original accepted front: {error}"))?;
+        let during = b"\xfehealthy neighbor while original final receive stays gated";
+        let during_echo = healthy.echo(during, cutoff).await?;
+        release
+            .take()
+            .unwrap()
+            .send(())
+            .map_err(|_| "the original receive gate disappeared before release".to_owned())?;
+        let mut delivered = vec![first];
+        while let Ok(bytes) = original.session.as_mut().unwrap().recv::<Box<[u8]>>().await {
+            delivered.push(bytes);
+        }
+        Ok::<_, String>((full, delivered, before_echo, during_echo, before, during))
+    })
+    .await;
+    if let Some(release) = release {
+        let _ = release.send(());
+    }
+    let original_cleanup = original.finish().await;
+    let healthy_cleanup = healthy.finish().await;
+    drop(original);
+    drop(healthy);
+    assert!(
+        original_cleanup.is_ok(),
+        "original cleanup: {original_cleanup:?}"
+    );
+    assert!(
+        healthy_cleanup.is_ok(),
+        "healthy cleanup: {healthy_cleanup:?}"
+    );
+    let ((queued, state), delivered, before_echo, during_echo, before, during) = observed
+        .expect("the bounded original delivery observation must complete")
+        .expect("the actual peer, gate and healthy neighbor must progress");
+    assert_eq!(queued, constants::MAX_RECEIVE_MESSAGES);
+    assert_eq!(state, RakSessionState::Disconnected);
+    assert_eq!(before_echo.0.as_ref(), before);
+    assert_eq!(before_echo.1.as_ref(), before);
+    assert_eq!(during_echo.0.as_ref(), during);
+    assert_eq!(during_echo.1.as_ref(), during);
+    assert!(delivered.len() >= constants::MAX_RECEIVE_MESSAGES);
+    for (sequence, bytes) in delivered[..constants::MAX_RECEIVE_MESSAGES]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            bytes,
+            &count_body(sequence),
+            "the original accepted prefix changed"
+        );
+    }
+    assert!(!delivered.contains(&count_body(constants::MAX_RECEIVE_MESSAGES)));
+    assert_eq!(
+        delivered.len(),
+        constants::MAX_RECEIVE_MESSAGES,
+        "final delivery resumed after its refused front when an old prefix slot was freed"
+    );
+}
