@@ -1,5 +1,71 @@
 use super::*;
 
+std::thread_local! {
+    static SCHEDULER_FRAME_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts scheduler head checks and metadata frame visits without timing.
+pub(super) fn record_scheduler_frame_visit() {
+    SCHEDULER_FRAME_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+#[test]
+fn an_ordering_window_stall_does_not_rescan_the_growing_send_backlog() {
+    let now = domain_time();
+    for count in [256, 512, 1024, 2048] {
+        let mut sender = session(0, 1);
+        send(&mut sender, 1, now).unwrap();
+        let withheld = sequences_of(&drain_outputs(&mut sender));
+        assert_eq!(withheld.len(), 1);
+        // ACK later datagrams while retaining the original gap and available bandwidth.
+        for _ in 1..ORDER_WINDOW {
+            send(&mut sender, 1, now).unwrap();
+            let sequences = sequences_of(&drain_outputs(&mut sender));
+            assert_eq!(sequences.len(), 1);
+            assert_ne!(sequences, withheld);
+            sender
+                .handle(SessionInput::Datagram(
+                    Ack::new(sequences, false).serialized().unwrap(),
+                    now,
+                ))
+                .unwrap();
+        }
+        send(&mut sender, 1, now).unwrap();
+        assert!(drain_outputs(&mut sender).is_empty());
+        let queue = RakPriority::Normal as usize;
+        let head = sender.outbound_queue[queue].front().unwrap();
+        let bandwidth = sender.congestion_controller.transmission_bandwidth();
+        assert!(head.size_hint() <= bandwidth);
+        assert!(!within_ordered_window(
+            head,
+            &sender.outbound_window.unwrap().ordered
+        ));
+        let retained = sender.outbound_bytes();
+        SCHEDULER_FRAME_VISITS.set(0);
+        for _ in 0..count {
+            send(&mut sender, 1, now).unwrap();
+        }
+        assert!(drain_outputs(&mut sender).is_empty());
+        assert_eq!(sender.outbound_queue[queue].len(), count + 1);
+        assert!(sender.outbound_bytes() > retained);
+        assert!(
+            SCHEDULER_FRAME_VISITS.get() <= 4 * count,
+            "metadata visits {} exceeded the linear burst budget for {count} sends",
+            SCHEDULER_FRAME_VISITS.get()
+        );
+        sender
+            .handle(SessionInput::Datagram(
+                Ack::new(withheld, false).serialized().unwrap(),
+                now,
+            ))
+            .unwrap();
+        assert!(
+            !drain_outputs(&mut sender).is_empty(),
+            "the original ACK must release progress"
+        );
+    }
+}
+
 /// Uses one explicit domain clock for session construction and protocol events.
 fn domain_time() -> Instant {
     crate::clock::test_now() + Duration::from_secs(1000)
