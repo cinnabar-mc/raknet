@@ -10,6 +10,8 @@ pub(super) enum Phase {
 
 pub(super) struct Driver {
     phase: Option<Phase>,
+    #[cfg(test)]
+    pub(super) receive_gate: Option<super::router_wire_tests::ReceiveGate>,
 }
 
 impl Driver {
@@ -17,12 +19,16 @@ impl Driver {
     pub(super) fn established(session: RakSession<Established>) -> Self {
         Self {
             phase: Some(Phase::Established(session)),
+            #[cfg(test)]
+            receive_gate: None,
         }
     }
     /// Takes a restored locally closing session without reopening it.
     pub(super) fn closing(session: RakSession<Closing>) -> Self {
         Self {
             phase: Some(Phase::Closing(session)),
+            #[cfg(test)]
+            receive_gate: None,
         }
     }
     /// Borrows the same validated session policy before starting the actor.
