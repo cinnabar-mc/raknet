@@ -1060,9 +1060,12 @@ fn receive_gap_deadline_and_reliable_splits_survive_snapshot_transfer() {
             ordered_payload(1, &[0xfe])
         };
         receiver.handle(datagram_at(0, vec![frame], start)).unwrap();
+        receiver
+            .handle(datagram_at(1, unreliable(0), start + SESSION_TIMEOUT / 4))
+            .unwrap();
         let capture = start + SESSION_TIMEOUT / 2;
         receiver
-            .handle(datagram_at(1, unreliable(0), capture))
+            .handle(datagram_at(2, unreliable(0), capture))
             .unwrap();
         drain_outputs(&mut receiver);
         let json = facet_json::to_string(&receiver.snapshot(capture)).unwrap();
@@ -1073,6 +1076,9 @@ fn receive_gap_deadline_and_reliable_splits_survive_snapshot_transfer() {
             SESSION_TIMEOUT / 2 + Duration::from_millis(1),
         )
         .unwrap();
+        receiver
+            .handle(datagram_at(3, unreliable(0), destination))
+            .unwrap();
         receiver.handle(SessionInput::Update(destination)).unwrap();
         assert_eq!(
             disconnect_reason(&receiver),
@@ -1152,26 +1158,35 @@ fn datagram_at(sequence: u32, frames: Vec<Frame>, now: Instant) -> SessionInput 
 }
 
 #[test]
-fn partial_split_without_a_fragment_for_the_session_timeout_is_evicted() {
+fn unreliable_partial_split_expires_without_ending_an_active_session() {
     let mut session = session(0, 1);
     let start = domain_time();
 
     session
         .handle(datagram_at(0, vec![fragment(1, 2, 0, &[0xFE, 1])], start))
         .unwrap();
+    for (sequence, seconds) in [(1, 4), (2, 8)] {
+        session
+            .handle(datagram_at(
+                sequence,
+                unreliable(0),
+                start + Duration::from_secs(seconds),
+            ))
+            .unwrap();
+    }
+    let expiry = start + Duration::from_secs(10);
     session
-        .handle(datagram_at(1, unreliable(0), start + SESSION_TIMEOUT / 2))
+        .handle(SessionInput::Update(expiry - Duration::from_millis(1)))
         .unwrap();
+    assert_eq!(session.inbound_spl_queue[&1].len(), 1);
     session
-        .handle(SessionInput::Update(
-            start + SESSION_TIMEOUT + Duration::from_millis(1),
-        ))
+        .handle(SessionInput::Update(expiry + Duration::from_millis(1)))
         .unwrap();
 
     assert_eq!(session.state, RakSessionState::Connected);
     assert!(
         session.inbound_spl_queue.is_empty(),
-        "a split idle for the session timeout must be evicted"
+        "an unreliable split idle for ten seconds must be evicted"
     );
     assert_eq!(session.inbound_spl_bytes, 0);
 }
@@ -2161,22 +2176,60 @@ fn close_retries_notification_until_acked() {
     );
 }
 
-/// Silence has a fixed ten-second cutoff, renewed by admitted traffic.
+/// Silence uses the actual RTT allowance, then retains its first close drain and cause.
 #[test]
-fn peer_timeout_is_ten_seconds_after_last_input() {
-    let mut receiver = session(0, 1);
-    let start = domain_time();
-    receiver
-        .handle(SessionInput::Update(start + Duration::from_millis(9999)))
-        .unwrap();
-    assert_eq!(receiver.state, RakSessionState::Connected);
-    receiver
-        .handle(SessionInput::Update(start + Duration::from_secs(10)))
-        .unwrap();
-    assert_eq!(
-        disconnect_reason(&receiver),
-        Some(RakDisconnectReason::Timeout)
-    );
+fn peer_silence_admits_one_adaptive_close_drain() {
+    for sample in [None, Some(Duration::ZERO), Some(Duration::from_secs(3))] {
+        let mut receiver = session(0, 1);
+        let start = domain_time();
+        let last_input = if let Some(roundtrip) = sample {
+            receiver
+                .handle(SessionInput::Send(
+                    Box::from([0xfe, 1]),
+                    RakReliability::Reliable,
+                    RakPriority::Immediate,
+                    start,
+                ))
+                .unwrap();
+            let sent = drain_outputs(&mut receiver);
+            let observed = start + roundtrip;
+            receiver
+                .handle(SessionInput::Datagram(
+                    Ack::new(sequences_of(&sent), false).serialized().unwrap(),
+                    observed,
+                ))
+                .unwrap();
+            assert_eq!(receiver.rtt(), roundtrip);
+            assert_eq!(receiver.outbound_bytes(), 0);
+            observed
+        } else {
+            start
+        };
+        let began =
+            last_input + Duration::from_secs(5) + sample.unwrap_or(Duration::from_millis(50)) * 2;
+        receiver
+            .handle(SessionInput::Update(began - Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(receiver.state, RakSessionState::Connected);
+        receiver.handle(SessionInput::Update(began)).unwrap();
+        assert_eq!(receiver.state, RakSessionState::Closing);
+        assert_eq!(disconnect_reason_of(&drain_outputs(&mut receiver)), None);
+        receiver
+            .handle(SessionInput::Disconnect(began + Duration::from_secs(1)))
+            .unwrap();
+        let cutoff = began + receiver.config.close_timeout;
+        receiver
+            .handle(SessionInput::Update(cutoff - Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(receiver.state, RakSessionState::Closing);
+        assert_eq!(disconnect_reason_of(&drain_outputs(&mut receiver)), None);
+        receiver.handle(SessionInput::Update(cutoff)).unwrap();
+        assert_eq!(receiver.state, RakSessionState::Disconnected);
+        assert_eq!(
+            disconnect_reason_of(&drain_outputs(&mut receiver)),
+            Some(RakDisconnectReason::Timeout),
+        );
+    }
 }
 
 /// Validation discards the whole datagram and preserves each endpoint's error policy.
@@ -2300,20 +2353,22 @@ fn acknowledged_reliable_split_survives_cleanup_and_delivers_once() {
             assert!(!delayed.is_empty());
             let retained = receiver.inbound_spl_bytes;
             assert!(retained > 0);
-            let keepalive = start + SESSION_TIMEOUT / 2;
-            receiver
-                .handle(SessionInput::Datagram(
-                    Ack::new(vec![], false).serialized().unwrap(),
-                    keepalive,
-                ))
-                .unwrap();
+            let keepalive = start + SESSION_TIMEOUT * 3 / 4;
+            for part in 1..=3 {
+                receiver
+                    .handle(SessionInput::Datagram(
+                        Ack::new(vec![], false).serialized().unwrap(),
+                        start + SESSION_TIMEOUT * part / 4,
+                    ))
+                    .unwrap();
+            }
             let now = if transfer {
                 let snapshot = receiver.snapshot(keepalive);
                 let destination = start + Duration::from_secs(3600);
                 receiver = SessionEngine::restore(
                     snapshot,
                     destination,
-                    SESSION_TIMEOUT / 2 + Duration::from_millis(1),
+                    SESSION_TIMEOUT / 4 + Duration::from_millis(1),
                 )
                 .unwrap();
                 destination
@@ -2431,3 +2486,5 @@ fn acknowledged_ordered_tail_survives_malformed_control() {
         }
     }
 }
+
+mod progress_witness;

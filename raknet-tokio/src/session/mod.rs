@@ -172,6 +172,12 @@ fn spawn<S: SessionPhase>(
                         pending = None;
                         let _ = driver.close(Instant::now().into_std(), true);
                     }
+                    #[cfg(test)]
+                    if result.is_ok() && driver.state() == RakSessionState::Closing
+                        && let Some(gate) = &mut driver.wait_gate
+                    {
+                        gate.admitted = true;
+                    }
                 }
                 // Try admitting the terminal wire prefix above first. A genuinely
                 // blocked route cannot withhold its already-produced local terminal.
@@ -244,7 +250,16 @@ fn spawn<S: SessionPhase>(
             {
                 match output {
                     RakSessionOutput::Wait(after) => {
-                        let deadline = Instant::now() + after;
+                        #[cfg(test)]
+                        if let Some(gate) = &mut driver.wait_gate {
+                            gate.before_wait(after).await;
+                        }
+                        let now = Instant::now();
+                        let deadline = now + after;
+                        // Delayed relative output cannot postpone the core's original cutoff.
+                        let deadline = driver
+                            .expiry_deadline(now.into_std())
+                            .map_or(deadline, |expiry| deadline.min(Instant::from_std(expiry)));
                         timer
                             .as_mut()
                             .reset(expiry.map_or(deadline, |expiry| expiry.min(deadline)));
@@ -500,3 +515,6 @@ mod router_wire_tests;
 
 #[cfg(test)]
 pub(crate) mod physical_send_tests;
+
+#[cfg(test)]
+mod wait_cutoff_tests;

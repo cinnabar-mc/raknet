@@ -13,8 +13,10 @@ use crate::protocol::types::frame::Frame;
 use crate::util::u24;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::debug;
+
+const UNRELIABLE_SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum ReliableArrival {
     New,
@@ -481,5 +483,5 @@ impl SessionEngine {
 
 /// Missing fragment timing is already stale; present timing uses the original cutoff.
 fn split_deadline(last: Option<&Instant>, now: Instant) -> Instant {
-    last.map_or(now, |&at| at + SESSION_TIMEOUT)
+    last.map_or(now, |&at| at + UNRELIABLE_SPLIT_TIMEOUT)
 }

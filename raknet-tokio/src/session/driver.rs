@@ -12,6 +12,8 @@ pub(super) struct Driver {
     phase: Option<Phase>,
     #[cfg(test)]
     pub(super) receive_gate: Option<super::router_wire_tests::ReceiveGate>,
+    #[cfg(test)]
+    pub(super) wait_gate: Option<super::wait_cutoff_tests::WaitGate>,
 }
 
 impl Driver {
@@ -21,6 +23,8 @@ impl Driver {
             phase: Some(Phase::Established(session)),
             #[cfg(test)]
             receive_gate: None,
+            #[cfg(test)]
+            wait_gate: None,
         }
     }
     /// Takes a restored locally closing session without reopening it.
@@ -29,6 +33,8 @@ impl Driver {
             phase: Some(Phase::Closing(session)),
             #[cfg(test)]
             receive_gate: None,
+            #[cfg(test)]
+            wait_gate: None,
         }
     }
     /// Borrows the same validated session policy before starting the actor.

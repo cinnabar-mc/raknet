@@ -135,6 +135,11 @@ impl RakCongestionController {
         }
     }
 
+    /// Distinguishes an observed zero round trip from the absence of any sample.
+    pub(super) fn has_rtt_sample(&self) -> bool {
+        !self.rtt_estimate_ms.is_infinite()
+    }
+
     pub fn slow_start(&self) -> bool {
         self.congestion_window <= self.slow_start_threshold || self.slow_start_threshold == 0.0
     }

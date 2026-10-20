@@ -93,6 +93,16 @@ receipt. `session.close()` synchronously consumes send permission and returns a
 running until terminal completion; `client.stop().await` or `server.stop().await`
 consumes that running owner and awaits its shutdown.
 
+Peer silence starts graceful close after five seconds plus twice the measured
+round trip, using 50ms before the first measurement. The first close retains its
+configured drain interval (five seconds by default) and retries its final notice
+until acknowledged or that interval ends. Deferred reliable delivery and receive
+ordering gaps retain their fifteen-second progress window; expiry fails the
+session rather than silently discarding acknowledged bytes. Accepted reliable
+fragments remain within the original byte and fragment limits until delivery or
+session retirement. Unreliable reassembly slots can be reclaimed after ten
+seconds without a new fragment.
+
 ## Drive the core yourself
 
 Started core drivers implement `Sans`: feed typed I/O with `handle`, then drain
