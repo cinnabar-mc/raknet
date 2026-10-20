@@ -34,9 +34,7 @@ impl SessionEngine {
         let mut freed = 0;
         let mut stale = false;
         self.inbound_spl_queue.retain(|split_id, fragments| {
-            let fresh = last
-                .get(split_id)
-                .is_some_and(|&at| now < at + SESSION_TIMEOUT);
+            let fresh = now < split_deadline(last.get(split_id), now);
             if !fresh {
                 freed += fragments.values().map(frame_cost).sum::<usize>();
                 stale |= fragments
@@ -132,11 +130,32 @@ impl SessionEngine {
         };
     }
 
+    /// Observes only a gap whose original delivery progress has not advanced.
+    fn stall_deadline(&self) -> Option<Instant> {
+        self.inbound_stall
+            .filter(|(_, progress)| *progress == self.inbound_progress)
+            .map(|(since, _)| since + SESSION_TIMEOUT)
+    }
+
+    /// Reports the same reliable-input expirations without evicting retained data.
+    pub(super) fn receive_deadline(&self, now: Instant) -> Option<Instant> {
+        self.inbound_spl_queue
+            .iter()
+            .filter(|(_, fragments)| {
+                fragments
+                    .values()
+                    .any(|frame| frame.reliability.is_reliable())
+            })
+            .map(|(id, _)| split_deadline(self.inbound_spl_last.get(id), now))
+            .chain(self.stall_deadline())
+            .min()
+    }
+
     /// Reports a gap with no delivery progress for the session timeout.
     pub(super) fn inbound_stalled(&mut self, now: Instant) -> bool {
         self.refresh_stall(now);
-        self.inbound_stall
-            .is_some_and(|(since, _)| now >= since + SESSION_TIMEOUT)
+        self.stall_deadline()
+            .is_some_and(|deadline| now >= deadline)
     }
 
     /// Admits buffering before committing reliable duplicate-detection state.
@@ -458,4 +477,9 @@ impl SessionEngine {
         self.inbound_spl_queue.len() >= MAX_CONCURRENT_SPLITS
             && !self.inbound_spl_queue.contains_key(&split_id)
     }
+}
+
+/// Missing fragment timing is already stale; present timing uses the original cutoff.
+fn split_deadline(last: Option<&Instant>, now: Instant) -> Instant {
+    last.map_or(now, |&at| at + SESSION_TIMEOUT)
 }

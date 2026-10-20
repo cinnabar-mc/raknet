@@ -12,12 +12,12 @@ async fn weak_lifetime_remains_through_closing_and_releases_only_after_finish() 
         now,
         Default::default(),
     );
-    let (datagram_tx, _datagram_rx) = unbounded_channel();
+    let (datagram_tx, datagram_rx) = wire::datagrams();
     let (disconnect_tx, _disconnect_rx) = unbounded_channel();
     let (mut session, input) = spawn_established(local, datagram_tx, disconnect_tx);
     let mut actor = session.actor.take().expect("the original actor is owned");
     let retirement = Arc::new(SessionRetirement::default());
-    let lifetime = session.lifetime(&retirement);
+    let lifetime = session.lifetime(Some(&retirement));
     let mut closing = match session.close() {
         Ok(closing) => closing,
         Err(error) => error.into_parts().0,
@@ -47,6 +47,7 @@ async fn weak_lifetime_remains_through_closing_and_releases_only_after_finish() 
         .expect("the original actor joined normally");
     assert!(matches!(terminal, Err(RakSessionError::Closed)));
     assert!(retired && held && finished);
+    drop(datagram_rx);
     assert!(
         lifetime.released(),
         "weak metadata cannot retain a finished original lifetime"

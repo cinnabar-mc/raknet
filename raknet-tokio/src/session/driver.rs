@@ -95,6 +95,13 @@ impl Driver {
             None => RakSessionState::Disconnected,
         }
     }
+    /// Observes the same core's finite terminal deadlines under wire backpressure.
+    pub(super) fn expiry_deadline(&self, now: Instant) -> Option<Instant> {
+        match self.phase.as_ref()? {
+            Phase::Established(session) => session.expiry_deadline(now),
+            Phase::Closing(session) => session.expiry_deadline(now),
+        }
+    }
     /// Captures the actor's actual saved phase.
     pub(super) fn snapshot(
         &self,

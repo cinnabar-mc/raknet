@@ -6,7 +6,10 @@ pub use phases::{ConfiguredClient, RunningClient};
 
 use crate::client::msg::RakClientMsg;
 use crate::prelude::{RakServerError, RakSession};
-use crate::session::{RestoredSession, SessionEvent, spawn_closing, spawn_established};
+use crate::session::wire;
+use crate::session::{
+    RestoredSession, SessionEvent, SessionLifetime, spawn_closing, spawn_established,
+};
 use crate::stop::StopState;
 use driver::Driver;
 use raknet::prelude::{
@@ -209,6 +212,7 @@ impl RakClient<ConfiguredClient> {
 
             async move {
                 let mut session_tx: Option<Sender<SessionEvent>> = None;
+                let mut session_route: Option<(RakSessionId, SessionLifetime)> = None;
                 let mut pings: HashMap<SocketAddr, Vec<PendingPing>> = HashMap::new();
                 let mut connect: Option<
                     oneshot::Sender<Result<RakSession<Established>, RakClientError>>,
@@ -222,7 +226,7 @@ impl RakClient<ConfiguredClient> {
                 let mut adopting: Option<oneshot::Sender<Result<RestoredSession, RakClientError>>> =
                     None;
 
-                let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
+                let (dgram_tx, mut dgram_rx) = wire::datagrams();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
                 let timer = sleep(Duration::ZERO);
@@ -255,12 +259,18 @@ impl RakClient<ConfiguredClient> {
                             let result = client.handle(RakClientInput::Datagram(datagram, addr, now));
                             fail_pending_connect(&mut client, &mut connect, result);
                         }
-                        Some((buf, addr)) = dgram_rx.recv() => {
-                            let _ = sockets.send_to(buf.as_ref(), addr).await;
+                        Some(datagram) = dgram_rx.recv() => {
+                            if session_route.as_ref().is_some_and(|(id, lifetime)|
+                                *id == datagram.id() && datagram.belongs_to(lifetime))
+                            {
+                                let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
+                            }
                         }
-                        Some(_) = disconnect_rx.recv() => {
-                            session_tx = None;
-                            client.reset();
+                        Some(id) = disconnect_rx.recv() => {
+                            if session_route.as_ref().is_some_and(|(current, _)| *current == id) {
+                                session_tx = None;
+                                client.reset();
+                            }
                         }
                         Some(msg) = msg_rx.recv() => {
                             let now = Instant::now().into_std();
@@ -301,7 +311,10 @@ impl RakClient<ConfiguredClient> {
                                             client.connect(addr, local, guid, now)
                                         });
                                     match result {
-                                        Ok(()) => connect = Some(sender),
+                                        Ok(()) => {
+                                            session_route = None;
+                                            connect = Some(sender);
+                                        }
                                         Err(e) => {
                                             let _ = sender.send(Err(e));
                                         }
@@ -317,7 +330,10 @@ impl RakClient<ConfiguredClient> {
                                         }
                                     };
                                     match result {
-                                        Ok(()) => adopting = Some(reply),
+                                        Ok(()) => {
+                                            session_route = None;
+                                            adopting = Some(reply);
+                                        }
                                         Err(error) => { let _ = reply.send(Err(error)); }
                                     }
                                 }
@@ -372,11 +388,13 @@ impl RakClient<ConfiguredClient> {
                             RakClientOutput::SessionConnected(session) => {
                                 debug!("session connected");
 
+                                let id = session.id();
                                 let (session, tx) = spawn_established(
                                     session,
                                     dgram_tx.clone(),
                                     disconnect_tx.clone(),
                                 );
+                                session_route = Some((id, session.lifetime(None)));
 
                                 if stop_deadline.is_some() || stop.requested() {
                                     let _ =
@@ -394,8 +412,10 @@ impl RakClient<ConfiguredClient> {
                                 }
                             }
                             RakClientOutput::SessionClosing(session) => {
+                                let id = session.id();
                                 let (session, tx) =
                                     spawn_closing(session, dgram_tx.clone(), disconnect_tx.clone());
+                                session_route = Some((id, session.lifetime(None)));
                                 session_tx = Some(tx);
                                 if let Some(reply) = adopting.take() {
                                     let _ = reply.send(Ok(RestoredSession::Closing(session)));
@@ -429,8 +449,12 @@ impl RakClient<ConfiguredClient> {
                     }
                 }
 
-                while let Ok((buf, addr)) = dgram_rx.try_recv() {
-                    let _ = sockets.send_to(buf.as_ref(), addr).await;
+                while let Ok(datagram) = dgram_rx.try_recv() {
+                    if session_route.as_ref().is_some_and(|(id, lifetime)| {
+                        *id == datagram.id() && datagram.belongs_to(lifetime)
+                    }) {
+                        let _ = sockets.send_to(datagram.bytes(), datagram.peer()).await;
+                    }
                 }
             }
         });

@@ -1,6 +1,6 @@
 //! Original session admission, first close and metadata-only lifetime observation.
 
-use raknet::prelude::RakSessionError;
+use raknet::prelude::{RakSessionError, constants};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -19,6 +19,11 @@ pub(super) struct Admission {
 pub(crate) struct SessionLifetime(Weak<Admission>);
 
 impl SessionLifetime {
+    /// Compares the original allocation without extending either route's lifetime.
+    pub(super) fn matches(&self, admission: &Arc<Admission>) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(admission))
+    }
+
     /// Observes the actual actor guard even before its receiver finishes dropping.
     pub(crate) fn actor_retired(&self) -> bool {
         let Some(admission) = self.0.upgrade() else {
@@ -67,6 +72,8 @@ struct State {
     retired: bool,
     bytes: usize,
     committed: usize,
+    wire_bytes: usize,
+    wire_messages: usize,
     close: Option<Close>,
 }
 
@@ -80,6 +87,12 @@ pub(super) struct SendCredit {
     admission: Arc<Admission>,
     bytes: usize,
     committed: bool,
+}
+
+/// Keeps the encoded datagram and original route charged through router send or drop.
+pub(super) struct WireCredit {
+    admission: Arc<Admission>,
+    bytes: usize,
 }
 
 /// Seals blocked callers even if the original actor is aborted or unwinds.
@@ -98,6 +111,8 @@ impl Admission {
                 retired: false,
                 bytes: 0,
                 committed: 0,
+                wire_bytes: 0,
+                wire_messages: 0,
                 close: None,
             }),
             changed: Notify::new(),
@@ -108,18 +123,57 @@ impl Admission {
     /// Links a weak lifetime observation to the endpoint's single retirement wake.
     pub(super) fn lifetime(
         self: &Arc<Self>,
-        retirement: &Arc<SessionRetirement>,
+        retirement: Option<&Arc<SessionRetirement>>,
     ) -> SessionLifetime {
-        let retirement = self.retirement.get_or_init(|| Arc::clone(retirement));
-        let retired = self
-            .state
-            .lock()
-            .expect("session admission mutex poisoned")
-            .retired;
-        if retired {
-            retirement.notify();
+        if let Some(retirement) = retirement {
+            let retirement = self.retirement.get_or_init(|| Arc::clone(retirement));
+            let retired = self
+                .state
+                .lock()
+                .expect("session admission mutex poisoned")
+                .retired;
+            if retired {
+                retirement.notify();
+            }
         }
         SessionLifetime(Arc::downgrade(self))
+    }
+
+    /// Reserves exact encoded bytes independently of caller-owned application bodies.
+    /// Original protocol output may drain after local sending has been sealed.
+    pub(super) async fn reserve_wire(
+        self: &Arc<Self>,
+        bytes: usize,
+        mtu: u16,
+    ) -> Result<WireCredit, RakSessionError> {
+        let maximum = self
+            .maximum
+            .ok_or(RakSessionError::InvalidConfig(
+                "session byte capacities must be positive",
+            ))?
+            .max(usize::from(mtu));
+        if bytes > maximum {
+            return Err(RakSessionError::MessageSizeExceeded(bytes));
+        }
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock().expect("session admission mutex poisoned");
+                if state.wire_messages < constants::MAX_RECEIVE_MESSAGES
+                    && bytes <= maximum - state.wire_bytes
+                {
+                    state.wire_bytes += bytes;
+                    state.wire_messages += 1;
+                    return Ok(WireCredit {
+                        admission: Arc::clone(self),
+                        bytes,
+                    });
+                }
+            }
+            notified.await;
+        }
     }
 
     /// Reserves actual body bytes while leaving uncommitted bodies caller-owned.
@@ -278,6 +332,34 @@ impl Drop for SendCredit {
                     .checked_sub(1)
                     .expect("each committed body leaves the FIFO once");
             }
+        }
+        self.admission.changed.notify_waiters();
+    }
+}
+
+impl WireCredit {
+    /// Rejects a reused numeric session ID belonging to a different original allocation.
+    pub(super) fn belongs_to(&self, lifetime: &SessionLifetime) -> bool {
+        lifetime.matches(&self.admission)
+    }
+}
+
+impl Drop for WireCredit {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .admission
+                .state
+                .lock()
+                .expect("session admission mutex poisoned");
+            state.wire_bytes = state
+                .wire_bytes
+                .checked_sub(self.bytes)
+                .expect("each original datagram returns its byte credit once");
+            state.wire_messages = state
+                .wire_messages
+                .checked_sub(1)
+                .expect("each original datagram returns its message credit once");
         }
         self.admission.changed.notify_waiters();
     }

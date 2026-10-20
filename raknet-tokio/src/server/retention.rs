@@ -1,5 +1,6 @@
 //! Exact live routes and metadata-only reservations after network retirement.
 
+use crate::session::wire::Datagram;
 use crate::session::{SessionEvent, SessionLifetime};
 use raknet::prelude::{RakServer, RakServerInput, RakSessionId, Sans};
 use std::collections::HashMap;
@@ -10,6 +11,19 @@ use tokio::sync::mpsc::Sender;
 pub(super) struct Route {
     pub(super) input: Sender<SessionEvent>,
     pub(super) lifetime: SessionLifetime,
+}
+
+/// Admits committed wire output only for its exact live or retained original route.
+pub(super) fn owns_wire(
+    datagram: &Datagram,
+    sessions: &HashMap<RakSessionId, Route>,
+    retained: &HashMap<RakSessionId, SessionLifetime>,
+) -> bool {
+    sessions
+        .get(&datagram.id())
+        .map(|route| &route.lifetime)
+        .or_else(|| retained.get(&datagram.id()))
+        .is_some_and(|lifetime| datagram.belongs_to(lifetime))
 }
 
 /// Removes only the original current route; a late repeated ID has no further effect.
