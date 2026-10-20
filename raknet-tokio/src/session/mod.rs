@@ -378,3 +378,6 @@ mod accepted_lifetime_tests;
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(test)]
+mod router_wire_tests;
