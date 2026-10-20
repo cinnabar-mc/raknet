@@ -15,7 +15,8 @@ pub const DGRAM_MTU_OVERHEAD: u16 = 36;
 pub const MAX_ORDERING_CHANNELS: i32 = 32;
 pub const PACKET_LIMIT: i32 = 120;
 pub const TOTAL_PACKET_LIMIT: i32 = 100_000;
-pub const ONLINE_PACKET_LIMIT: i32 = 120;
+/// No online datagram quota unless the serving caller explicitly configures one.
+pub const ONLINE_PACKET_LIMIT: i32 = 0;
 pub const ONLINE_RATE_LIMIT_WINDOW: Duration = Duration::from_millis(10);
 pub const BLOCK_DURATION: Duration = Duration::from_secs(10);
 

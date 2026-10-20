@@ -18,10 +18,8 @@ async fn pair(
     let addr: SocketAddr = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .and_then(|s| s.local_addr())
         .unwrap();
-    // go-raknet has no per-address datagram rate limit; the default one ends a bulk loopback session.
     let mut server = RakServer::new(addr, |c| {
         c.max_connections = 1;
-        c.online_packet_limit = i32::MAX;
     })
     .start()
     .await
