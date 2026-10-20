@@ -24,12 +24,11 @@ impl SessionLifetime {
         let Some(admission) = self.0.upgrade() else {
             return true;
         };
-        let retired = admission
+        admission
             .state
             .lock()
             .expect("session admission mutex poisoned")
-            .retired;
-        retired
+            .retired
     }
 
     /// Completion/drop of every original owner releases this exact admission lifetime.
