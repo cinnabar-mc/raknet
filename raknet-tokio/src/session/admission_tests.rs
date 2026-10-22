@@ -202,3 +202,104 @@ async fn close_outside_full_fifo_preserves_committed_body_and_closing_snapshot()
         "close retains the earlier committed body after reply cancellation"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_reservation_returns_credit_and_close_revokes_existing_permit() {
+    let ActorPair {
+        session,
+        input,
+        peer: _peer,
+        datagrams: _datagrams,
+    } = actor();
+    let sender = session.sender();
+    let original_actor = session.task.upgrade().unwrap();
+    let mut reservation = Box::pin(sender.reserve_send(OUTBOUND_BYTES as usize));
+    let pending = poll_fn(|context| {
+        let _held = original_actor.hold();
+        fill_controls(&session);
+        Poll::Ready(reservation.as_mut().poll(context).is_pending())
+    })
+    .await;
+    drop(reservation);
+    let observed = tokio::time::timeout(constants::CLOSE_TIMEOUT, async {
+        let returned = sender.reserve_send(OUTBOUND_BYTES as usize).await?;
+        drop(returned);
+        sender.reserve_send(BODY_BYTES).await
+    })
+    .await;
+    let closing = session.close().unwrap_or_else(|error| error.into_parts().0);
+    let (commit, next) = match observed {
+        Ok(Ok(permit)) => (
+            permit
+                .commit(
+                    vec![0xfe; BODY_BYTES].into_boxed_slice(),
+                    RakReliability::ReliableOrdered,
+                    RakPriority::Immediate,
+                )
+                .err(),
+            sender.reserve_send(BODY_BYTES).await.err(),
+        ),
+        _ => (None, None),
+    };
+    let cleanup = cleanup(closing, input).await;
+    assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
+    assert!(pending, "the original full FIFO withholds admission");
+    assert!(matches!(commit, Some(RakSessionError::Closed)));
+    assert!(matches!(next, Some(RakSessionError::Closed)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_receipt_survives_borrowed_wait_cancellation() {
+    let ActorPair {
+        session,
+        mut peer,
+        input,
+        mut datagrams,
+    } = actor();
+    let body = vec![0xfe; BODY_BYTES].into_boxed_slice();
+    let observed = tokio::time::timeout(constants::CLOSE_TIMEOUT, async {
+        let permit = session
+            .sender()
+            .reserve_send(body.len())
+            .await
+            .map_err(|error| error.to_string())?;
+        let original_actor = session.task.upgrade().unwrap();
+        let mut permit = Some(permit);
+        let (mut receipt, pending) = poll_fn(|context| {
+            let _held = original_actor.hold();
+            let receipt = permit
+                .take()
+                .expect("one original command is committed")
+                .commit(
+                    body.clone(),
+                    RakReliability::ReliableOrdered,
+                    RakPriority::Immediate,
+                )
+                .map_err(|error| error.to_string());
+            let mut receipt = match receipt {
+                Ok(receipt) => receipt,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let mut canceled = Box::pin(receipt.admitted());
+            let pending = canceled.as_mut().poll(context).is_pending();
+            drop(canceled);
+            Poll::Ready(Ok((receipt, pending)))
+        })
+        .await?;
+        let admitted = receipt.admitted().await;
+        let delivered = received(&mut peer, &mut datagrams).await?;
+        Ok::<_, String>((pending, admitted, delivered))
+    })
+    .await;
+    let cleanup = cleanup(session, input).await;
+    assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
+    let (pending, admitted, delivered) = observed
+        .expect("original admission completes before the cutoff")
+        .expect("the original peer remains healthy");
+    assert!(
+        pending,
+        "the held original actor cannot acknowledge the command"
+    );
+    assert!(admitted.is_ok());
+    assert_eq!(delivered, body);
+}

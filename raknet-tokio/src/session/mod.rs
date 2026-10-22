@@ -3,14 +3,16 @@
 mod admission;
 mod command;
 mod driver;
+mod send;
 pub(crate) mod wire;
 
 use crate::inline::Task;
-use admission::{ActorAdmission, Admission, ReceiveCredit};
+use admission::{ActorAdmission, Admission, ReceiveCredit, SendCredit};
 pub(crate) use admission::{SessionLifetime, SessionRetirement};
 use command::RakSessionMsg;
 use driver::Driver;
 use raknet::prelude::*;
+pub use send::{SendPermit, SendReceipt, SessionSender};
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -396,6 +398,11 @@ impl<S: SessionPhase> RakSession<S> {
 }
 
 impl RakSession<Established> {
+    /// Borrows send-only admission without sharing receive or consuming close ownership.
+    pub fn sender(&self) -> SessionSender {
+        SessionSender::new(self)
+    }
+
     /// Admits one message under the original command-count and outbound-byte budgets.
     ///
     /// Waiting retains the body in this caller's future. Cancellation before queue
@@ -414,27 +421,12 @@ impl RakSession<Established> {
         T: Into<Box<[u8]>>,
     {
         let bytes = bytes.into();
-        let mut credit = self
-            .admission
-            .reserve(bytes.len(), self.max_message_len)
-            .await?;
-        let permit = tokio::select! {
-            biased;
-            _ = self.admission.closed() => return Err(RakSessionError::Closed),
-            permit = self.msg_tx.reserve() => permit.map_err(|_| RakSessionError::Closed)?,
-        };
-        let (tx, rx) = oneshot::channel();
-        credit.commit()?;
-        Task::drive(&self.task, || {
-            permit.send(RakSessionMsg::Send(
-                bytes,
-                reliability,
-                priority,
-                tx,
-                credit,
-            ))
-        });
-        rx.await.map_err(|_| RakSessionError::Closed)?
+        self.sender()
+            .reserve_send(bytes.len())
+            .await?
+            .commit(bytes, reliability, priority)?
+            .admitted()
+            .await
     }
     /// Synchronously consumes send permission before any cancellable close wait.
     pub fn close(self) -> Result<RakSession<Closing>, SessionCloseError> {
