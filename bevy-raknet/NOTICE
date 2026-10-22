@@ -1,0 +1,37 @@
+Cinnabar RakNet modifications
+Copyright 2026 Cinnabar contributors
+
+Cinnabar contributors additionally license the copyrightable portions of their
+own contributions and modifications under the MIT license reproduced in
+LICENSE-MIT-CINNABAR. This grant excludes pre-existing upstream code and other
+third-party material, which retain their original licenses and notices.
+Existing Apache-2.0 grants remain available; the MIT grant does not replace the
+Apache-2.0 terms for the original implementation or this fork as a whole.
+
+The client MTU negotiation state machine follows public Lunar go-raknet behavior
+at commit 6124f52657d4d5f006ea2af2d525260998dd3173. It adapts its probe scheduling,
+protected challenge, cookie refresh and final-grant handling to caller-driven
+Rust protocol state and explicit socket-write completion inputs. Client system
+addresses, mapped IPv4 normalization and IPv6 wire fields also follow this
+reference. System-address codecs retain short-list support and reject excess
+entries with bounded input allocation. UDP error classification follows the
+reference's Unix and Winsock handshake read policies.
+
+Receive-window advancement and recent-loss selection also follow this reference.
+ACK/NACK emission remains caller-driven, with bounded pending loss records.
+
+That reference is MIT-licensed, copyright 2019 Sander ten Veldhuis.
+See LICENSE-MIT-go-raknet for the retained notice and license.
+The original RakNet project's Apache-2.0 license and notices remain in effect.
+
+Early application-packet retention and connected liveness controls follow the
+same public behavior reference, with explicit Rust-owned handshake bounds and
+ordered transfer of pending packets and terminal notifications.
+
+Default client GUID generation uses fresh OS entropy for each ping/connection,
+with the reference's little-endian payload mapping and client type bits. Identity
+is supplied explicitly to the Rust engine and retained in attempt metadata.
+
+Wire timestamps use endpoint-relative monotonic uptime, following the same
+reference's timestamp and remote SystemUptime behavior. Portable Rust snapshots
+rebase their timer offsets using caller-supplied transfer elapsed time.

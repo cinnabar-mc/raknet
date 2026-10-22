@@ -1,6 +1,13 @@
 Cinnabar RakNet modifications
 Copyright 2026 Cinnabar contributors
 
+Cinnabar contributors additionally license the copyrightable portions of their
+own contributions and modifications under the MIT license reproduced in
+LICENSE-MIT-CINNABAR. This grant excludes pre-existing upstream code and other
+third-party material, which retain their original licenses and notices.
+Existing Apache-2.0 grants remain available; the MIT grant does not replace the
+Apache-2.0 terms for the original implementation or this fork as a whole.
+
 The client MTU negotiation state machine follows public Lunar go-raknet behavior
 at commit 6124f52657d4d5f006ea2af2d525260998dd3173. It adapts its probe scheduling,
 protected challenge, cookie refresh and final-grant handling to caller-driven
