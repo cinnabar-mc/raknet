@@ -2,6 +2,27 @@
 
 use super::*;
 
+#[test]
+fn final_handle_release_notifies_after_an_earlier_retirement_wake_is_consumed() {
+    let admission = Admission::new(2048, constants::CLOSE_TIMEOUT, true);
+    let handle = admission.handle();
+    let retirement = Arc::new(SessionRetirement::default());
+    let lifetime = admission.lifetime(&handle, Some(&retirement));
+    drop(ActorAdmission(Arc::clone(&admission)));
+    let _ = retirement.take();
+
+    // The endpoint can consume any earlier field's wake while the handle remains owned.
+    drop(admission);
+    let _ = retirement.take();
+    assert!(!lifetime.released());
+    drop(handle);
+    assert!(
+        retirement.take(),
+        "the final handle release must wake the endpoint after its earlier reap"
+    );
+    assert!(lifetime.released());
+}
+
 #[tokio::test(start_paused = true)]
 async fn weak_lifetime_remains_through_closing_and_releases_only_after_finish() {
     let now = Instant::now().into_std();
