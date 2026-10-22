@@ -17,24 +17,30 @@ pub(super) struct Admission {
     direct_wire: AtomicBool,
 }
 
+/// The actual receive/terminal owner, separate from detached send admission.
+pub(super) struct HandleLifetime(Weak<Admission>);
+
 /// A weak observation cannot keep the original handle, actor or queued body alive.
-pub(crate) struct SessionLifetime(Weak<Admission>);
+pub(crate) struct SessionLifetime {
+    admission: Weak<Admission>,
+    handle: Weak<HandleLifetime>,
+}
 
 impl SessionLifetime {
     /// Mirrors this exact route's socket permission while its endpoint lock is held.
     pub(crate) fn set_direct_wire(&self, allowed: bool) {
-        if let Some(admission) = self.0.upgrade() {
+        if let Some(admission) = self.admission.upgrade() {
             admission.direct_wire.store(allowed, Ordering::Release);
         }
     }
     /// Compares the original allocation without extending either route's lifetime.
     pub(super) fn matches(&self, admission: &Arc<Admission>) -> bool {
-        self.0.ptr_eq(&Arc::downgrade(admission))
+        self.admission.ptr_eq(&Arc::downgrade(admission))
     }
 
     /// Observes the actual actor guard even before its receiver finishes dropping.
     pub(crate) fn actor_retired(&self) -> bool {
-        let Some(admission) = self.0.upgrade() else {
+        let Some(admission) = self.admission.upgrade() else {
             return true;
         };
         admission
@@ -44,9 +50,31 @@ impl SessionLifetime {
             .retired
     }
 
-    /// Completion/drop of every original owner releases this exact admission lifetime.
+    /// Final handle disposal releases its slot once original actor and storage have retired.
+    /// Revoked senders and uncommitted permits retain bookkeeping, not accepted ownership.
     pub(crate) fn released(&self) -> bool {
-        self.0.strong_count() == 0
+        if self.handle.strong_count() != 0 {
+            return false;
+        }
+        let Some(admission) = self.admission.upgrade() else {
+            return true;
+        };
+        let state = admission
+            .state
+            .lock()
+            .expect("session admission mutex poisoned");
+        state.retired
+            && state.committed == 0
+            && state.wire_messages == 0
+            && state.received_bytes == 0
+    }
+}
+
+impl Drop for HandleLifetime {
+    fn drop(&mut self) {
+        if let Some(admission) = self.0.upgrade() {
+            admission.notify_retirement();
+        }
     }
 }
 
@@ -114,6 +142,11 @@ pub(super) struct ReceiveCredit {
 pub(super) struct ActorAdmission(pub(super) Arc<Admission>);
 
 impl Admission {
+    /// Creates the sole application-handle lifetime; consuming phase changes transfer it.
+    pub(super) fn handle(self: &Arc<Self>) -> Arc<HandleLifetime> {
+        Arc::new(HandleLifetime(Arc::downgrade(self)))
+    }
+
     /// Retains the original byte policy without semaphore platform restrictions.
     pub(super) fn new(maximum: i32, close_timeout: Duration, open: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -160,6 +193,7 @@ impl Admission {
     /// Links a weak lifetime observation to the endpoint's single retirement wake.
     pub(super) fn lifetime(
         self: &Arc<Self>,
+        handle: &Arc<HandleLifetime>,
         retirement: Option<&Arc<SessionRetirement>>,
     ) -> SessionLifetime {
         if let Some(retirement) = retirement {
@@ -173,7 +207,17 @@ impl Admission {
                 retirement.notify();
             }
         }
-        SessionLifetime(Arc::downgrade(self))
+        SessionLifetime {
+            admission: Arc::downgrade(self),
+            handle: Arc::downgrade(handle),
+        }
+    }
+
+    /// Wakes only the existing endpoint retention owner after a finite lifetime change.
+    fn notify_retirement(&self) {
+        if let Some(retirement) = self.retirement.get() {
+            retirement.notify();
+        }
     }
 
     /// Reserves exact encoded bytes independently of caller-owned application bodies.
@@ -373,7 +417,7 @@ impl SendCredit {
 
 impl Drop for SendCredit {
     fn drop(&mut self) {
-        let closing = {
+        let (closing, retired) = {
             let mut state = self
                 .admission
                 .state
@@ -389,11 +433,14 @@ impl Drop for SendCredit {
                     .checked_sub(1)
                     .expect("each committed body leaves the FIFO once");
             }
-            state.close.is_some()
+            (state.close.is_some(), state.retired)
         };
         self.admission.changed.notify_waiters();
         if closing {
             self.admission.closing_changed.notify_one();
+        }
+        if retired {
+            self.admission.notify_retirement();
         }
     }
 }
@@ -411,7 +458,7 @@ impl WireCredit {
 
 impl Drop for WireCredit {
     fn drop(&mut self) {
-        {
+        let retired = {
             let mut state = self
                 .admission
                 .state
@@ -425,8 +472,12 @@ impl Drop for WireCredit {
                 .wire_messages
                 .checked_sub(1)
                 .expect("each original datagram returns its message credit once");
-        }
+            state.retired
+        };
         self.admission.changed.notify_waiters();
+        if retired {
+            self.admission.notify_retirement();
+        }
     }
 }
 
@@ -441,6 +492,11 @@ impl Drop for ReceiveCredit {
             .received_bytes
             .checked_sub(self.bytes)
             .expect("each final received body returns its byte credit once");
+        let retired = state.retired;
+        drop(state);
+        if retired {
+            self.admission.notify_retirement();
+        }
     }
 }
 

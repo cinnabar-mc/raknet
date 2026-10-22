@@ -175,7 +175,9 @@ mod tests {
         let (route, mut received) = datagrams_on(endpoint, Some(writer));
         let original = Admission::new(2048, std::time::Duration::from_secs(1), true);
         let replacement = Admission::new(2048, std::time::Duration::from_secs(1), true);
-        let lifetime = original.lifetime(None);
+        let original_handle = original.handle();
+        let replacement_handle = replacement.handle();
+        let lifetime = original.lifetime(&original_handle, None);
         lifetime.set_direct_wire(true);
         let id = RakSessionId(7);
         let mut pending = Some((Box::from(&b"original"[..]), destination));
@@ -187,7 +189,9 @@ mod tests {
         assert_eq!(&bytes[..length], b"original");
         assert!(received.try_recv().is_err());
         lifetime.set_direct_wire(false);
-        replacement.lifetime(None).set_direct_wire(true);
+        replacement
+            .lifetime(&replacement_handle, None)
+            .set_direct_wire(true);
         let mut pending = Some((Box::from(&b"retired original"[..]), destination));
         forward(&route, &original, 1500, id, &mut pending)
             .await
