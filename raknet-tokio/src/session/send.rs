@@ -77,21 +77,25 @@ impl SendPermit {
                 self.credit,
             ));
         });
-        Ok(SendReceipt { received })
+        Ok(SendReceipt {
+            received: Some(received),
+        })
     }
 }
 
 /// The retained local admission result for one already committed command.
 #[must_use = "observe the original local admission result"]
 pub struct SendReceipt {
-    received: oneshot::Receiver<Result<(), RakSessionError>>,
+    received: Option<oneshot::Receiver<Result<(), RakSessionError>>>,
 }
 
 impl SendReceipt {
-    /// Waits without consuming this receipt if its borrowed future is canceled.
+    /// Observes the result once, retaining it across cancellation of this borrowed wait.
+    /// Repeated observation after completion returns `Closed` rather than repolling the channel.
     pub async fn admitted(&mut self) -> Result<(), RakSessionError> {
-        (&mut self.received)
-            .await
-            .map_err(|_| RakSessionError::Closed)?
+        let received = self.received.as_mut().ok_or(RakSessionError::Closed)?;
+        let result = received.await;
+        self.received = None;
+        result.map_err(|_| RakSessionError::Closed)?
     }
 }

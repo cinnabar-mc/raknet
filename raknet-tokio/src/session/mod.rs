@@ -398,7 +398,7 @@ impl<S: SessionPhase> RakSession<S> {
 }
 
 impl RakSession<Established> {
-    /// Borrows send-only admission without sharing receive or consuming close ownership.
+    /// Creates an owned send-only capability without sharing receive or consuming close ownership.
     pub fn sender(&self) -> SessionSender {
         SessionSender::new(self)
     }

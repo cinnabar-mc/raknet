@@ -287,13 +287,14 @@ async fn owned_receipt_survives_borrowed_wait_cancellation() {
         })
         .await?;
         let admitted = receipt.admitted().await;
+        let repeated = receipt.admitted().await;
         let delivered = received(&mut peer, &mut datagrams).await?;
-        Ok::<_, String>((pending, admitted, delivered))
+        Ok::<_, String>((pending, admitted, repeated, delivered))
     })
     .await;
     let cleanup = cleanup(session, input).await;
     assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
-    let (pending, admitted, delivered) = observed
+    let (pending, admitted, repeated, delivered) = observed
         .expect("original admission completes before the cutoff")
         .expect("the original peer remains healthy");
     assert!(
@@ -301,5 +302,6 @@ async fn owned_receipt_survives_borrowed_wait_cancellation() {
         "the held original actor cannot acknowledge the command"
     );
     assert!(admitted.is_ok());
+    assert!(matches!(repeated, Err(RakSessionError::Closed)));
     assert_eq!(delivered, body);
 }
