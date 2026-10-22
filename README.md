@@ -142,6 +142,9 @@ This is the [Cinnabar](https://github.com/cinnabar-mc) fork of
 For Minecraft Login, packet encoding and resource packs, use a higher layer such
 as [bedrock-net](https://github.com/cinnabar-mc/bedrock-net).
 
-The original implementation and this fork use [Apache-2.0](LICENSE).
+The original implementation and this fork retain [Apache-2.0](LICENSE).
+Cinnabar contributors also offer their own contributions and modifications under
+[MIT](LICENSE-MIT-CINNABAR). That grant covers their authored portions; upstream
+code and third-party material keep their original terms.
 See [NOTICE](NOTICE) and the retained [MIT notice](LICENSE-MIT-go-raknet) for
 Lunar go-raknet reference attribution.
