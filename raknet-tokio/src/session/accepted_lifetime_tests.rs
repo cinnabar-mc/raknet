@@ -337,3 +337,156 @@ async fn unaccepted_retired_session_keeps_its_slot_until_original_owner_drains()
         "actual route retirement released capacity while the original accepted handle still retained unread reliable data and terminal metadata"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn finished_accepted_owner_releases_slot_while_revoked_send_capabilities_survive() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut server = RakServer::new((Ipv4Addr::LOCALHOST, 0).into(), |config| {
+        config.max_connections = 1;
+        config.session.max_outbound_bytes = OUTBOUND_BYTES;
+    })
+    .start()
+    .await
+    .unwrap();
+    let first = RakClient::new(|_| {}).start().await.unwrap();
+    let replacement = RakClient::new(|_| {}).start().await.unwrap();
+    let mut sessions = Vec::new();
+    let mut actors = Vec::new();
+    let mut detached = None;
+    let mut stage = "original bound socket observation";
+    let observed = tokio::time::timeout_at(deadline, async {
+        let address = server
+            .command_queue_probe()
+            .await
+            .map_err(|_| "bound socket probe closed".to_owned())?
+            .address
+            .ok_or_else(|| "the original server has no bound address".to_owned())?;
+        stage = "original accepted handshake";
+        let mut client = first
+            .connect(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        retain_actor(&mut client, &mut actors);
+        sessions.push(client);
+        let mut accepted = server.accept().await.map_err(|error| error.to_string())?;
+        retain_actor(&mut accepted, &mut actors);
+        sessions.push(accepted);
+        let [client, accepted] = sessions.as_mut_slice() else {
+            unreachable!()
+        };
+        let original_marker = b"\xfeoriginal accepted owner";
+        let original_echo = echo(client, accepted, original_marker)
+            .await
+            .map_err(|error| error.to_string())?;
+        let sender = accepted.sender();
+        let unused = sender
+            .reserve_send(1)
+            .await
+            .map_err(|error| error.to_string())?;
+        detached = Some((sender, unused));
+
+        stage = "original accepted close, receive drain and final finish";
+        let accepted = sessions.pop().expect("original accepted owner");
+        let mut closing = accepted.close().map_err(|error| error.to_string())?;
+        let server_terminal = closing.recv::<Box<[u8]>>().await;
+        let finished = match closing.finish() {
+            Ok(_) => true,
+            Err(closing) => {
+                drop(closing);
+                false
+            }
+        };
+        let mut client = sessions.pop().expect("original client owner");
+        let client_terminal = client.recv::<Box<[u8]>>().await;
+        let client_finished = match client.finish() {
+            Ok(_) => true,
+            Err(client) => {
+                drop(client);
+                false
+            }
+        };
+        routes(&server, 0).await?;
+
+        stage = "replacement handshake before dropping revoked sender or unused permit";
+        let mut client = replacement
+            .connect(address)
+            .await
+            .map_err(|error| format!("replacement connection after original finish: {error}"))?;
+        retain_actor(&mut client, &mut actors);
+        sessions.push(client);
+        let mut accepted = server.accept().await.map_err(|error| error.to_string())?;
+        retain_actor(&mut accepted, &mut actors);
+        sessions.push(accepted);
+        let [client, accepted] = sessions.as_mut_slice() else {
+            unreachable!()
+        };
+        let replacement_marker = b"\xfereplacement accepted before stale sends drop";
+        let replacement_echo = echo(client, accepted, replacement_marker)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((
+            original_echo,
+            replacement_echo,
+            original_marker,
+            replacement_marker,
+            server_terminal,
+            client_terminal,
+            finished,
+            client_finished,
+        ))
+    })
+    .await;
+
+    // Keep both revoked objects alive until after admission and normal endpoint retirement.
+    let detached_survived = detached.is_some();
+    for session in sessions {
+        close(session);
+    }
+    while server.unaccepted_count() != 0 {
+        let mut session = server
+            .accept()
+            .await
+            .expect("original reported accepted prefix");
+        retain_actor(&mut session, &mut actors);
+        close(session);
+    }
+    tokio::join!(first.stop(), replacement.stop(), server.stop());
+    let actor_count = actors.len();
+    let cleanup_deadline = Instant::now() + constants::CLOSE_TIMEOUT;
+    let mut cleanup_errors = Vec::new();
+    for mut actor in actors {
+        match tokio::time::timeout_at(cleanup_deadline, &mut actor).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => cleanup_errors.push(format!("original actor join: {error}")),
+            Err(_) => {
+                actor.abort();
+                let _ = actor.await;
+                cleanup_errors.push("original actor needed abort after endpoint stops".to_owned());
+            }
+        }
+    }
+    drop(detached);
+    assert!(cleanup_errors.is_empty(), "cleanup: {cleanup_errors:?}");
+    let (
+        original_echo,
+        replacement_echo,
+        original_marker,
+        replacement_marker,
+        server_terminal,
+        client_terminal,
+        finished,
+        client_finished,
+    ) = observed
+        .unwrap_or_else(|_| panic!("original cutoff expired during {stage}"))
+        .expect(
+            "a finished accepted owner must release its slot despite revoked send capabilities",
+        );
+    assert!(detached_survived && finished && client_finished);
+    assert!(matches!(server_terminal, Err(RakSessionError::Closed)));
+    assert!(matches!(client_terminal, Err(RakSessionError::Closed)));
+    assert_eq!(actor_count, 4, "both actual handshake pairs retired");
+    assert_eq!(original_echo.0.as_ref(), original_marker);
+    assert_eq!(original_echo.1.as_ref(), original_marker);
+    assert_eq!(replacement_echo.0.as_ref(), replacement_marker);
+    assert_eq!(replacement_echo.1.as_ref(), replacement_marker);
+}
