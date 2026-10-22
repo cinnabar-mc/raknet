@@ -18,7 +18,7 @@ pub(super) struct Admission {
 }
 
 /// The actual receive/terminal owner, separate from detached send admission.
-pub(super) struct HandleLifetime(Weak<Admission>);
+pub(super) struct HandleLifetime(Arc<Admission>);
 
 /// A weak observation cannot keep the original handle, actor or queued body alive.
 pub(crate) struct SessionLifetime {
@@ -72,9 +72,7 @@ impl SessionLifetime {
 
 impl Drop for HandleLifetime {
     fn drop(&mut self) {
-        if let Some(admission) = self.0.upgrade() {
-            admission.notify_retirement();
-        }
+        self.0.notify_retirement();
     }
 }
 
@@ -144,7 +142,7 @@ pub(super) struct ActorAdmission(pub(super) Arc<Admission>);
 impl Admission {
     /// Creates the sole application-handle lifetime; consuming phase changes transfer it.
     pub(super) fn handle(self: &Arc<Self>) -> Arc<HandleLifetime> {
-        Arc::new(HandleLifetime(Arc::downgrade(self)))
+        Arc::new(HandleLifetime(Arc::clone(self)))
     }
 
     /// Retains the original byte policy without semaphore platform restrictions.
