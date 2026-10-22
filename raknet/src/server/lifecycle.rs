@@ -23,7 +23,10 @@ pub enum RakServerOutput {
     SessionClosing(RakSession<Closing>),
 }
 
-/// A caller-driven serving endpoint; it never exposes raw session construction.
+/// A RakNet server driven by your socket I/O and periodic updates.
+///
+/// Feed `RakServerInput` through `Sans::handle` and drain `Sans::poll` for
+/// replies, connected sessions and datagrams to route to those sessions.
 pub struct RakServer {
     engine: ServerEngine,
     closing_adoptions: HashSet<RakSessionId>,

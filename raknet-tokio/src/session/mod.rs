@@ -38,7 +38,10 @@ pub(crate) enum SessionEvent {
     Close(std::time::Instant),
 }
 
-/// An established or locally closing application handle, never clonable.
+/// One established or locally closing message session.
+///
+/// `recv` reads complete messages. Established sessions can also send; consuming
+/// `close` returns a closing session that retains unread messages.
 ///
 /// ```compile_fail
 /// use raknet_tokio::prelude::*;
@@ -343,8 +346,12 @@ impl<S: SessionPhase> RakSession<S> {
         self.admission.lifetime(&self.handle, retirement)
     }
 
-    /// Receives complete messages, retaining the prefix before terminal failure.
-    /// Queue byte credit ends at this pop, before conversion to caller-owned `T`.
+    /// Waits for one complete message, reading queued messages before terminal failure.
+    /// Canceling a pending receive does not consume a message.
+    ///
+    /// # Errors
+    /// Returns `Closed` after the receive queue drains, or the close operation's
+    /// error. Use `finish` after draining to obtain the protocol disconnection reason.
     pub async fn recv<T>(&mut self) -> Result<T, RakSessionError>
     where
         Box<[u8]>: Into<T>,
@@ -388,7 +395,8 @@ impl<S: SessionPhase> RakSession<S> {
             .await
             .map_err(|_| SnapshotError::Session(RakSessionError::Closed))??)
     }
-    /// Takes terminal metadata once the received-message prefix has been consumed.
+    /// Takes disconnection metadata after retirement and all received messages have drained.
+    /// Returns the session unchanged while either is incomplete.
     pub fn finish(mut self) -> Result<ClosedSession, Self> {
         if !self.buf_rx.is_closed() || !self.buf_rx.is_empty() {
             return Err(self);
@@ -431,7 +439,12 @@ impl RakSession<Established> {
             .admitted()
             .await
     }
-    /// Synchronously consumes send permission before any cancellable close wait.
+    /// Starts graceful close, consuming this session's application-send methods.
+    /// Keep reading from the returned closing session until it ends.
+    ///
+    /// # Errors
+    /// A rejected close returns the same closing session and cause through
+    /// `SessionCloseError::into_parts`, preserving its unread messages.
     pub fn close(self) -> Result<RakSession<Closing>, SessionCloseError> {
         let (tx, rx) = oneshot::channel();
         let closing = RakSession {
