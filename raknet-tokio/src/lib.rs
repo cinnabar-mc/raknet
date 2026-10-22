@@ -15,7 +15,10 @@ pub mod prelude {
         ConfiguredServer, RakServer, RunningServer, ServerAdoptError, ServerStartError,
         error::RakServerError,
     };
-    pub use super::session::{RakSession, RestoredSession, SessionCloseError, SnapshotError};
+    pub use super::session::{
+        RakSession, RestoredSession, SendPermit, SendReceipt, SessionCloseError, SessionSender,
+        SnapshotError,
+    };
     pub use raknet::prelude::{
         ClosedSession, Closing, Established, RakClientConfig, RakClientError, RakPriority,
         RakReliability, RakServerConfig, RakSessionConfig, RakSessionError, RakSessionSnapshot,
