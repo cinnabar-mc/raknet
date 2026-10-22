@@ -1,3 +1,36 @@
+//! RakNet messages over UDP, with sockets and scheduling supplied by your application.
+//!
+//! Use [`prelude::RakClient`] to connect or [`prelude::RakServer`] to accept peers.
+//! Feed received datagrams and timer updates through [`prelude::Sans::handle`],
+//! then drain [`prelude::Sans::poll`] for writes, messages and deadlines.
+//!
+//! The [sans-I/O guide](https://github.com/cinnabar-mc/raknet/blob/main/docs/integration.md)
+//! covers MTU write feedback, routing, shutdown and shared sockets. For an existing
+//! runtime integration, see the `raknet-tokio` and `bevy-raknet` crates.
+//!
+//! # Start a client attempt
+//!
+//! ```
+//! use raknet::prelude::*;
+//! use std::time::Instant;
+//!
+//! let now = Instant::now();
+//! let client = RakClient::new(RakClientConfig::default(), RakClock::new(now))?;
+//! let mut attempt = client.connect(
+//!     "127.0.0.1:19132".parse()?,
+//!     "0.0.0.0:0".parse()?,
+//!     ClientGuid::generate()?,
+//!     now,
+//! )?;
+//! // Use your bound socket's local address above. Drain attempt.poll(), perform
+//! // its writes, then feed received datagrams, write results and timer updates.
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Connection setup returns an established session through `SessionConnected`.
+//! Only established sessions can send. After `close`, keep draining the closing
+//! session's messages, datagrams and terminal output.
+
 // Modified by Cinnabar contributors for caller-driven connection negotiation.
 mod client;
 mod clock;
@@ -17,6 +50,7 @@ pub mod test_support;
 mod types;
 mod util;
 
+/// Common client, server, session and I/O types for a caller-driven integration.
 pub mod prelude {
     pub use crate::client::lifecycle::{
         ClientAdoptError, ClientStartError, RakClient, RakClientInput, RakClientOutput,

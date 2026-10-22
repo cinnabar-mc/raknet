@@ -28,7 +28,10 @@ use tokio::sync::mpsc::{channel, unbounded_channel};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::debug;
 
-/// A configured or running server; only the running owner can accept sessions.
+/// A configured or running Tokio server.
+///
+/// Call `start` to bind the socket, then `accept` to receive established message
+/// sessions. Keep the server running while using them and await `stop` at shutdown.
 ///
 /// ```compile_fail
 /// use raknet_tokio::prelude::*;
@@ -41,6 +44,7 @@ pub struct RakServer<S> {
 }
 
 impl RakServer<ConfiguredServer> {
+    /// Creates server configuration for the bind address; no socket is opened yet.
     pub fn new<T>(addr: SocketAddr, conf: T) -> Self
     where
         T: FnOnce(&mut RakServerConfig),
@@ -62,8 +66,11 @@ impl RakServer<ConfiguredServer> {
         self.state.config.max_connections = value;
     }
 
-    /// Binds an automatic socket owner, retaining configuration on validation or bind failure.
-    /// Manual session flushing is unsupported because this handle exposes no caller tick.
+    /// Validates settings, binds the UDP socket and starts accepting connections.
+    ///
+    /// # Errors
+    /// Returns the configured server and cause through `ServerStartError::into_parts`.
+    /// Manual flushing is rejected before binding; Tokio sessions require autoflush.
     pub async fn start(self) -> Result<RakServer<RunningServer>, ServerStartError> {
         if let Err(error) = self.state.config.session.validate() {
             return Err(ServerStartError {
@@ -515,6 +522,10 @@ impl RakServer<RunningServer> {
         Ok(rx.await.map_err(|_| RakServerError::Closed)??)
     }
 
+    /// Waits for the next established peer and returns its message session.
+    ///
+    /// # Errors
+    /// Returns `RakServerError::Closed` when the accepting task has ended.
     pub async fn accept(&mut self) -> Result<RakSession<Established>, RakServerError> {
         self.state
             .session_rx

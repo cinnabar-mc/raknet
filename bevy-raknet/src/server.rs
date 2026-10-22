@@ -15,6 +15,7 @@ pub(crate) mod bounded_delivery_tests;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 
+/// Updates a server resource in `PreUpdate` and publishes its connection messages.
 pub struct RakServerPlugin;
 
 impl Plugin for RakServerPlugin {
@@ -74,6 +75,9 @@ impl SessionEntry {
     }
 }
 
+/// A nonblocking UDP server resource driven by `RakServerPlugin`.
+/// Read `RakServerEvent` messages for peer IDs, send through `connected(id)`
+/// and drain received messages through `recv`.
 #[derive(Resource)]
 pub struct RakServer {
     intl: RakServerIntl,
@@ -86,8 +90,11 @@ pub struct RakServer {
 }
 
 impl RakServer {
-    /// Binds an automatic server, retaining its original address/configuration on startup failure.
-    /// Manual session flushing is unsupported because this resource exposes no caller tick.
+    /// Binds a nonblocking UDP socket at the supplied address.
+    ///
+    /// # Errors
+    /// Returns the address, configuration and I/O cause through `ServerStartError::into_parts`.
+    /// Manual flushing is unsupported and rejected before binding.
     pub fn new<T>(addr: SocketAddr, conf: T) -> Result<Self, ServerStartError>
     where
         T: FnOnce(&mut RakServerConfig),
@@ -167,7 +174,7 @@ impl RakServer {
         Ok(())
     }
 
-    /// Borrows established permission from the actual route's typed session slot.
+    /// Borrows an established peer's session for sending and receiving messages.
     pub fn connected(&mut self, id: RakSessionId) -> Option<RakServerSession<'_, Established>> {
         self.sessions
             .get(&id)

@@ -22,10 +22,11 @@ pub enum RakSessionInput {
     Update(Instant),
 }
 
-/// A negotiated or explicitly restored session with local phase capabilities.
+/// An established or closing RakNet session.
 ///
-/// Live sessions cannot be cloned or constructed from raw endpoint metadata.
-/// Peer failure remains a runtime result, even before local close.
+/// Connection setup or trusted snapshot restoration returns this session.
+/// Established sessions can send; closing sessions can still drain messages
+/// and protocol output. Handle remote failures in either phase.
 ///
 /// ```compile_fail
 /// use raknet::prelude::*;

@@ -48,10 +48,11 @@ pub enum RakClientOutput {
     },
 }
 
-/// A configured endpoint or a started attempt/route with exclusive ownership.
+/// A client before connection setup or during an active attempt.
 ///
-/// The network handshake remains internally enum-driven. Only its completed
-/// handoff can grant an established session's application-send capability.
+/// `new` creates a configured client; `connect` starts an attempt. Process its
+/// output until `SessionConnected` returns a session that can send messages.
+/// Supply socket I/O and timer updates through the `Sans` trait.
 ///
 /// ```
 /// use raknet::prelude::*;
@@ -96,7 +97,14 @@ impl RakClient<Configured> {
         })
     }
 
-    /// Starts one attempt and consumes the right to start another until reset.
+    /// Starts one connection attempt without performing socket I/O.
+    ///
+    /// Pass the socket's local address and a fresh GUID. Drain the returned
+    /// client's output and report every MTU probe write completion.
+    ///
+    /// # Errors
+    /// Returns the configured client and cause through `ClientStartError::into_parts`
+    /// if the addresses, MTU settings or attempt cannot be used.
     pub fn connect(
         mut self,
         remote: SocketAddr,

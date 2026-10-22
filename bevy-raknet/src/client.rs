@@ -17,6 +17,7 @@ pub(crate) mod bounded_delivery_tests;
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 
+/// Updates a client resource in `PreUpdate` and publishes its connection messages.
 pub struct RakClientPlugin;
 
 impl Plugin for RakClientPlugin {
@@ -52,6 +53,9 @@ pub enum RakClientEvent {
     Disconnected { reason: RakDisconnectReason },
 }
 
+/// A nonblocking IPv4 client resource for one connection at a time.
+/// Add `RakClientPlugin`, start through `idle`, then exchange messages through
+/// `connected` and `recv` while the app keeps updating.
 #[derive(Resource)]
 pub struct RakClient {
     intl: Driver,
@@ -67,8 +71,11 @@ pub struct RakClient {
 }
 
 impl RakClient {
-    /// Binds an automatic client, retaining the original configuration on any startup failure.
-    /// Manual session flushing is unsupported because this resource exposes no caller tick.
+    /// Binds a nonblocking IPv4 socket with the supplied configuration.
+    ///
+    /// # Errors
+    /// Returns configuration and I/O failures through `ClientStartError::into_parts`.
+    /// Manual flushing is unsupported and rejected before binding.
     pub fn new<T>(conf: T) -> Result<Self, ClientStartError>
     where
         T: FnOnce(&mut RakClientConfig),
@@ -108,13 +115,13 @@ impl RakClient {
         })
     }
 
-    /// Borrows connection-start permission after the preceding data and events have drained.
+    /// Returns a way to start a connection once earlier data and events have drained.
     pub fn idle(&mut self) -> Option<RakClientIdle<'_>> {
         (self.delivery.is_none() && self.session.is_none() && self.intl.is_idle())
             .then_some(RakClientIdle { client: self })
     }
 
-    /// Borrows application-send permission only from an established slot.
+    /// Borrows the established session for sending and receiving messages.
     pub fn connected(&mut self) -> Option<RakClientSession<'_, Established>> {
         self.session
             .as_ref()

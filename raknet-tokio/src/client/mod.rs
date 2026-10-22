@@ -198,7 +198,11 @@ fn fail_pending_connect(
     }
 }
 
-/// A configuration or started socket owner with phase-specific operations.
+/// A configured or running Tokio client.
+///
+/// Call `start` to open sockets, then `connect` to get a message session. Keep
+/// the running client alive while using the session, and await `stop` to join
+/// its network task.
 ///
 /// ```compile_fail
 /// use raknet_tokio::prelude::*;
@@ -211,6 +215,7 @@ pub struct RakClient<S> {
 }
 
 impl RakClient<ConfiguredClient> {
+    /// Creates client configuration; socket I/O begins at `start`.
     pub fn new<T>(conf: T) -> Self
     where
         T: FnOnce(&mut RakClientConfig),
@@ -223,8 +228,11 @@ impl RakClient<ConfiguredClient> {
         }
     }
 
-    /// Opens the automatic socket owner, retaining configuration on validation or bind failure.
-    /// Manual session flushing is unsupported because this handle exposes no caller tick.
+    /// Validates settings, binds UDP sockets and starts networking.
+    ///
+    /// # Errors
+    /// Returns the configured client and cause through `ClientStartError::into_parts`.
+    /// Manual flushing is rejected before binding; Tokio sessions require autoflush.
     pub async fn start(self) -> Result<RakClient<RunningClient>, ClientStartError> {
         if let Err(error) = self.state.config.validate() {
             let cause = std::io::Error::new(std::io::ErrorKind::InvalidInput, error).into();
@@ -661,6 +669,12 @@ impl RakClient<RunningClient> {
         Ok(rx.await.map_err(|_| RakClientError::Closed)??)
     }
 
+    /// Connects to a numeric peer address and returns an established message session.
+    /// Keep this running client alive until the session has finished.
+    ///
+    /// # Errors
+    /// Returns a connection, timeout or closed error, including when another
+    /// connection already occupies this client.
     pub async fn connect(
         &self,
         addr: SocketAddr,
