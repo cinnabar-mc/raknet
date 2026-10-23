@@ -4,6 +4,9 @@ RakNet provides message-based networking over UDP for Rust clients and servers.
 It handles connection setup, reliable delivery, ordering, fragmentation and
 congestion control. You send and receive complete messages.
 
+This is an independently maintained hard fork of
+[bedrock-crustaceans/raknet](https://github.com/bedrock-crustaceans/raknet).
+
 ## Installation
 
 For the examples below, add:
