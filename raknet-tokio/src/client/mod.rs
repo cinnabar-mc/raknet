@@ -356,7 +356,9 @@ impl RakClient<ConfiguredClient> {
                                 fail_pending_connect(&mut client, &mut connect, result);
                             }
                         }
-                        Ok((datagram, addr)) = sockets.recv(&mut buf4, &mut buf6), if pending.is_none() && !draining => {
+                        received = sockets.recv(&mut buf4, &mut buf6), if pending.is_none() && !draining => {
+                            // An error must not disable receiving until another branch wakes.
+                            let Ok((datagram, addr)) = received else { continue };
                             let now = Instant::now().into_std();
 
                             let result = client.handle(RakClientInput::Datagram(datagram, addr, now));

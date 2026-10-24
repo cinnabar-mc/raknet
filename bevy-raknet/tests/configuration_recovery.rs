@@ -5,7 +5,7 @@ use std::{io::ErrorKind, net::UdpSocket};
 
 #[test]
 fn client_retains_configuration_before_binding_and_through_explicit_retry() {
-    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let occupied = UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = occupied.local_addr().unwrap().port();
     let Err(failure) = RakClient::new(|config| {
         config.local_port = port;
