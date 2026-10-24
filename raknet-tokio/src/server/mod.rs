@@ -213,7 +213,9 @@ impl RakServer<ConfiguredServer> {
 
                             let _ = server.handle(RakServerInput::Update(now));
                         }
-                        Ok((len, addr)) = socket.recv_from(&mut buf), if pending.is_none() && !draining => {
+                        received = socket.recv_from(&mut buf), if pending.is_none() && !draining => {
+                            // An error must not disable receiving until another branch wakes.
+                            let Ok((len, addr)) = received else { continue };
                             let now = Instant::now().into_std();
 
                             if retirement.take() {

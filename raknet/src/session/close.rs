@@ -19,11 +19,16 @@ impl SessionEngine {
         PEER_SILENCE.saturating_add(rtt.saturating_mul(2))
     }
 
-    /// Peer silence starts a close; it cannot shorten an already-started drain.
+    /// Peer silence cannot shorten a drain with a representable close cutoff.
     pub(super) fn peer_deadline(&self) -> Option<Instant> {
-        (self.state != RakSessionState::Closing)
-            .then(|| self.last_recv.checked_add(self.peer_timeout()))
-            .flatten()
+        if self.state == RakSessionState::Closing
+            && self
+                .closing_since
+                .is_some_and(|since| self.close_deadline(since).is_some())
+        {
+            return None;
+        }
+        self.last_recv.checked_add(self.peer_timeout())
     }
 
     /// Retains the first close origin and validated grace interval.
@@ -75,6 +80,9 @@ impl SessionEngine {
         self.tick(now)?;
         self.last_tick = now;
 
+        if self.peer_deadline().is_some_and(|deadline| now >= deadline) {
+            return self.disconnect(!self.disconnect_sent, RakDisconnectReason::Timeout, now);
+        }
         if self
             .close_deadline(since)
             .is_some_and(|deadline| now >= deadline)
@@ -93,13 +101,16 @@ impl SessionEngine {
         Ok(())
     }
 
-    /// Keeps the adapter cadence bounded by the first close cutoff alone.
+    /// Uses peer liveness only when the configured close cutoff cannot be represented.
     fn closing_wait(&self, now: Instant) -> Duration {
-        remaining(
+        let wait = remaining(
             self.closing_since.unwrap_or(now),
             self.config.close_timeout,
             now,
         )
-        .min(self.config.autoflush_interval_ms)
+        .min(self.config.autoflush_interval_ms);
+        self.peer_deadline().map_or(wait, |deadline| {
+            wait.min(deadline.saturating_duration_since(now))
+        })
     }
 }

@@ -17,10 +17,21 @@ fn unread_bevy_discovery_pongs_keep_only_the_bounded_accepted_prefix() {
     for index in 0_u8..3 {
         let message = vec![index; RECEIVE_BYTES / 2 + 1].into_boxed_slice();
         server.set_message(message.clone());
+        let before = (client.pongs.len(), client.dropped_pongs);
         client.ping(address);
-        client.update();
-        server.update();
-        client.update();
+        let mut completed = false;
+        for _ in 0..PROGRESS_WATCHDOG {
+            step(&mut server, &mut [&mut client]);
+            if (client.pongs.len(), client.dropped_pongs) != before {
+                completed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            completed,
+            "setup: the actual discovery reply did not arrive"
+        );
         replies.push(message);
     }
 
